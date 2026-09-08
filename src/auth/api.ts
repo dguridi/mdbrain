@@ -1,0 +1,306 @@
+// Every request this program makes, and nothing else.
+//
+// The thin edge around the pure core: each function here is one HTTP call whose
+// shape is decided elsewhere. They are gathered in one module so the whole of
+// what the binary can reach is readable at once — three auth endpoints, three
+// table reads and one RPC, every one of them carrying a session this program
+// already holds. **Nothing here can create one**: the app's page obtains the
+// session and hands it over, so there is no call that trades anything for
+// tokens.
+//
+// One call receives a credential rather than sending one: `mintAgentKey` asks
+// the server for an agent's connection key. It is worth being exact about the
+// direction, because the two are easy to conflate — the key is **minted by the
+// server**, under a gate this program cannot influence, and this program only
+// receives and stores it.
+//
+// **No retries anywhere, deliberately.** A refused refresh means the session is
+// over, and asking again cannot change that; a network failure is the person's
+// to see and act on. A loop here would turn one clear sentence into a hang.
+
+import { ANON_KEY, APP_URL, PROJECT_URL } from "./project.ts";
+import type { StoredSession } from "./session.ts";
+
+/** What the token endpoint hands back, reduced to the three fields kept. */
+interface TokenResponse {
+  access_token?: unknown;
+  refresh_token?: unknown;
+  expires_at?: unknown;
+  expires_in?: unknown;
+}
+
+/**
+ * A failure that is worth showing a person as it stands.
+ *
+ * The field is declared and assigned rather than written as a constructor
+ * parameter property: Node runs these files by stripping the types out, which
+ * cannot do a parameter property because it would have to *emit* an assignment.
+ * The binary being runnable with plain `node` is worth more than the shorthand.
+ */
+export class AuthError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "AuthError";
+    this.status = status;
+  }
+}
+
+function headers(accessToken?: string): Record<string, string> {
+  const h: Record<string, string> = { apikey: ANON_KEY, "content-type": "application/json" };
+  // The anon key is the API key; the bearer is who is asking. Both are needed —
+  // PostgREST rejects a request with no `apikey`, and RLS sees nobody without
+  // the bearer.
+  if (accessToken) h.authorization = `Bearer ${accessToken}`;
+  return h;
+}
+
+/**
+ * The headers the app's own routes take.
+ *
+ * No `apikey`: these are Next.js routes rather than PostgREST, and the bearer is
+ * the whole of what authorises them — the same human session `mdbrain login`
+ * obtained, judged by row-level security once it reaches the database.
+ */
+function appHeaders(accessToken: string): Record<string, string> {
+  return { "content-type": "application/json", authorization: `Bearer ${accessToken}` };
+}
+
+/**
+ * POST to one of the app's own routes, refusing to follow a redirect.
+ *
+ * **A redirect is an error here rather than something to follow.** Crossing
+ * origins strips the `Authorization` header, so following one turns a working
+ * credential into a 401 that reads exactly like being signed out — which is what
+ * the apex domain did to every one of these calls until `APP_URL` gained its
+ * `www.`. Naming it costs one branch and saves the next person the hour it cost
+ * to find, so the redirect is reported with the address it wanted to go to.
+ */
+async function postToApp(path: string, accessToken: string, body: unknown): Promise<Response> {
+  const res = await fetch(`${APP_URL}${path}`, {
+    method: "POST",
+    headers: appHeaders(accessToken),
+    body: JSON.stringify(body),
+    redirect: "manual",
+  });
+  if (res.status >= 300 && res.status < 400) {
+    const to = res.headers.get("location") ?? "somewhere else";
+    throw new AuthError(
+      0,
+      `${APP_URL}${path} redirected to ${to}. A redirect drops the credential, so this is a wrong address rather than a refused session — mdbrain is pointed at the wrong origin.`,
+    );
+  }
+  return res;
+}
+
+/** Read a token response into a session, or say why it is not one. */
+function toSession(body: TokenResponse, nowSeconds: number): StoredSession {
+  const accessToken = body.access_token;
+  const refreshToken = body.refresh_token;
+  if (typeof accessToken !== "string" || typeof refreshToken !== "string") {
+    throw new AuthError(0, "The server's answer did not contain a session.");
+  }
+  // `expires_at` is what Supabase sends; `expires_in` is the fallback, because a
+  // session with no expiry would be treated as valid forever by the refresh
+  // decision and would fail on the first request instead.
+  const expiresAt =
+    typeof body.expires_at === "number"
+      ? body.expires_at
+      : nowSeconds + (typeof body.expires_in === "number" ? body.expires_in : 3600);
+  return { accessToken, refreshToken, expiresAt };
+}
+
+async function readError(res: Response): Promise<string> {
+  const text = await res.text().catch(() => "");
+  try {
+    const body: unknown = JSON.parse(text);
+    if (typeof body === "object" && body !== null) {
+      const record = body as Record<string, unknown>;
+      for (const field of ["error_description", "msg", "message", "error"]) {
+        if (typeof record[field] === "string") return record[field];
+      }
+    }
+  } catch {
+    // Not JSON; the raw text is the best thing to say.
+  }
+  return text.slice(0, 300) || `HTTP ${res.status}`;
+}
+
+/**
+ * Buy a new access token with the refresh token.
+ *
+ * A refusal here is not a network problem and must not be retried: it means the
+ * session has been ended, by expiry or by *sign out other devices*.
+ */
+export async function refreshSession(refreshToken: string, nowSeconds: number): Promise<StoredSession> {
+  const res = await fetch(`${PROJECT_URL}/auth/v1/token?grant_type=refresh_token`, {
+    method: "POST",
+    headers: headers(),
+    body: JSON.stringify({ refresh_token: refreshToken }),
+  });
+  if (!res.ok) throw new AuthError(res.status, await readError(res));
+  return toSession((await res.json()) as TokenResponse, nowSeconds);
+}
+
+/**
+ * End this session on the server, and only this one.
+ *
+ * `scope=local` is the whole point: a signed-in browser is a different session
+ * and stays signed in. `global` and `others` reach across to it, which is the
+ * app's own *sign out other devices* and not this command's business.
+ */
+export async function signOutLocal(accessToken: string): Promise<void> {
+  const res = await fetch(`${PROJECT_URL}/auth/v1/logout?scope=local`, {
+    method: "POST",
+    headers: headers(accessToken),
+  });
+  // A 401 is **not** "the server had already forgotten it". It says this access
+  // token was not accepted — which an expired one never is, and an access token
+  // outlives its hour far less often than a session outlives a day. Nothing was
+  // revoked in that case, and the refresh token stored beside it is still live.
+  // The two causes are indistinguishable from here, so the ambiguous one is
+  // raised rather than reported as success: a `logout` that says *revoked* while
+  // leaving a usable refresh token on a server is the single outcome this
+  // command exists to prevent.
+  if (!res.ok) throw new AuthError(res.status, await readError(res));
+}
+
+/** Who the session belongs to, for `whoami` to name. */
+export async function currentUser(accessToken: string): Promise<{ email: string | null; id: string | null }> {
+  const res = await fetch(`${PROJECT_URL}/auth/v1/user`, { headers: headers(accessToken) });
+  if (!res.ok) throw new AuthError(res.status, await readError(res));
+  const body = (await res.json()) as Record<string, unknown>;
+  return {
+    email: typeof body.email === "string" ? body.email : null,
+    id: typeof body.id === "string" ? body.id : null,
+  };
+}
+
+/** One organization the signed-in account can see. */
+export interface Organization {
+  id: string;
+  name: string;
+}
+
+/** One agent, as the roster read returns it. */
+export interface Agent {
+  id: string;
+  org_id: string;
+  display_name: string;
+  status: string;
+}
+
+async function selectRows<T>(path: string, accessToken: string): Promise<T[]> {
+  const res = await fetch(`${PROJECT_URL}/rest/v1/${path}`, { headers: headers(accessToken) });
+  if (!res.ok) throw new AuthError(res.status, await readError(res));
+  return (await res.json()) as T[];
+}
+
+/**
+ * The organizations this account belongs to, and the agents in them.
+ *
+ * Both reads go through PostgREST under the caller's own RLS, which is what
+ * makes them the proof the login works: an anonymous request returns nothing and
+ * a stale token is refused, so rows coming back mean the session is real.
+ */
+export function listOrganizations(accessToken: string): Promise<Organization[]> {
+  return selectRows<Organization>("organizations?select=id,name&order=name", accessToken);
+}
+
+export function listAgents(accessToken: string): Promise<Agent[]> {
+  return selectRows<Agent>("agents?select=id,org_id,display_name,status&order=display_name", accessToken);
+}
+
+/** One organization membership of the signed-in account, with the role it holds there. */
+export interface Membership {
+  org_id: string;
+  role: string;
+}
+
+/**
+ * The roles this account holds in the organizations it belongs to.
+ *
+ * `configure` needs it to answer a question the agent roster cannot: whether the
+ * account may *manage* a given agent, which is the same right that governs
+ * adding and deleting one in the app's settings. The read is filtered by the
+ * account's own id rather than trusted to return only its own rows, because the
+ * SELECT policy admits the whole roster of every organization it is in.
+ */
+export function listMemberships(accessToken: string, userId: string): Promise<Membership[]> {
+  return selectRows<Membership>(`organization_members?select=org_id,role&user_id=eq.${encodeURIComponent(userId)}`, accessToken);
+}
+
+/**
+ * Ask the server to mint a connection key for one agent, and receive it.
+ *
+ * **This program never mints a key.** The secret is generated inside the
+ * database by `mint_agent_key`, which stores only its hash and hands the
+ * plaintext back once, gated by the same owner check that governs adding and
+ * deleting the agent. Everything this function does is ask, and everything the
+ * caller does is store what came back.
+ */
+export async function mintAgentKey(accessToken: string, agentId: string): Promise<string> {
+  const res = await fetch(`${PROJECT_URL}/rest/v1/rpc/mint_agent_key`, {
+    method: "POST",
+    headers: headers(accessToken),
+    body: JSON.stringify({ p_agent_id: agentId }),
+  });
+  if (!res.ok) throw new AuthError(res.status, await readError(res));
+  // A table-returning function answers with an array of rows; one row, one key.
+  const body: unknown = await res.json();
+  const row = Array.isArray(body) ? (body[0] as Record<string, unknown> | undefined) : (body as Record<string, unknown>);
+  const key = row?.key;
+  if (typeof key !== "string" || key === "") throw new AuthError(0, "The server's answer did not contain a connection key.");
+  return key;
+}
+
+/**
+ * How much work is waiting for these agents, without taking any of it.
+ *
+ * The cheap gate in front of the claim: a poll asks this every tick and asks for
+ * the work only when the answer is more than none, which is what keeps a
+ * five-minute poll a read rather than a write. **It claims nothing** — a runner
+ * that only looked must not have consumed what it looked at.
+ *
+ * This one and the claim below go to the **app** rather than to PostgREST: they
+ * are the app's own routes, authorised by the same human session as everything
+ * else here, so there is no `apikey` to send.
+ */
+export async function askForCount(
+  accessToken: string,
+  agents: string[],
+): Promise<{ waiting: number; capped: boolean }> {
+  const res = await postToApp("/api/events/count", accessToken, { agents });
+  if (!res.ok) throw new AuthError(res.status, await readError(res));
+  const body: unknown = await res.json();
+  const record = (typeof body === "object" && body !== null ? body : {}) as Record<string, unknown>;
+  const waiting = typeof record.waiting === "number" ? record.waiting : 0;
+  return { waiting, capped: record.capped === true };
+}
+
+/**
+ * Take this runner's next units of work.
+ *
+ * **The claim is terminal**: taking the work is what marks it done, and there is
+ * no acknowledgement afterwards. So a caller must never ask for more than it
+ * will run — which is why `limit` is 1 and the queue exists.
+ *
+ * The body is answered unread: `readWork` in `../work/instruction.ts` is what
+ * decides whether it is one, and keeping that here would put the contract in the
+ * module that cannot be tested without a socket.
+ */
+export async function claimWork(
+  accessToken: string,
+  agents: string[],
+  limit: number,
+  sessionsPerHour: number | null,
+): Promise<unknown> {
+  const res = await postToApp(
+    "/api/events/claim",
+    accessToken,
+    sessionsPerHour === null ? { agents, limit } : { agents, limit, sessionsPerHour },
+  );
+  if (!res.ok) throw new AuthError(res.status, await readError(res));
+  return res.json();
+}

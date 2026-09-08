@@ -1,0 +1,21 @@
+{
+  "name": "@markdown-den/agent-runner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "mdbrain — the runner you can log into",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "bun build --compile src/main.ts --outfile dist/mdbrain"
+  },
+  "dependencies": {
+    "@inkjs/ui": "^2.0.0",
+    "ink": "^7.1.1",
+    "react": "19.2.4"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.18",
+    "ink-testing-library": "^4.0.0",
+    "react-devtools-core": "^7.0.1"
+  }
+}

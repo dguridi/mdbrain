@@ -1,0 +1,302 @@
+// The screen the live view is drawn on, and the presenter that drives it.
+//
+// Everything here is Ink, a clock, or a keyboard — the three things `view.ts`
+// deliberately has none of. The split is `configure`'s: what is *true* is a pure
+// module, and this only draws it and forwards what was pressed.
+//
+// **The roster is drawn even when every row is idle**, which is what it will
+// spend most of its life doing. A long-running mostly-silent process that draws
+// almost nothing is exactly the shape that gets mistaken for a shell that was
+// handed back, so the frame, the command's name and the countdown stay on screen.
+//
+// **The clock lives here, and it only subtracts.** The runner says when the next
+// poll is due; this counts the seconds down to it. A redraw a second is
+// deliberate rather than inherited from the spinner: it is the slowest rate at
+// which a number of seconds can be right.
+//
+// **Reading keys is what takes the interrupt away, and this is where it is given
+// back.** Ink's `useInput` puts the terminal in raw mode, and a terminal in raw
+// mode does not turn Ctrl-C into a signal — so `run`'s SIGINT handler, which is
+// how §5f's graceful stop begins, simply stops being reached. Ctrl-C is
+// therefore a binding like any other, routed to the same handler the signal
+// would have reached. Losing that is not a cosmetic bug: it is a runner that
+// cannot be stopped from the terminal it is running in.
+//
+// Built with `createElement` rather than JSX, so `node src/main.ts` still runs.
+
+import { createElement as h, useEffect, useState, type ReactElement } from "react";
+import { Box, Text, render, useInput, useStdin } from "ink";
+import { Spinner } from "@inkjs/ui";
+import { costText, durationText, plainLine, shortClaim, type Presenter, type RunEvent } from "./present.ts";
+import { actionForKey, keyHints, type ViewRequest } from "./keys.ts";
+import {
+  applyEvent,
+  emptyView,
+  messagePreview,
+  moveSelection,
+  selectedRun,
+  type AgentRow,
+  type RecentRun,
+  type Selection,
+  type ViewState,
+} from "./view.ts";
+
+/** How often the countdown redraws. One second, because that is its own unit. */
+export const COUNTDOWN_TICK_MS = 1_000;
+
+/** The gutter colour, the same one `configure` uses: one rule down the left of the frame. */
+const FRAME_COLOR = "cyan";
+
+const STATE_COLOR: Record<AgentRow["state"], string> = { idle: "gray", running: "green", held: "yellow" };
+
+/** One agent's row: its state, the spinner when it is running, and what it is doing. */
+function agentLine(row: AgentRow, width: number): ReactElement {
+  const trailing: string[] = [];
+  if (row.queued > 0) trailing.push(`${row.queued} waiting`);
+  if (row.note !== null) trailing.push(row.note);
+  return h(
+    Box,
+    { key: row.agent },
+    h(Text, { color: STATE_COLOR[row.state] }, `  ${row.agent.padEnd(width)}  `),
+    row.state === "running"
+      ? h(Spinner, { label: trailing.length > 0 ? trailing.join(" · ") : "running" })
+      : h(
+          Text,
+          { color: STATE_COLOR[row.state], dimColor: row.state === "idle" },
+          row.state === "held"
+            ? `held — ${row.note ?? ""}`
+            : trailing.length > 0
+              ? `idle · ${trailing.join(" · ")}`
+              : "idle",
+        ),
+  );
+}
+
+/**
+ * What the countdown says, given the runner's phase and the moment it is read.
+ *
+ * Pure and exported so a test can read it without a terminal or a real clock.
+ * A deadline already past reads as *due now* rather than as a negative number:
+ * the poll is a turn of the loop away and the arithmetic saying otherwise is the
+ * clock's rounding, not a fact about the runner.
+ *
+ * **A runner that will not poll again says so instead of counting.** Otherwise
+ * the countdown keeps running through a shutdown, or through the whole of a
+ * `--once` run waiting on its sessions, and counts down to a poll that is never
+ * coming — which is the one kind of lie a screen like this can tell.
+ */
+export function countdownText(state: ViewState, now: number): string | null {
+  switch (state.poll.kind) {
+    case "unknown":
+      return null;
+    case "polling":
+      return "polling now";
+    case "finishing":
+      return "no more polls — waiting for the sessions that are running";
+    case "waiting": {
+      const left = state.poll.at - now;
+      return left <= 0 ? "next poll due now" : `next poll in ${durationText(left)}`;
+    }
+  }
+}
+
+/**
+ * The run the cursor is on, drawn in full.
+ *
+ * **The message is the whole point of this block.** A row in the recent list
+ * says a session failed; only the harness’s own words say why, and until now the
+ * only place they existed was a line in `runs.jsonl` that a person had to leave
+ * the program to read. The claim is shown beside them because it is the id that
+ * row is keyed on, so the detail points at the rest of the record without this
+ * view ever reading it.
+ */
+function runDetail(run: RecentRun): ReactElement[] {
+  const { text, truncated } = messagePreview(run.message);
+  const children: ReactElement[] = [
+    h(Text, { key: "detail-heading", color: FRAME_COLOR }, "The run you picked"),
+    h(
+      Text,
+      { key: "detail-head", color: run.outcome === "done" ? "green" : "red" },
+      `  ${run.agent}  ${run.outcome}  ${durationText(run.ms)}  ${costText(run.costUsd)}  claim ${shortClaim(run.claim)}`,
+    ),
+  ];
+  children.push(h(Text, { key: "detail-message" }, `  ${text === "" ? "(the harness said nothing)" : text}`));
+  if (truncated) {
+    children.push(
+      h(Text, { key: "detail-more", dimColor: true }, `  The rest of it is in the run log, on the row for claim ${shortClaim(run.claim)}.`),
+    );
+  }
+  return children;
+}
+
+/** What the screen needs beyond the runner’s own state to draw one frame. */
+export interface ScreenFrame {
+  /** The moment the countdown is read against, in epoch milliseconds. */
+  now: number;
+  /**
+   * Whether keys are being read, which decides whether they are offered — a
+   * hint naming a key nothing is listening for is worse than no hint at all.
+   */
+  keysActive: boolean;
+  /** Which recent run is open, which is the person’s state and not the runner’s. */
+  selection: Selection;
+}
+
+/** The whole screen. Exported so a test can draw it with its own clock. */
+export function liveView(state: ViewState, frame: ScreenFrame): ReactElement {
+  const { now, keysActive, selection } = frame;
+  const width = Math.max(1, ...state.agents.map((a) => a.agent.length));
+  const children: ReactElement[] = [h(Text, { key: "title", color: FRAME_COLOR, bold: true }, "mdbrain run")];
+  for (const line of state.summary.slice(1)) {
+    children.push(h(Text, { key: `summary-${line}`, dimColor: true }, line));
+  }
+  children.push(h(Text, { key: "agents-heading", color: FRAME_COLOR }, "Agents"));
+  if (state.agents.length === 0) {
+    children.push(h(Text, { key: "no-agents", dimColor: true }, "  (none configured)"));
+  } else {
+    for (const row of state.agents) children.push(agentLine(row, width));
+  }
+
+  children.push(h(Text, { key: "recent-heading", color: FRAME_COLOR }, "Recent runs"));
+  const open = selectedRun(state.recent, selection);
+  if (state.recent.length === 0) {
+    children.push(h(Text, { key: "no-recent", dimColor: true }, "  (none this session)"));
+  } else {
+    state.recent.forEach((run) => {
+      // The cursor is a mark in the gutter rather than a highlight, so a row
+      // reads the same whether or not the terminal honours inverse video.
+      const picked = open !== null && open.claim === run.claim;
+      children.push(
+        h(
+          Text,
+          // Keyed on the claim rather than the position, for the same reason the
+          // cursor is: the list grows from the top and a row is not the run it
+          // was a moment ago.
+          { key: `recent-${run.claim}`, color: run.outcome === "done" ? "green" : "red", bold: picked },
+          `${picked ? "› " : "  "}${run.agent}  ${run.outcome}  ${durationText(run.ms)}  ${costText(run.costUsd)}`,
+        ),
+      );
+    });
+  }
+  if (open !== null) children.push(...runDetail(open));
+
+  if (state.note !== null) children.push(h(Text, { key: "note", dimColor: true }, `  ${state.note}`));
+
+  const countdown = countdownText(state, now);
+  if (countdown !== null) children.push(h(Text, { key: "countdown", color: FRAME_COLOR }, `  ${countdown}`));
+  // The keys are named on screen rather than left to be known. A terminal whose
+  // stdin cannot be put in raw mode reads none, and offering them there would be
+  // an instruction that does nothing.
+  if (keysActive) children.push(h(Text, { key: "keys", dimColor: true }, `  ${keyHints().join("   ")}`));
+
+  return h(
+    Box,
+    {
+      flexDirection: "column",
+      borderStyle: "round",
+      borderColor: FRAME_COLOR,
+      borderTop: false,
+      borderRight: false,
+      borderBottom: false,
+      paddingLeft: 1,
+    },
+    ...children,
+  );
+}
+
+/** What the presenter hands the screen: the state to draw, and where a key goes. */
+interface ScreenProps {
+  state: ViewState;
+  onRequest: (request: ViewRequest) => void;
+}
+
+/**
+ * The live screen: the state drawn, the countdown ticking, the keys read.
+ *
+ * **It holds two things of its own, and neither is the runner's.** `now` exists
+ * so the countdown can subtract, and the timer behind it runs **only while there
+ * is a deadline to count down to** — a runner that is polling, or one that has
+ * not said yet, has nothing on screen that changes with the clock, and a timer
+ * running then would be a redraw with nothing behind it. `selection` is which
+ * recent run the person opened, which is a fact about the person rather than
+ * about the runner, and is exactly why the keys that move it never leave this
+ * component while the two that ask the runner for something always do.
+ */
+function LiveScreen({ state, onRequest }: ScreenProps): ReactElement {
+  const [now, setNow] = useState(() => Date.now());
+  const [selection, setSelection] = useState<Selection>(null);
+  const deadline = state.poll.kind === "waiting" ? state.poll.at : null;
+  useEffect(() => {
+    if (deadline === null) return;
+    // Read the clock once on arrival too: the deadline is new, and waiting a
+    // whole second before the first number would show a countdown that starts
+    // late by exactly the interval it counts in.
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), COUNTDOWN_TICK_MS);
+    return () => clearInterval(timer);
+  }, [deadline]);
+
+  const { isRawModeSupported } = useStdin();
+  useInput(
+    (input, key) => {
+      const action = actionForKey(input, key);
+      // A key this view does not offer is ignored rather than guessed at.
+      if (action === null) return;
+      if (action.to === "loop") onRequest(action.request);
+      else setSelection((current) => moveSelection(state.recent, current, action.action));
+    },
+    { isActive: isRawModeSupported },
+  );
+
+  return liveView(state, { now, keysActive: isRawModeSupported, selection });
+}
+
+/** The screen as an element, so a test can drive its keys without a terminal. */
+export function liveScreenFor(state: ViewState, onRequest: (request: ViewRequest) => void = () => {}): ReactElement {
+  return h(LiveScreen, { state, onRequest });
+}
+
+/**
+ * The live presenter: the same events, drawn rather than printed.
+ *
+ * The stopping line is printed after the view is unmounted rather than drawn
+ * inside it, because it is the one thing a person reads once the screen is gone.
+ *
+ * The request handler starts as a no-op and is replaced by `listen`, because the
+ * screen is drawn before the loop that answers a keypress exists — and a key
+ * pressed in that window should do nothing rather than reach a half-built runner.
+ */
+export function livePresenter(out: (line: string) => void, now: () => Date = () => new Date()): Presenter {
+  let state = emptyView;
+  let handler: (request: ViewRequest) => void = () => {};
+  const forward = (request: ViewRequest) => handler(request);
+  const app = render(h(LiveScreen, { state, onRequest: forward }), { exitOnCtrlC: false });
+  let live = true;
+
+  const unmount = () => {
+    if (!live) return;
+    live = false;
+    app.unmount();
+  };
+
+  return {
+    present(event, at) {
+      if (event.kind === "stopped") {
+        unmount();
+        const text = plainLine({ at: at ?? now(), event });
+        if (text !== null) out(text);
+        return;
+      }
+      state = applyEvent(state, event);
+      if (live) app.rerender(h(LiveScreen, { state, onRequest: forward }));
+    },
+    listen(next) {
+      handler = next;
+    },
+    async stop() {
+      unmount();
+      await app.waitUntilExit();
+    },
+  };
+}
+
