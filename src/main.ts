@@ -10,13 +10,19 @@ import { configure } from "./commands/configure.ts";
 import { login } from "./commands/login.ts";
 import { logout } from "./commands/logout.ts";
 import { run as runCommand } from "./commands/run.ts";
+import { upgrade } from "./commands/upgrade.ts";
 import { whoami } from "./commands/whoami.ts";
+import { sweepLeftover } from "./upgrade/sweep.ts";
+import { VERSION } from "./version.ts";
 
-/** The version `--version` prints; kept in step with `package.json`. */
-export const VERSION = "0.1.0";
+// Re-exported so the many callers that already ask this module for the version
+// keep working; what it *is* lives in `version.ts`, beside the two other
+// build-time constants, because `upgrade` reads all three and this module
+// imports `upgrade`.
+export { VERSION };
 
 /** Every command this binary has. */
-export const COMMANDS: CommandSpec[] = [login, whoami, logout, configure, runCommand];
+export const COMMANDS: CommandSpec[] = [login, whoami, logout, configure, runCommand, upgrade];
 
 /**
  * Run one invocation.
@@ -25,6 +31,13 @@ export const COMMANDS: CommandSpec[] = [login, whoami, logout, configure, runCom
  * the bottom of this file so importing the command list costs nothing.
  */
 export function run(argv: string[]): Promise<number> {
+  // Best-effort, unawaited and unreported: a Windows upgrade leaves a displaced
+  // binary that cannot be deleted while the process running from it is alive, so
+  // every invocation has a go and every failure is the expected one. It is here
+  // rather than in `upgrade` because the file outlives the command that made it,
+  // and in the binary rather than only in the installer because `upgrade` makes
+  // the same leftover the installer does.
+  void sweepLeftover(process.execPath, process.platform);
   return dispatch(argv, COMMANDS, VERSION, {
     out: (line) => console.log(line),
     err: (line) => console.error(line),

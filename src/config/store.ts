@@ -10,15 +10,17 @@
 // it holds no secret and is meant to be copied.
 //
 // The per-agent MCP file is what the harness is pointed at to reach the
-// workspace as that agent. It carries the connection key as `${VARIABLE}` — the
+// workspace as that agent. **Its contents are the harness's and are written by
+// the harness spec**; what belongs here is where the file goes, when it is
+// rewritten, and when a stale one is swept. It carries the connection key as `${VARIABLE}` — the
 // variable's name, which the harness expands from the session's environment —
 // and never the value, so it can sit under the config root and travel with it.
 
 import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { configDir, configPath, type PathEnv } from "./paths.ts";
-import { MCP_SERVER_NAME, MCP_URL } from "../auth/project.ts";
 import { newAgentMap, parseConfig, serializeConfig, type Config } from "./schema.ts";
+import { harnessFor, type HarnessSpec } from "../run/harness.ts";
 import { DRAFT_VERSION, mcpFileNameFor, parseDraft, type ConfigureDraft } from "../configure/questions.ts";
 
 /** What was on disk, with the two failures told apart from absence. */
@@ -113,30 +115,23 @@ export function mcpConfigPath(agentName: string, env?: PathEnv): string {
 }
 
 /**
- * The MCP configuration the harness is handed for one agent.
+ * Write one agent's MCP file, creating the folder on the first agent.
  *
- * The header names the variable rather than carrying the key, in the `${NAME}`
- * form the harness expands from its environment. The file is therefore not a
- * secret, which is what allows it to live under the config root.
+ * **The text comes from the harness, not from here.** What that file contains is
+ * the harness's question — which keys it carries, and whether it is JSON at all —
+ * and this module's question is only where it goes and when it is rewritten.
+ * The spec is passed rather than defaulted, so a caller cannot write one
+ * harness's file for an agent that named another.
  */
-export function mcpConfigText(connectionKeyVariable: string): string {
-  const config = {
-    mcpServers: {
-      [MCP_SERVER_NAME]: {
-        type: "http",
-        url: MCP_URL,
-        headers: { Authorization: `Bearer \${${connectionKeyVariable}}` },
-      },
-    },
-  };
-  return `${JSON.stringify(config, null, 2)}\n`;
-}
-
-/** Write one agent's MCP file, creating the folder on the first agent. */
-export async function writeMcpConfig(agentName: string, connectionKeyVariable: string, env?: PathEnv): Promise<string> {
+export async function writeMcpConfig(
+  agentName: string,
+  connectionKeyVariable: string,
+  harness: HarnessSpec,
+  env?: PathEnv,
+): Promise<string> {
   const path = mcpConfigPath(agentName, env);
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, mcpConfigText(connectionKeyVariable), "utf8");
+  await writeFile(path, harness.mcpConfigText(connectionKeyVariable), "utf8");
   return path;
 }
 
@@ -160,8 +155,13 @@ export async function syncMcpConfigs(config: Config, env?: PathEnv): Promise<{ m
   // it would be absent from `keep` and removed again as though it were stale.
   const mcpPaths = newAgentMap() as unknown as Record<string, string>;
   for (const [name, entry] of Object.entries(config.agents)) {
-    mcpPaths[name] = await writeMcpConfig(name, entry.env.connectionKey, env);
+    mcpPaths[name] = await writeMcpConfig(name, entry.env.connectionKey, harnessFor(entry.harness), env);
   }
+  // The sweep still knows one file shape — `agent-*.json` — which is the half of
+  // this seam that has NOT moved. It is correct while every harness writes JSON
+  // under that name, and the day one does not, two harnesses on one machine will
+  // want two shapes and this set will be deciding for both of them. Left as it is
+  // deliberately rather than generalised against a second harness nobody has.
   const keep = new Set(Object.values(mcpPaths));
   const removed: string[] = [];
   for (const file of await readdir(mcpDir(env))) {

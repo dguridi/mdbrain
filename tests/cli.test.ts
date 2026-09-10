@@ -28,12 +28,27 @@ describe("the command line", () => {
     expect(await dispatch(["--help"], COMMANDS, VERSION, io)).toBe(0);
     const help = out.join("\n");
     for (const command of COMMANDS) expect(help).toContain(command.name);
-    expect(COMMANDS.map((c) => c.name)).toEqual(["login", "whoami", "logout", "configure", "run"]);
+    expect(COMMANDS.map((c) => c.name)).toEqual(["login", "whoami", "logout", "configure", "run", "upgrade"]);
   });
 
   it("96-S22a: every command carries a summary, so help cannot go stale silently", () => {
     for (const command of COMMANDS) expect(command.summary.length).toBeGreaterThan(0);
     expect(renderHelp(COMMANDS, VERSION)).toContain(VERSION);
+  });
+
+  it("109-S3: --version prints the bare version, which is what the release smoke test compares to the tag", async () => {
+    // The release workflow tests `mdbrain --version` against the tag with a
+    // string equality, so a decorated answer — `mdbrain 0.2.0`, the shape
+    // `renderHelp` right above already uses — would fail the release after
+    // seven cross-compiles at tag time rather than failing here. `VERSION` is
+    // the constant the release binds, so it is what goes in, and the whole of
+    // what must come out.
+    for (const flag of ["--version", "-v"]) {
+      const { out, err, io } = capture();
+      expect(await dispatch([flag], COMMANDS, VERSION, io), flag).toBe(0);
+      expect(out, flag).toEqual([VERSION]);
+      expect(err, flag).toEqual([]);
+    }
   });
 
   it("96-S22b: an unknown command is refused with its own exit code", async () => {

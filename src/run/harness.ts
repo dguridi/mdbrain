@@ -32,7 +32,7 @@
 // Pure: `build` takes values and answers argv and an environment. Nothing here
 // spawns anything, which is what lets every flag be asserted without a process.
 
-import { MCP_SERVER_NAME } from "../auth/project.ts";
+import { MCP_SERVER_NAME, MCP_URL } from "../auth/project.ts";
 import type { Bounds, HarnessId } from "../config/schema.ts";
 import { readOutcome, type Outcome, type SessionEnd } from "./outcome.ts";
 
@@ -71,6 +71,15 @@ export interface HarnessSpec {
   id: HarnessId;
   /** The variable the harness itself reads its credential from. */
   credentialVariable: string;
+  /**
+   * The MCP configuration file this harness reads, as text.
+   *
+   * On the spec rather than in the config store because the file format is the
+   * harness's, not the protocol's: what keys it carries and whether it is JSON
+   * at all differ per harness, and a store that wrote one shape for all of them
+   * would be a Claude assumption with a general name on it.
+   */
+  mcpConfigText(connectionKeyVariable: string): string;
   build(input: Invocation): Spawnable;
   readOutcome(end: SessionEnd): Outcome;
 }
@@ -119,10 +128,42 @@ export function credentialsCollide(spec: HarnessSpec, connectionKeyVariable: str
   return connectionKeyVariable === spec.credentialVariable;
 }
 
+/**
+ * Claude Code's MCP configuration file, as text.
+ *
+ * **Named for the format it writes rather than for the protocol.** The shape
+ * below — a `mcpServers` object, an `http` type, a bearer header — is Claude
+ * Code's file and not a general MCP one: another harness reading the same
+ * server will want its own keys, and one of them wants TOML rather than JSON.
+ * The seam is here, beside the argv this harness is started with and the
+ * credential variable it reads, because that is where the rest of the Claude
+ * assumptions live and where somebody adding a second harness will look.
+ *
+ * The header names the variable rather than carrying the key, in the `${NAME}`
+ * form the harness expands from its environment. The file is therefore not a
+ * secret, which is what allows it to live under the config root.
+ *
+ * @param connectionKeyVariable the environment variable holding this agent's key
+ * @returns the file's whole text, newline-terminated
+ */
+export function claudeMcpConfigText(connectionKeyVariable: string): string {
+  const config = {
+    mcpServers: {
+      [MCP_SERVER_NAME]: {
+        type: "http",
+        url: MCP_URL,
+        headers: { Authorization: `Bearer \${${connectionKeyVariable}}` },
+      },
+    },
+  };
+  return `${JSON.stringify(config, null, 2)}\n`;
+}
+
 /** Claude Code, the one harness this build has. */
 export const claudeHarness: HarnessSpec = {
   id: "claude",
   credentialVariable: "ANTHROPIC_API_KEY",
+  mcpConfigText: claudeMcpConfigText,
 
   build(input) {
     return {

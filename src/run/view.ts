@@ -32,6 +32,7 @@
 import type { OutcomeKind } from "./outcome.ts";
 import type { RunEvent, RunPhase } from "./present.ts";
 import type { ScreenAction } from "./keys.ts";
+import { versionNoticeText } from "../upgrade/notice.ts";
 
 /** How many finished sessions the view remembers. Memory only, and never read back. */
 export const RECENT_LIMIT = 5;
@@ -67,6 +68,15 @@ export interface RecentRun {
   message: string;
   /** The claim, which is the same id the run log’s row is keyed on. */
   claim: string;
+  /**
+   * When the session ended, as the stamp its own event carried.
+   *
+   * **The envelope's moment rather than a clock read here**, which is what keeps
+   * this reducer clockless: the runner stamps every event once, the plain log
+   * prints that stamp, and the screen remembers it — so a row on screen and a
+   * line in the log cannot come to disagree about when a run finished.
+   */
+  at: Date;
 }
 
 /**
@@ -87,6 +97,21 @@ export interface ViewState {
   summary: string[];
   /** The last thing that was not about a particular agent. */
   note: string | null;
+  /**
+   * That a newer version is published, and how to get it — **its own field, and
+   * that is the point of it.**
+   *
+   * `note` is a single slot that six senders overwrite, so a version notice put
+   * there survives only until the next of them fires. This one is reachable by
+   * nothing but a `version` event.
+   *
+   * **It is also persistent, unlike `note`.** A note is the last thing that
+   * happened and stops being interesting; this stays true until the runner is
+   * restarted onto the new version, so nothing clears it — not a poll, not a key,
+   * not a session. A second check that finds the same tag leaves it exactly as it
+   * was.
+   */
+  versionNotice: string | null;
   /** How much work the last poll found, when it said. */
   waiting: number | null;
   poll: PollPhase;
@@ -98,6 +123,7 @@ export const emptyView: ViewState = {
   recent: [],
   summary: [],
   note: null,
+  versionNotice: null,
   waiting: null,
   poll: { kind: "unknown" },
 };
@@ -123,7 +149,7 @@ function withRow(state: ViewState, agent: string, change: (row: AgentRow) => Age
  * That is what makes "the presenter never decides anything" checkable rather
  * than merely stated.
  */
-export function applyEvent(state: ViewState, event: RunEvent): ViewState {
+export function applyEvent(state: ViewState, event: RunEvent, at: Date): ViewState {
   switch (event.kind) {
     case "configured":
       return withRow(state, event.agent, (row) => ({ ...row, state: "idle", note: null }));
@@ -168,6 +194,7 @@ export function applyEvent(state: ViewState, event: RunEvent): ViewState {
         costUsd: event.costUsd,
         message: event.message,
         claim: event.claim,
+        at,
       };
       return { ...next, recent: [run, ...next.recent].slice(0, RECENT_LIMIT) };
     }
@@ -181,13 +208,24 @@ export function applyEvent(state: ViewState, event: RunEvent): ViewState {
       return {
         ...next,
         recent: [
-          { agent: event.agent, outcome: event.outcome, ms: event.ms, costUsd: null, message: event.message, claim: event.claim },
+          { agent: event.agent, outcome: event.outcome, ms: event.ms, costUsd: null, message: event.message, claim: event.claim, at },
           ...next.recent,
         ].slice(0, RECENT_LIMIT),
       };
     }
+    case "day":
+      // Nothing. The date is for a log read back later; every run on this screen
+      // says its own age, which is the same question answered where it is asked.
+      return state;
     case "note":
       return { ...state, note: event.message };
+    case "version":
+      // Composed here rather than on the screen, so the line a log file keeps
+      // and the line a person reads are the same sentence. A later notice
+      // replaces an earlier one: the newest published version is the only one
+      // worth acting on, and two of these stacked up would be a list nobody
+      // asked for.
+      return { ...state, versionNotice: versionNoticeText({ version: event.version, how: event.how }) };
     case "stopped":
       // The last line is printed after the view is gone, so there is nothing to
       // draw for it. `livePresenter` is where that happens.

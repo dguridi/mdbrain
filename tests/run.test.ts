@@ -13,11 +13,11 @@ import {
   type PollNowState,
 } from "../src/run/loop.ts";
 import { childEnvironment, claudeHarness, harnessFor, type Invocation } from "../src/run/harness.ts";
-import { UNREADABLE_OUTCOME_MESSAGE, readOutcome, resultObject, type SessionEnd } from "../src/run/outcome.ts";
+import { OUTCOME_KINDS, UNREADABLE_OUTCOME_MESSAGE, readOutcome, resultObject, type OutcomeKind, type SessionEnd } from "../src/run/outcome.ts";
 import { logRow, rowText } from "../src/run/log.ts";
-import { costText, durationText, plainLine, plainPresenter, shortClaim, type RunEvent } from "../src/run/present.ts";
+import { agoText, clockText, costText, dayLine, durationText, plainLine, plainPresenter, shortClaim, type RunEvent } from "../src/run/present.ts";
 import type { Config } from "../src/config/schema.ts";
-import { mcpConfigText } from "../src/config/store.ts";
+
 import type { WorkUnit } from "../src/work/instruction.ts";
 import {
   MESSAGE_PREVIEW_LIMIT,
@@ -132,6 +132,9 @@ const good = (over: Record<string, unknown> = {}) =>
     ...over,
   });
 
+// One stamp for every reducer case whose subject is not the clock.
+const AT = new Date(2026, 8, 8, 22, 11, 40);
+
 describe("run: startup", () => {
   it("105-S20: an agent whose credential variable is unset, or whose directory is gone, is held by name and the rest continue", () => {
     const plan = planStartup(
@@ -238,7 +241,7 @@ describe("run: the session's invocation", () => {
     expect(at).toBeGreaterThan(-1);
     expect(built.args[at + 1]).toBe("mcp__markdown-den");
 
-    const declared = Object.keys((JSON.parse(mcpConfigText("MDBRAIN_KEY_DEV_BOT_MDDEN")) as { mcpServers: Record<string, unknown> }).mcpServers);
+    const declared = Object.keys((JSON.parse(claudeHarness.mcpConfigText("MDBRAIN_KEY_DEV_BOT_MDDEN")) as { mcpServers: Record<string, unknown> }).mcpServers);
     expect(declared).toEqual(["markdown-den"]);
     expect(built.args[at + 1]).toBe(`mcp__${declared[0]}`);
   });
@@ -628,6 +631,7 @@ async function drive(over: Partial<import("../src/commands/run.ts").RunDeps> = {
   const out: string[] = [];
   const err: string[] = [];
   const rows: unknown[] = [];
+  const notes: import("../src/run/diagnosis.ts").DiagnosisRow[] = [];
   const spawned: Array<{ command: string; args: string[]; env: Record<string, string> }> = [];
   const deps: import("../src/commands/run.ts").RunDeps = {
     isTTY: false,
@@ -651,12 +655,17 @@ async function drive(over: Partial<import("../src/commands/run.ts").RunDeps> = {
     recordRun: async (row) => {
       rows.push(row);
     },
+    recordDiagnosis: async (row) => {
+      notes.push(row);
+    },
     sleep: async () => {},
     now: () => new Date(2026, 8, 4, 12, 4, 1),
+    lookupLatest: async () => null,
+    build: { version: "0.1.0", channel: "direct", isCompiled: true },
     ...over,
   };
   const code = await runRun(deps, { positional: [], flags: { once: true, ...flags }, out: (l) => out.push(l), err: (l) => err.push(l) });
-  return { code, out, err, rows, spawned };
+  return { code, out, err, rows, notes, spawned };
 }
 
 describe("run: the command, driven end to end", () => {
@@ -873,7 +882,7 @@ describe("run: the live view", () => {
   /** A fixed moment, so the countdown a test reads is arithmetic rather than timing. */
   const NOW = new Date(2026, 8, 4, 12, 4, 1).getTime();
   const frame = (over: Partial<ScreenFrame> = {}): ScreenFrame => ({ now: NOW, keysActive: true, selection: null, ...over });
-  const feed = (events: RunEvent[]) => events.reduce((state, event) => applyEvent(state, event), emptyView);
+  const feed = (events: RunEvent[]) => events.reduce((state, event) => applyEvent(state, event, AT), emptyView);
 
   it("105-S54: an agent idle, then running, then idle again reflects each transition", () => {
     const idle = feed([{ kind: "configured", agent: "dev-bot-mdden" }]);
@@ -886,10 +895,10 @@ describe("run: the live view", () => {
       unitKind: "file-arrived",
       seq: 8412,
       workspace: "01-ideas",
-    });
+    }, AT);
     expect(running.agents[0]).toMatchObject({ state: "running", note: "file-arrived #8412 · 01-ideas" });
 
-    const back = applyEvent(running, { kind: "done", agent: "dev-bot-mdden", claim: "c1", ms: 1000, costUsd: 1, turns: 2, message: "Done." });
+    const back = applyEvent(running, { kind: "done", agent: "dev-bot-mdden", claim: "c1", ms: 1000, costUsd: 1, turns: 2, message: "Done." }, AT);
     expect(back.agents[0]).toMatchObject({ state: "idle", note: null });
 
     // Drawn rather than only held: the running row is the one that mounts the
@@ -1010,7 +1019,7 @@ describe("run: the live view", () => {
       { kind: "queued", agent: "a", depth: 2 },
     ]);
     expect(queued.agents[0]).toMatchObject({ state: "running", queued: 2 });
-    const after = applyEvent(queued, { kind: "done", agent: "a", claim: "c1", ms: 1, costUsd: null, turns: null, message: "Done." });
+    const after = applyEvent(queued, { kind: "done", agent: "a", claim: "c1", ms: 1, costUsd: null, turns: null, message: "Done." }, AT);
     expect(after.agents[0].queued).toBe(1);
   });
 
@@ -1019,7 +1028,7 @@ describe("run: the live view", () => {
       { kind: "configured", agent: "a" },
       { kind: "start", agent: "a", claim: "c", unitKind: "k", seq: 1, workspace: "w" },
     ]);
-    expect(applyEvent(before, { kind: "skipped", agent: "a", reason: "a: a session is already running." })).toBe(before);
+    expect(applyEvent(before, { kind: "skipped", agent: "a", reason: "a: a session is already running." }, AT)).toBe(before);
   });
 });
 
@@ -1226,7 +1235,7 @@ describe("run: the countdown and the keys", () => {
     for (let i = 0; i < 4; i += 1) await new Promise((r) => setTimeout(r, 25));
   };
   const frame = (over: Partial<ScreenFrame> = {}): ScreenFrame => ({ now: NOW, keysActive: true, selection: null, ...over });
-  const feed = (events: RunEvent[]) => events.reduce((state, event) => applyEvent(state, event), emptyView);
+  const feed = (events: RunEvent[]) => events.reduce((state, event) => applyEvent(state, event, AT), emptyView);
   const press = (over: Partial<KeyModifiers> = {}): KeyModifiers => ({ ctrl: false, upArrow: false, downArrow: false, escape: false, ...over });
 
   it("105-S60: the deadline arrives as an event, and the only thing the clock supplies is the subtraction", () => {
@@ -1241,7 +1250,7 @@ describe("run: the countdown and the keys", () => {
     // negative number: the loop is one turn away and the arithmetic is rounding.
     expect(countdownText(waiting, NOW + 300_000)).toBe("next poll due now");
 
-    expect(countdownText(applyEvent(waiting, { kind: "phase", phase: { kind: "polling" } }), NOW)).toBe("polling now");
+    expect(countdownText(applyEvent(waiting, { kind: "phase", phase: { kind: "polling" } }, AT), NOW)).toBe("polling now");
     // A runner that has not said where it is says nothing rather than guessing.
     expect(countdownText(emptyView, NOW)).toBeNull();
     expect(render(liveView(waiting, frame())).lastFrame()).toContain("next poll in 4m12s");
@@ -1298,9 +1307,9 @@ describe("run: the countdown and the keys", () => {
     expect(answerPollNow(NOW + POLL_NOW_MIN_GAP_MS, where({ lastTakenAt: NOW })).kind).toBe("taken");
 
     // And a refusal reaches the screen, which is the whole point of saying it.
-    const refused = applyEvent(emptyView, { kind: "asked", taken: false, reason: inFlight.reason });
+    const refused = applyEvent(emptyView, { kind: "asked", taken: false, reason: inFlight.reason }, AT);
     expect(refused.note).toBe(inFlight.reason);
-    expect(applyEvent(refused, { kind: "asked", taken: true, reason: null }).note).toBeNull();
+    expect(applyEvent(refused, { kind: "asked", taken: true, reason: null }, AT).note).toBeNull();
   });
 
   it("105-S63: every key the view names is one it accepts, and every key it accepts is named", () => {
@@ -1475,7 +1484,7 @@ describe("run: the countdown and the keys", () => {
 describe("run: the message a run left behind", () => {
   const NOW = new Date(2026, 8, 4, 12, 4, 1).getTime();
   const frame = (over: Partial<ScreenFrame> = {}): ScreenFrame => ({ now: NOW, keysActive: true, selection: null, ...over });
-  const feed = (events: RunEvent[]) => events.reduce((state, event) => applyEvent(state, event), emptyView);
+  const feed = (events: RunEvent[]) => events.reduce((state, event) => applyEvent(state, event, AT), emptyView);
   const twoRuns = () =>
     feed([
       { kind: "configured", agent: "a" },
@@ -1510,7 +1519,7 @@ describe("run: the message a run left behind", () => {
     expect(selectedRun(view.recent, first)!.message).toContain("no credential");
 
     // A run finishing pushes the list down; the selection is still the same run.
-    const after = applyEvent(view, { kind: "done", agent: "a", claim: "c3", ms: 5, costUsd: null, turns: null, message: "Third." });
+    const after = applyEvent(view, { kind: "done", agent: "a", claim: "c3", ms: 5, costUsd: null, turns: null, message: "Third." }, AT);
     expect(after.recent[0].claim).toBe("c3");
     expect(selectedRun(after.recent, first)!.claim).toBe("c2");
 
@@ -1541,7 +1550,7 @@ describe("run: the message a run left behind", () => {
     await settle();
     expect(lastFrame() ?? "").toContain("claim c2");
 
-    const after = applyEvent(before, { kind: "done", agent: "a", claim: "c3", ms: 5, costUsd: null, turns: null, message: "Third." });
+    const after = applyEvent(before, { kind: "done", agent: "a", claim: "c3", ms: 5, costUsd: null, turns: null, message: "Third." }, AT);
     rerender(liveScreenFor(after));
     await settle();
     expect(after.recent[0].claim).toBe("c3");
@@ -1598,5 +1607,678 @@ describe("run: the message a run left behind", () => {
     stdin.write(ESCAPE);
     await settle();
     expect(lastFrame() ?? "").not.toContain("The run you picked");
+  });
+});
+
+describe("run: when a run happened", () => {
+  const ENDED = new Date(2026, 8, 4, 12, 4, 1);
+  const frame = (over: Partial<ScreenFrame> = {}): ScreenFrame => ({
+    now: ENDED.getTime() + 3 * 60_000,
+    keysActive: true,
+    selection: null,
+    ...over,
+  });
+  const oneRun = (at: Date) =>
+    [
+      { kind: "configured", agent: "a" } as RunEvent,
+      { kind: "done", agent: "a", claim: "c1", ms: 1000, costUsd: 0.1, turns: 1, message: "Triaged three files." } as RunEvent,
+    ].reduce((state, event) => applyEvent(state, event, at), emptyView);
+
+  it("105-S94: a recent run remembers the stamp its own event carried", () => {
+    const view = oneRun(ENDED);
+    expect(view.recent[0].at).toEqual(ENDED);
+
+    // The screen's stamp and the log's stamp are the same value, so a row and a
+    // line cannot come to disagree about when a session ended.
+    const logged = plainLine({ at: ENDED, event: { kind: "done", agent: "a", claim: "c1", ms: 1000, costUsd: 0.1, turns: 1, message: "x" } });
+    expect(logged).toContain(clockText(view.recent[0].at));
+  });
+
+  it("105-S94: the row says the clock and the age together", () => {
+    const drawn = render(liveView(oneRun(ENDED), frame())).lastFrame() ?? "";
+    expect(drawn).toContain("12:04:01 · 3m ago");
+  });
+
+  it("105-S94: the stamps land in one column, whatever is in front of them", () => {
+    // Four variable-width fields sit between a row and its stamp, so without
+    // padding the stamps land in as many places as there are rows and the eye
+    // has to find each one.
+    const view = [
+      { kind: "done", agent: "a", claim: "c1", ms: 1_000, costUsd: 0.1, turns: 1, message: "x" } as RunEvent,
+      { kind: "failed", agent: "a-much-longer-name", claim: "c2", outcome: "failed", ms: 3_600_000, message: "y" } as RunEvent,
+    ].reduce((state, event) => applyEvent(state, event, ENDED), emptyView);
+    const rows = (render(liveView(view, frame())).lastFrame() ?? "")
+      .split("\n")
+      .filter((line) => line.includes("12:04:01 ·"));
+    expect(rows).toHaveLength(2);
+    expect(new Set(rows.map((line) => line.indexOf("12:04:01")))).toHaveLength(1);
+  });
+
+  it("105-S95: the age is coarse, and answers ten-minutes-ago or yesterday", () => {
+    expect(agoText(0)).toBe("just now");
+    expect(agoText(59_000)).toBe("just now");
+    // A clock that disagrees with itself by a moment is likelier than a run that
+    // has not happened yet.
+    expect(agoText(-5_000)).toBe("just now");
+    expect(agoText(60_000)).toBe("1m ago");
+    expect(agoText(10 * 60_000)).toBe("10m ago");
+    expect(agoText(59 * 60_000)).toBe("59m ago");
+    expect(agoText(64 * 60_000)).toBe("1h ago");
+    expect(agoText(23 * 3_600_000)).toBe("23h ago");
+    expect(agoText(25 * 3_600_000)).toBe("1d ago");
+    expect(agoText(3 * 86_400_000)).toBe("3d ago");
+  });
+
+  it("105-S96: the date is announced first and then only when the local day changes", () => {
+    const monday = new Date(2026, 8, 7, 23, 59, 30);
+    const stillMonday = new Date(2026, 8, 7, 23, 59, 59);
+    const tuesday = new Date(2026, 8, 8, 0, 0, 4);
+
+    expect(dayLine(null, monday)).toBe("Mon 7 Sep 2026");
+    expect(dayLine(monday, stillMonday)).toBeNull();
+    // Fourteen seconds apart and two dates: the calendar day is the question,
+    // not the elapsed time.
+    expect(dayLine(stillMonday, tuesday)).toBe("Tue 8 Sep 2026");
+    // And twenty hours apart on one day is still one date.
+    expect(dayLine(tuesday, new Date(2026, 8, 8, 20, 0, 0))).toBeNull();
+  });
+
+  it("105-S97: the log prints the date and the screen draws nothing for it", () => {
+    const lines: string[] = [];
+    const plain = plainPresenter((line) => lines.push(line), () => ENDED);
+    plain.present({ kind: "day", date: "Fri 4 Sep 2026" });
+    expect(lines).toEqual(["12:04:01 day       Fri 4 Sep 2026"]);
+
+    // The screen has no use for it: every run there says its own age.
+    const before = oneRun(ENDED);
+    expect(applyEvent(before, { kind: "day", date: "Sat 5 Sep 2026" }, ENDED)).toBe(before);
+  });
+
+  it("105-S97: a plain run says its date before its first line", async () => {
+    const driven = await drive({ isTTY: false });
+    expect(driven.code).toBe(0);
+    expect(driven.out[0]).toBe("12:04:01 day       Fri 4 Sep 2026");
+    // And once only, for a run that never crosses midnight.
+    expect(driven.out.filter((line) => line.includes(" day  ")).length).toBe(1);
+  });
+
+  it("105-S96: a runner that crosses midnight announces the new date, before the first line of it", async () => {
+    // Which day it is is decided by `dayLine` and remembered by the runner, and
+    // only the runner can be asked the second half: a fixed clock cannot tell a
+    // runner that announces once from one that announces per day, and a runner
+    // left up overnight is the whole reason this event exists.
+    let tick = 0;
+    // Five seconds a call from ten seconds before midnight, so the run crosses
+    // it wherever the calls happen to fall.
+    const driven = await drive({ now: () => new Date(2026, 8, 7, 23, 59, 50 + 5 * tick++) });
+    expect(driven.code).toBe(0);
+
+    const days = driven.out.filter((line) => line.includes(" day  "));
+    expect(days).toHaveLength(2);
+    expect(days[0]).toContain("Mon 7 Sep 2026");
+    expect(days[1]).toContain("Tue 8 Sep 2026");
+
+    // The announcement is the first thing said on the new day, which is what
+    // makes the lines under it unambiguous rather than merely dated somewhere.
+    expect(driven.out.findIndex((line) => line.startsWith("00:"))).toBe(driven.out.indexOf(days[1]));
+  });
+
+  it("105-S98: the run you picked says the date in full", () => {
+    const drawn = render(liveView(oneRun(ENDED), frame({ selection: "c1" }))).lastFrame() ?? "";
+    expect(drawn).toContain("ended Fri 4 Sep 2026, 12:04:01 · 3m ago");
+  });
+
+  it("105-S99: no existing plain line changed shape", () => {
+    const at = ENDED;
+    expect(plainLine({ at, event: { kind: "done", agent: "a", claim: "3f2a9911aa", ms: 458_000, costUsd: 0.42, turns: 23, message: "x" } })).toBe(
+      "12:04:01 done      a  claim 3f2a…  7m38s  $0.42  turns 23",
+    );
+    expect(plainLine({ at, event: { kind: "poll", agents: ["a"], waiting: 2 } })).toBe("12:04:01 poll      asked for a — 2 waiting");
+    expect(plainLine({ at, event: { kind: "phase", phase: { kind: "polling" } } })).toBeNull();
+  });
+});
+
+describe("run: the clock behind the ages", () => {
+  const ENDED = new Date(2026, 8, 4, 12, 4, 1);
+
+  it("105-S94: every outcome the runner has fits the column, not only the two a person sees most", () => {
+    // Four of the six are longer than `failed`, so a width chosen from the
+    // common pair would push the stamp sideways on exactly the rows somebody is
+    // scanning for.
+    //
+    // Two frames rather than one, because `RECENT_LIMIT` is five and there are
+    // six kinds: a single view silently drops the oldest, and a case that drew
+    // five of six while saying *every* would be quiet about whichever it lost.
+    // The agent name is the same in both, so the width they share is too.
+    const stampColumns = (kinds: readonly OutcomeKind[]) => {
+      const view = kinds.reduce(
+        (state, kind, i) =>
+          applyEvent(state, { kind: "failed", agent: "a", claim: `c${i}`, outcome: kind, ms: 1_000, message: "x" }, ENDED),
+        emptyView,
+      );
+      const rows = (render(liveView(view, { now: ENDED.getTime(), keysActive: true, selection: null })).lastFrame() ?? "")
+        .split("\n")
+        .filter((line) => line.includes("12:04:01 ·"));
+      // Every kind asked for was drawn: a frame short of a row would agree about
+      // the column while saying nothing about the kind that went missing.
+      expect(rows).toHaveLength(kinds.length);
+      return rows.map((line) => line.indexOf("12:04:01"));
+    };
+
+    const columns = [...stampColumns(OUTCOME_KINDS.slice(0, 3)), ...stampColumns(OUTCOME_KINDS.slice(3))];
+    expect(columns).toHaveLength(OUTCOME_KINDS.length);
+    expect(new Set(columns)).toHaveLength(1);
+  });
+
+  it("105-S95: the age keeps moving in the phases that have no countdown", async () => {
+    // `--once`, a stop's grace and a session the server ended are all stretches
+    // of minutes with no deadline. Gated on the deadline alone the clock froze
+    // at mount, and every row read `just now` for the rest of the process.
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(ENDED);
+      // A second short of eleven minutes old, so one tick of the clock is enough
+      // to change what the row says.
+      const finished = new Date(ENDED.getTime() - (11 * 60_000 - 1_000));
+      const view = applyEvent(
+        applyEvent(emptyView, { kind: "done", agent: "a", claim: "c1", ms: 1_000, costUsd: 0.1, turns: 1, message: "x" }, finished),
+        { kind: "phase", phase: { kind: "finishing" } },
+        ENDED,
+      );
+      const { lastFrame } = render(liveScreenFor(view));
+      expect(lastFrame() ?? "").toContain("10m ago");
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(lastFrame() ?? "").toContain("11m ago");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("run: the in-`run` version notice", () => {
+  const NOW = new Date(2026, 8, 4, 12, 4, 1).getTime();
+  const PERIOD_MS = 6 * 60 * 60 * 1000;
+  const frame = (over: Partial<ScreenFrame> = {}): ScreenFrame => ({ now: NOW, keysActive: true, selection: null, ...over });
+  const feed = (events: RunEvent[]) => events.reduce((state, event) => applyEvent(state, event, AT), emptyView);
+  const HOW = "Run `mdbrain upgrade` to replace it.";
+  const notice: RunEvent = { kind: "version", version: "0.2.0", how: HOW };
+  // The check is started and never awaited, so its answer lands a few microtasks
+  // after the command has returned. That is the design and not a race: a poll
+  // loop must not have its timing put behind somebody else's host.
+  const settleChecks = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  it("114-S8: a note sent after a version notice does not erase it", () => {
+    const after = feed([
+      { kind: "configured", agent: "a" },
+      notice,
+      { kind: "note", message: "The run log could not be written: EACCES" },
+    ]);
+
+    expect(after.versionNotice).toContain("0.2.0");
+    expect(after.note).toBe("The run log could not be written: EACCES");
+    expect(render(liveView(after, frame())).lastFrame()).toContain("0.2.0");
+
+    // Every sender that owns the `note` slot, one after another, plus the two
+    // events that clear it. None of them reaches the notice, which is the whole
+    // reason it is not a `note`.
+    const survivors: RunEvent[] = [
+      { kind: "note", message: "a renamed agent" },
+      { kind: "note", message: "the count could not be read" },
+      { kind: "note", message: "the claim failed" },
+      { kind: "note", message: "an unreadable instruction" },
+      { kind: "note", message: "work for an agent this runner is not running" },
+      { kind: "poll", agents: ["a"], waiting: 0 },
+      { kind: "asked", taken: true, reason: null },
+    ];
+    const battered = survivors.reduce((state, event) => applyEvent(state, event, AT), after);
+    expect(battered.versionNotice).toBe(after.versionNotice);
+    expect(render(liveView(battered, frame())).lastFrame()).toContain("0.2.0");
+
+    // The notice is drawn ABOVE the note, which is a decision rather than an
+    // accident of the order two pushes were written in: a note is the last thing
+    // that happened and this stays true until the runner is restarted, so the
+    // transient line belongs nearer the countdown that also moves. Asserted as two
+    // indices, because swapping the pushes leaves every presence assertion above
+    // satisfied. The two lookups are checked to have found their lines first, so a
+    // frame that stopped drawing either one fails here rather than comparing -1.
+    const lines = render(liveView(after, frame())).lastFrame()!.split("\n");
+    const noticeAt = lines.findIndex((l) => l.includes("0.2.0 is available"));
+    const noteAt = lines.findIndex((l) => l.includes("EACCES"));
+    expect(noticeAt).toBeGreaterThanOrEqual(0);
+    expect(noteAt).toBeGreaterThanOrEqual(0);
+    expect(noticeAt).toBeLessThan(noteAt);
+
+    // The control, and it is what makes the assertion above mean anything: the
+    // same fact sent as a `note` is gone after the first of those fires.
+    const asNote = feed([
+      { kind: "note", message: "mdbrain 0.2.0 is available." },
+      { kind: "note", message: "the claim failed" },
+    ]);
+    expect(asNote.note).not.toContain("0.2.0");
+  });
+
+  it("114-S9: both presenters render it, in the same words", async () => {
+    const { versionNoticeText } = await import("../src/upgrade/notice.ts");
+    const sentence = versionNoticeText({ version: "0.2.0", how: HOW });
+
+    const line = plainLine({ at: AT, event: notice });
+    expect(line).not.toBeNull();
+    expect(line).toContain(sentence);
+    expect(line).toContain("version");
+
+    const drawn = render(liveView(feed([{ kind: "configured", agent: "a" }, notice]), frame())).lastFrame();
+    expect(drawn).toContain(sentence);
+
+    // A kind rendered by one presenter and not the other is the failure this
+    // asserts, and it is the two assertions on `sentence` above that catch it —
+    // one per presenter. These two are weaker restatements: `sentence` already
+    // contains both strings, so neither can fail while the assertion above it
+    // passes. They are kept because they name, in the case itself, what each
+    // presenter is expected to carry.
+    expect(line).toContain("0.2.0");
+    expect(drawn).toContain("mdbrain upgrade");
+  });
+
+  it("114-S9: a packaged install is told its own packager's command, not this one", async () => {
+    const { versionNoticeFor } = await import("../src/upgrade/notice.ts");
+    const brew = versionNoticeFor("0.1.0", "0.2.0", "homebrew", true);
+    expect(brew?.how).toContain("brew");
+    expect(brew?.how).not.toContain("mdbrain upgrade");
+    expect(versionNoticeFor("0.1.0", "0.2.0", "direct", true)?.how).toContain("mdbrain upgrade");
+  });
+
+  it("114-S13: once at startup, then every six hours, and no oftener", async () => {
+    const { VERSION_CHECK_PERIOD_MS, versionCheckDue } = await import("../src/upgrade/notice.ts");
+    const { AuthError } = await import("../src/auth/api.ts");
+    expect(VERSION_CHECK_PERIOD_MS).toBe(PERIOD_MS);
+
+    // Nothing checked yet is due, which is what makes the check at startup
+    // happen without a second code path asking for one.
+    expect(versionCheckDue(null, NOW)).toBe(true);
+    expect(versionCheckDue(NOW, NOW)).toBe(false);
+    expect(versionCheckDue(NOW, NOW + PERIOD_MS - 1)).toBe(false);
+    expect(versionCheckDue(NOW, NOW + PERIOD_MS)).toBe(true);
+
+    // A day of ticking, driven through the command with a clock that moves a
+    // minute at a time. The session ending is what stops the loop, since a
+    // runner otherwise polls for as long as it is left up.
+    const TICKS = 24 * 60;
+    let clock = NOW;
+    let ticks = 0;
+    let asked = 0;
+    await drive(
+      {
+        now: () => new Date(clock),
+        lookupLatest: async () => {
+          asked += 1;
+          return null;
+        },
+        count: async () => {
+          if (ticks >= TICKS) throw new AuthError(401, "JWT expired");
+          ticks += 1;
+          clock += 60_000;
+          return { waiting: 0, capped: false };
+        },
+        sleep: async () => {},
+      },
+      { once: false },
+    );
+    await settleChecks();
+
+    expect(ticks).toBe(TICKS);
+    // Once at startup, and once at each of the four six-hour boundaries a day
+    // holds. A check on every tick would be 1440.
+    expect(asked).toBe(5);
+  }, 20_000);
+
+  it("114-S14: a lookup that fails writes nothing — not the screen, not the log, not the exit code", async () => {
+    const { versionNoticeFor } = await import("../src/upgrade/notice.ts");
+    // The pure half: a failed lookup and an already-current version are both
+    // nothing to say, and neither carries a reason anybody could print.
+    expect(versionNoticeFor("0.1.0", null, "direct", true)).toBeNull();
+    expect(versionNoticeFor("0.1.0", "0.1.0", "direct", true)).toBeNull();
+
+    const failed = await drive({ lookupLatest: async () => null });
+    await settleChecks();
+    const said = [...failed.out, ...failed.err].join("\n");
+    expect(said).not.toMatch(/is available/);
+    expect(said).not.toMatch(/could not be checked|check failed|latest version/i);
+    expect(failed.code).toBe(0);
+    // The run log is the half a screen assertion cannot see, and it is where the
+    // declined line would be reintroduced as a tidy-up.
+    expect(JSON.stringify(failed.rows)).not.toMatch(/is available|version check/i);
+
+    // The neuter that makes the three assertions above an instrument rather than
+    // a formality: the same channel does carry the notice when there is one, so
+    // they are watching something that works.
+    const announced = await drive({ lookupLatest: async () => "0.2.0" });
+    await settleChecks();
+    expect(announced.out.join("\n")).toMatch(/is available/);
+  });
+
+  it("114-S14: a second check finding the same tag does not say it twice", async () => {
+    const { AuthError } = await import("../src/auth/api.ts");
+    let clock = NOW;
+    let ticks = 0;
+    let asked = 0;
+    const run = await drive(
+      {
+        now: () => new Date(clock),
+        lookupLatest: async () => {
+          asked += 1;
+          return "0.2.0";
+        },
+        count: async () => {
+          if (ticks >= 3) throw new AuthError(401, "JWT expired");
+          ticks += 1;
+          // A full period between ticks, so every one of them is due.
+          clock += PERIOD_MS;
+          return { waiting: 0, capped: false };
+        },
+        sleep: async () => {},
+      },
+      { once: false },
+    );
+    await settleChecks();
+
+    // Asked every time it was due — the period is not what is under test here —
+    // and said once, because the second answer told nobody anything new. A
+    // runner up for a week would otherwise repeat the line twenty-eight times.
+    expect(asked).toBeGreaterThan(1);
+    expect(run.out.filter((line) => line.includes("is available"))).toHaveLength(1);
+  });
+
+  it("114-S20: a lookup still outstanding when the run ends is abandoned, and says nothing after it", async () => {
+    const { VERSION_CHECK_TIMEOUT_MS } = await import("../src/upgrade/notice.ts");
+    // Bounded well inside `fetch`'s own five minutes, which is the number this
+    // exists to not be.
+    expect(VERSION_CHECK_TIMEOUT_MS).toBeLessThanOrEqual(30_000);
+
+    let signal: AbortSignal | undefined;
+    let answer: ((version: string | null) => void) | undefined;
+    const run = await drive({
+      lookupLatest: (given) => {
+        signal = given;
+        return new Promise<string | null>((resolve) => {
+          answer = resolve;
+        });
+      },
+    });
+
+    // It returned at all, with the lookup still outstanding: nothing waits on
+    // this, at the end any more than during a tick.
+    expect(run.code).toBe(0);
+    // And it was abandoned rather than left holding the process open. This
+    // program sets an exit code and lets the loop drain, so a request nobody is
+    // waiting on is still a reason the prompt does not come back.
+    expect(signal?.aborted).toBe(true);
+
+    // An answer that arrives anyway lands nowhere. The plain presenter has no
+    // guard of its own — it prints whatever it is handed — so without this the
+    // notice would appear beneath the line that says the runner stopped.
+    const settled = run.out.length;
+    answer?.("0.2.0");
+    await settleChecks();
+    expect(run.out).toHaveLength(settled);
+    expect(run.out.join("\n")).not.toMatch(/is available/);
+  });
+
+  it("114-S20: a Ctrl-C abandons the lookup too, and the drain after it says nothing", async () => {
+    // The last line is not the only route. Between a stop and that line the run
+    // waits on every session's grace, which can be minutes, and `presenting` is
+    // still true for all of it — so a lookup that answers in that window is
+    // drawn under a screen the person has already asked to be rid of. The stop
+    // handler's abort is what closes it: with the call removed this case sees a
+    // `version` event and the assertion below fails.
+    let answer: ((v: string | null) => void) | undefined;
+    let release: (() => void) | undefined;
+    const grace = new Promise<void>((r) => {
+      release = r;
+    });
+
+    const run = await drive(
+      {
+        isTTY: true,
+        count: async () => ({ waiting: 1, capped: false }),
+        startSession: async () => {
+          await grace;
+          return { stdout: good(), stderr: "", exitCode: 0, timedOut: false, stopped: false, signal: null, spawnProblem: null };
+        },
+        lookupLatest: (given) =>
+          new Promise<string | null>((resolve, reject) => {
+            answer = resolve;
+            // A real aborted fetch rejects; without this the abort is invisible
+            // here and the case would pass whether or not it happened.
+            given.addEventListener("abort", () => reject(new Error("aborted")));
+          }),
+        sleep: async () => {
+          captured.handler?.("quit");
+          answer?.("0.2.0");
+          await settleChecks();
+          release?.();
+        },
+      },
+      { once: false },
+    );
+
+    expect(run.code).toBe(0);
+    // The notice reaches the live view as an event rather than as a line, so
+    // asserting on `out` here would pass however loudly it was drawn.
+    expect(captured.events.filter((e) => e.kind === "version")).toHaveLength(0);
+  });
+
+  it("114-S20: the lookup is given a signal, and an aborted one is silent like any other failure", async () => {
+    const { latestVersion } = await import("../src/upgrade/latest.ts");
+    const controller = new AbortController();
+    controller.abort();
+    // The lookup answers null for an abort exactly as it does for an unreachable
+    // host: both callers want the same thing from a failure and neither wants a
+    // reason.
+    const aborted = await latestVersion(
+      (_url, init) => {
+        expect((init as RequestInit).signal).toBeDefined();
+        throw new DOMException("aborted", "AbortError");
+      },
+      "owner/repo",
+      controller.signal,
+    );
+    expect(aborted).toBeNull();
+
+    // The signal reaches the request rather than being accepted and dropped.
+    let passed: AbortSignal | null | undefined;
+    await latestVersion(
+      async (_url, init) => {
+        passed = (init as RequestInit).signal;
+        return new Response(null, { status: 302, headers: { location: "https://x/releases/tag/v0.2.0" } });
+      },
+      "owner/repo",
+      controller.signal,
+    );
+    expect(passed).toBe(controller.signal);
+  });
+});
+
+describe("run: the diagnosis log", () => {
+  it("redacts every credential shape it can name, and says which it cannot", async () => {
+    const { redactSecrets } = await import("../src/run/diagnosis.ts");
+
+    const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcDEF-_123";
+    expect(redactSecrets(`token ${jwt} refused`)).toBe("token [redacted] refused");
+    expect(redactSecrets("key smd_agent_deadbeef_secretpart")).toBe("key [redacted]");
+    expect(redactSecrets("sb_publishable_AbCdEf123456 and sb_secret_ZyXwVu987654")).toBe("[redacted] and [redacted]");
+    expect(redactSecrets("Authorization: Bearer abc123def456ghi")).toBe("Authorization: Bearer [redacted]");
+
+    // An opaque refresh token is the shape no pattern separates from a word, so
+    // it is the length cap and not this function that bounds it.
+    expect(redactSecrets("Sign in to ask for work.")).toBe("Sign in to ask for work.");
+  });
+
+  it("a refused poll names which of the two calls it was, the status, and the server's words", async () => {
+    const { refusedMessage, SAID_LIMIT } = await import("../src/run/diagnosis.ts");
+    const said = "Your session is no longer accepted.";
+
+    const counting = refusedMessage(said, "count", 401, "Sign in to ask for work.");
+    const claiming = refusedMessage(said, "claim", 401, "Sign in to ask for work.");
+    expect(counting).toContain(said);
+    expect(counting).toContain("HTTP 401");
+    expect(counting).toContain("Sign in to ask for work.");
+    // The whole point: two refusals that used to be the same sentence.
+    expect(counting).not.toBe(claiming);
+    expect(counting).toMatch(/waiting/);
+    expect(claiming).toMatch(/claiming/);
+
+    // A rate limit and a gateway failure must not read the same.
+    expect(refusedMessage(said, "count", 429, "over_request_rate_limit")).toContain("HTTP 429");
+
+    const long = refusedMessage(said, "count", 500, "x".repeat(SAID_LIMIT + 200));
+    expect(long.length).toBeLessThan(said.length + SAID_LIMIT + 100);
+    expect(refusedMessage(said, "count", 401, "bearer abc123def456ghi")).toContain("[redacted]");
+    // A body that was empty leaves no dangling "the server said:".
+    expect(refusedMessage(said, "count", 401, "   ")).not.toContain("the server said");
+
+    // A proxy's HTML error page arrives verbatim, newlines and all, into a
+    // sentence printed as one line and a file written one record per line.
+    const page = refusedMessage(said, "count", 502, "<html>\n  <body>\n    Bad gateway\n  </body>\n</html>");
+    expect(page).not.toContain("\n");
+    expect(page).toContain("Bad gateway");
+  });
+
+  it("the rows are one line of JSON each, in a file that is not the run log", async () => {
+    const { diagnosisPath, diagnosisText, refusedRow, startRow, stopRow } = await import("../src/run/diagnosis.ts");
+    const { runLogPath } = await import("../src/run/log.ts");
+    const env = { env: { MDBRAIN_STATE_DIR: "/state" }, platform: "linux" as const, home: "/home/d" };
+
+    expect(diagnosisPath(env)).not.toBe(runLogPath(env));
+    expect(diagnosisPath(env)).toContain("diagnosis.jsonl");
+
+    const at = new Date(Date.UTC(2026, 8, 9, 16, 0, 7));
+    const start = startRow(at, {
+      version: "0.1.0",
+      channel: "direct",
+      compiled: true,
+      runtime: { engine: "bun", engineVersion: "1.2.0", execPath: "/opt/mdbrain", platform: "linux-x64" },
+      keyStore: "keychain",
+      keyStoreWhere: "the keychain",
+      configPath: "/home/d/.config/mdbrain/config.json",
+      asking: ["dev-bot-mdden"],
+      held: [{ agent: "other", reason: "no key" }],
+      pollMs: 30_000,
+    });
+    expect(start.at).toBe("2026-09-09T16:00:07.000Z");
+    expect(diagnosisText(start).endsWith("\n")).toBe(true);
+    expect(diagnosisText(start).trimEnd()).not.toContain("\n");
+    expect(JSON.parse(diagnosisText(start))).toMatchObject({ kind: "start", keyStore: "keychain" });
+
+    expect(refusedRow(at, "claim", 401, `key smd_agent_deadbeef_x`).said).toBe("key [redacted]");
+    // The row itself is what has to be flat, and asserting it on the LINE cannot
+    // fail: `JSON.stringify` escapes a newline whatever the field holds, so a row
+    // carrying a raw newline still serialises to one line and the file's contract
+    // survives a value that would be unreadable when it is read back.
+    const page = refusedRow(at, "count", 502, "<html>\n bad\n</html>");
+    expect(page.said).toBe("<html> bad </html>");
+    expect(diagnosisText(page).trimEnd()).not.toContain("\n");
+    expect(stopRow(at, "session-ended", 1, 3)).toMatchObject({ kind: "stop", reason: "session-ended", exitCode: 1, sessions: 3 });
+  });
+
+  it("a start is written down with the key store and the runtime that chose it", async () => {
+    const started = await drive();
+    const start = started.notes.find((n) => n.kind === "start");
+    expect(start).toBeDefined();
+    // The sentence that scrolls away, and the fact that decides it — neither of
+    // which survived anywhere before.
+    expect(start).toMatchObject({ keyStore: "keychain", keyStoreWhere: "the keychain" });
+    expect(["bun", "node"]).toContain((start as { runtime: { engine: string } }).runtime.engine);
+    expect((start as { asking: string[] }).asking).toEqual(["dev-bot-mdden"]);
+  });
+
+  // The build is injected so the notice can be compared against something other
+  // than this binary. The row has to read that same seam: a run whose notice is
+  // about one build and whose log records another explains the wrong machine.
+  it("the start row records the build the run was given, not the one it was compiled as", async () => {
+    const started = await drive({ build: { version: "9.9.9", channel: "homebrew", isCompiled: true } });
+    const start = started.notes.find((n) => n.kind === "start") as unknown as {
+      version: string;
+      channel: string;
+      compiled: boolean;
+    };
+    expect({ version: start.version, channel: start.channel, compiled: start.compiled }).toEqual({
+      version: "9.9.9",
+      channel: "homebrew",
+      compiled: true,
+    });
+  });
+
+  it("a run with nobody to ask still leaves a start and a stop", async () => {
+    const held = await drive({ env: {}, roster: async () => [] });
+    expect(held.notes.map((n) => n.kind)).toEqual(["start", "stop"]);
+    expect(held.notes[1]).toMatchObject({ reason: "all-held", exitCode: 1 });
+  });
+
+  it("a refusal is written down, and the count and the claim are told apart", async () => {
+    const { AuthError } = await import("../src/auth/api.ts");
+
+    const counting = await drive({
+      count: async () => {
+        throw new AuthError(401, "Sign in to ask for work.");
+      },
+    });
+    expect(counting.err.join("\n")).toContain("HTTP 401");
+    expect(counting.notes.find((n) => n.kind === "refused")).toMatchObject({ call: "count", status: 401 });
+
+    const claiming = await drive({
+      claim: async () => {
+        throw new AuthError(401, "Sign in to ask for work.");
+      },
+    });
+    expect(claiming.notes.find((n) => n.kind === "refused")).toMatchObject({ call: "claim", status: 401 });
+    // The two screens a person cannot currently tell apart.
+    expect(counting.err.join("\n")).not.toBe(claiming.err.join("\n"));
+    expect(claiming.notes.at(-1)).toMatchObject({ kind: "stop", reason: "session-ended", exitCode: 1 });
+  });
+
+  it("a throw that escapes the loop still ends the start it left open", async () => {
+    // A start with nothing after it reads exactly like a process that was killed,
+    // which is the one ambiguity the file exists to remove.
+    const boom = new Error("the presenter threw while drawing");
+    const notes: import("../src/run/diagnosis.ts").DiagnosisRow[] = [];
+    await expect(
+      drive(
+        {
+          recordDiagnosis: async (row) => {
+            notes.push(row);
+          },
+          // The wait between polls is inside the loop's `try` and caught nowhere.
+          sleep: async () => {
+            throw boom;
+          },
+        },
+        { once: false },
+      ),
+    ).rejects.toThrow(boom);
+    expect(notes.map((n) => n.kind)).toEqual(["start", "stop"]);
+    expect(notes.at(-1)).toMatchObject({ kind: "stop", reason: "threw", exitCode: 1 });
+  });
+
+  it("a diagnosis that cannot be written is a note, never the reason a run failed", async () => {
+    const broken = await drive({
+      recordDiagnosis: async () => {
+        throw new Error("disk full");
+      },
+    });
+    expect(broken.code).toBe(0);
+    expect(broken.out.join("\n")).toContain("disk full");
+  });
+
+  it("the roster is the third call authorised the same way, and its words are redacted too", async () => {
+    const { AuthError } = await import("../src/auth/api.ts");
+    const token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcDEF-_123";
+    const refused = await drive({
+      roster: async () => {
+        throw new AuthError(401, `upstream refused: Authorization: Bearer ${token}`);
+      },
+    });
+    expect(refused.code).toBe(1);
+    expect(refused.err.join("\n")).not.toContain(token);
+    expect(refused.err.join("\n")).toContain("[redacted]");
   });
 });

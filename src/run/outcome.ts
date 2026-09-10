@@ -13,8 +13,18 @@
 //
 // Pure: text in, an outcome out. No process, no clock, no disk.
 
+/**
+ * Every outcome a session can have, as a value.
+ *
+ * The list rather than the union alone, because a presenter has to size a column
+ * to the longest of them and a number written down beside the two most common
+ * ones is wrong about the other four the day it is written. A kind added here
+ * widens that column by being declared.
+ */
+export const OUTCOME_KINDS = ["done", "failed", "timed-out", "stopped", "spawn-failed", "unreadable"] as const;
+
 /** What became of one session. */
-export type OutcomeKind = "done" | "failed" | "timed-out" | "stopped" | "spawn-failed" | "unreadable";
+export type OutcomeKind = (typeof OUTCOME_KINDS)[number];
 
 /** What happened, and everything worth recording about it. */
 export interface Outcome {

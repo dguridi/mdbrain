@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { claudeHarness, HARNESSES } from "../src/run/harness.ts";
+import { MCP_URL } from "../src/auth/project.ts";
 import {
   CONFIG_VERSION,
   DEFAULT_BOUNDS,
@@ -17,7 +19,6 @@ import {
   loadConfig,
   loadDraft,
   mcpConfigPath,
-  mcpConfigText,
   saveConfig,
   saveDraft,
   syncMcpConfigs,
@@ -224,7 +225,7 @@ describe("the config store", () => {
   });
 
   it("writes one MCP file per agent under the config root, naming the variable and never a value", async () => {
-    const path = await writeMcpConfig("dev-bot-mdden", "MDBRAIN_KEY_DEV_BOT_MDDEN");
+    const path = await writeMcpConfig("dev-bot-mdden", "MDBRAIN_KEY_DEV_BOT_MDDEN", claudeHarness);
     expect(path).toBe(mcpConfigPath("dev-bot-mdden"));
     expect(path.startsWith(join(root, "config"))).toBe(true);
     const text = readFileSync(path, "utf8");
@@ -237,11 +238,36 @@ describe("the config store", () => {
   it("folds an agent name into a safe, prefixed, case-folded file name", () => {
     expect(mcpConfigPath("spec warden/2").endsWith(join("mcp", "agent-spec_warden_2.json"))).toBe(true);
     expect(mcpConfigPath("CON").endsWith(join("mcp", "agent-con.json"))).toBe(true);
-    expect(mcpConfigText("X")).toContain('"url"');
+    expect(claudeHarness.mcpConfigText("X")).toContain('"url"');
+  });
+  it("the MCP file's format belongs to the harness, not to the config store", () => {
+    // The seam this exists to keep visible. `store.ts` decides where the file
+    // goes and when it is rewritten; what is IN it is the harness's, because the
+    // keys and even the syntax differ per harness and a store that wrote one
+    // shape for all of them is a Claude assumption wearing a general name.
+    const store = readFileSync(join(__dirname, "..", "src", "config", "store.ts"), "utf8");
+    expect(store).not.toContain("mcpServers");
+    expect(store).not.toContain("MCP_URL");
+
+    // Driven off the roster rather than against `claude` by name, so a harness
+    // added later arrives asserted instead of needing somebody to remember.
+    for (const [id, spec] of Object.entries(HARNESSES)) {
+      const text = spec.mcpConfigText("MDBRAIN_KEY_PROBE");
+      // The variable's NAME and never a value: the file lives under the config
+      // root and is meant to be copied, which is only safe while that holds.
+      expect(text, id).toContain("${MDBRAIN_KEY_PROBE}");
+      expect(text, id).toContain(MCP_URL);
+      // Asserted as an ABSENCE beside the two presences above, because those
+      // cannot see a harness that writes the variable AND the value: the
+      // never-a-value half is the one the file's location rests on, and it is
+      // the half a presence is structurally blind to. The shapes are the
+      // schema's own definition of a key rather than a literal chosen here.
+      expect(text, id).not.toMatch(/sk-|smd_agent_/);
+    }
   });
 
   it("syncing writes one file per configured agent and removes the files of agents no longer configured, reporting each", async () => {
-    await writeMcpConfig("gone-bot", "MDBRAIN_KEY_GONE_BOT");
+    await writeMcpConfig("gone-bot", "MDBRAIN_KEY_GONE_BOT", claudeHarness);
     const { mcpPaths, removed } = await syncMcpConfigs(config());
     expect(Object.keys(mcpPaths)).toEqual(["dev-bot-mdden"]);
     expect(existsSync(mcpPaths["dev-bot-mdden"])).toBe(true);

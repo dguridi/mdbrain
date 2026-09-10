@@ -20,7 +20,13 @@
 // countdown means nothing in a file nobody is watching. So a presenter may
 // render an event as nothing, and `plainLine` answers null for the events whose
 // only reader is the screen. That keeps the vocabulary one thing while leaving
-// the non-TTY output byte for byte what it was.
+// each existing line's shape, ordering and stream exactly what they were.
+//
+// **And it runs the other way too**, which is what `day` is: a plain line is
+// stamped with a time of day and no date, so a log read back is ambiguous about
+// which day `12:04:01` was — while the screen, whose recent runs say their own
+// age, has nothing to draw for it. An event with one reader is the shape this
+// vocabulary already had; `day` is the first one whose reader is the log.
 //
 // **A presenter may also be asked something**, which is the one direction that
 // used to be closed. A key is not a decision: it produces a `ViewRequest`, which
@@ -32,6 +38,7 @@
 
 import type { OutcomeKind } from "./outcome.ts";
 import type { ViewRequest } from "./keys.ts";
+import { versionNoticeText } from "../upgrade/notice.ts";
 
 /**
  * Where the runner is, between one poll and the next.
@@ -77,10 +84,45 @@ export type RunEvent =
   | { kind: "failed"; agent: string; claim: string; outcome: OutcomeKind; ms: number; message: string }
   /** Where the runner is between polls. The screen draws it; no line prints it. */
   | { kind: "phase"; phase: RunPhase }
+  /**
+   * The local date the events after it happened on. The log prints it; the
+   * screen draws nothing for it.
+   *
+   * **The mirror image of `phase`, and it is here for the same reason that one
+   * renders as nothing.** A plain line is stamped with a time of day and no
+   * date, which is enough while somebody is watching and ambiguous the moment
+   * they read the file back — `12:04:01` is a different fact on a runner that
+   * has been up for three days. The screen has no use for it, because a recent
+   * run there says its own age.
+   *
+   * Carries the text rather than the moment, so both presenters would say the
+   * same words and the runner is the one that chose them.
+   */
+  | { kind: "day"; date: string }
   /** A person asked for a poll. `reason` is why it was not taken, or null. */
   | { kind: "asked"; taken: boolean; reason: string | null }
   /** Something worth one line that is not about a particular agent. */
   | { kind: "note"; message: string }
+  /**
+   * A newer version of `mdbrain` is published.
+   *
+   * **Its own kind rather than a `note`, and that is the whole of its design.**
+   * In the live view `note` is a single slot — the reducer assigns the last one
+   * and the screen draws whatever is in it — and there are six senders of `note`
+   * in `run.ts` alone: a renamed agent, a run log that could not be written, a
+   * count that could not be read, a failed claim, an unreadable instruction, and
+   * work for an agent this runner does not run. **A version notice sent as a
+   * `note` is erased by the first of those to fire**, and on a runner left up for
+   * days that is a near certainty rather than a risk. So it occupies a field no
+   * `note` sender can reach, because it is not in that slot at all.
+   *
+   * The alternative considered and not taken was making `note` a list, which is a
+   * larger change to a contract two presenters share and to the screen's layout.
+   *
+   * Carries the fact and the remedy rather than the sentence, so the wording
+   * lives in one pure function both presenters call.
+   */
+  | { kind: "version"; version: string; how: string }
   /** The last thing said: what stopping cost. */
   | { kind: "stopped"; lostQueued: number };
 
@@ -97,6 +139,73 @@ const LABEL_WIDTH = 10;
 export function clockText(at: Date): string {
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${pad(at.getHours())}:${pad(at.getMinutes())}:${pad(at.getSeconds())}`;
+}
+
+const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/**
+ * `Mon 8 Sep 2026`, local — the date a person reads rather than parses.
+ *
+ * Written out rather than taken from `Intl`, for the reason every other string
+ * here is: the runner's output is one language, and a locale-derived date would
+ * make the log's shape depend on the machine it ran on. An ISO date would be
+ * unambiguous and is the thing the ask named as not wanted — somebody at a
+ * terminal is asking *ten minutes ago or yesterday*, not reading a field.
+ */
+export function dayText(at: Date): string {
+  return `${DAYS[at.getDay()]} ${at.getDate()} ${MONTHS[at.getMonth()]} ${at.getFullYear()}`;
+}
+
+/**
+ * The date to announce before an event stamped `at`, or null when the day has
+ * already been said.
+ *
+ * **A null `previous` announces**, so the first line of any run carries its
+ * date and a log file is anchored from its first byte rather than from whenever
+ * the runner happens to cross midnight.
+ *
+ * Compared on the local calendar day and not on elapsed hours: two events
+ * fourteen minutes apart across midnight are two dates, and two events twenty
+ * hours apart on one long day are one.
+ *
+ * @param previous the stamp of the last event announced against, or null
+ * @param at the stamp of the event about to be rendered
+ * @returns the date's text, or null when it is the same day
+ */
+export function dayLine(previous: Date | null, at: Date): string | null {
+  if (
+    previous !== null &&
+    previous.getFullYear() === at.getFullYear() &&
+    previous.getMonth() === at.getMonth() &&
+    previous.getDate() === at.getDate()
+  ) {
+    return null;
+  }
+  return dayText(at);
+}
+
+/**
+ * How long ago something was, in the terms the question is asked in.
+ *
+ * **One unit, and it is not `durationText`.** That one measures a session, where
+ * the seconds are the thing being reported and two units earn their place. This
+ * one answers *ten minutes ago or yesterday*, and at every scale the second unit
+ * is noise a reader has to look past: `20h00m ago` says nothing `20h ago` does
+ * not, and the four characters it costs are four a person's eye has to cross on
+ * every row.
+ *
+ * @param ms how long ago, in milliseconds; a negative value reads as `just now`
+ *   rather than as the future, since a clock that disagrees with itself by a
+ *   moment is likelier than a run that has not happened yet
+ */
+export function agoText(ms: number): string {
+  const minutes = Math.floor(ms / 60_000);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
 }
 
 /**
@@ -180,6 +289,8 @@ export function plainLine(stamped: StampedEvent): string | null {
       // Nothing. A countdown is a screen's business, and the line for a poll is
       // the `poll` event, when it happens.
       return null;
+    case "day":
+      return line("day", event.date);
     case "asked":
       return line(
         "asked",
@@ -187,6 +298,8 @@ export function plainLine(stamped: StampedEvent): string | null {
       );
     case "note":
       return line("note", event.message);
+    case "version":
+      return line("version", versionNoticeText({ version: event.version, how: event.how }));
     case "stopped":
       return line(
         "stopped",

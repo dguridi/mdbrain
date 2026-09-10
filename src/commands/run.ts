@@ -43,10 +43,25 @@ import { runSession, type StopRegistry } from "../run/execute.ts";
 import { readOutcome, type Outcome } from "../run/outcome.ts";
 import { renderPrompt } from "../run/prompt.ts";
 import { appendRun, logRow, runLogPath } from "../run/log.ts";
-import { plainPresenter, type Presenter, type RunEvent } from "../run/present.ts";
+import {
+  appendDiagnosis,
+  redactSecrets,
+  refusedMessage,
+  refusedRow,
+  runtimeFacts,
+  startRow,
+  stopRow,
+  type RefusedCall,
+  type RefusedRow,
+} from "../run/diagnosis.ts";
+import { dayLine, plainPresenter, type Presenter, type RunEvent } from "../run/present.ts";
 import { livePresenter } from "../run/screen.ts";
 import type { ViewRequest } from "../run/keys.ts";
 import { readySession } from "./session.ts";
+import { latestVersion } from "../upgrade/latest.ts";
+import { isCompiledExecPath, type Channel } from "../upgrade/plan.ts";
+import { VERSION_CHECK_TIMEOUT_MS, versionCheckDue, versionNoticeFor } from "../upgrade/notice.ts";
+import { CHANNEL, VERSION } from "../version.ts";
 
 /**
  * What the command needs from outside itself, so a test can stand each one in.
@@ -71,9 +86,33 @@ export interface RunDeps {
   startSession: typeof runSession;
   /** Appends one row to the run log. */
   recordRun: typeof appendRun;
+  /**
+   * Appends one row to the diagnosis log — the start, a refusal, the stop.
+   *
+   * A separate edge from `recordRun` rather than a second use of it, because the
+   * two files answer different questions and a test that wanted to assert one
+   * would otherwise have to filter the other out of it.
+   */
+  recordDiagnosis: typeof appendDiagnosis;
   /** Waits, or resolves at once when something asks the loop to stop. */
   sleep: (ms: number, signal: { stopped: boolean; wake: (() => void) | null }) => Promise<void>;
   now: () => Date;
+  /**
+   * What the latest published version is, or null when it could not be
+   * established. The same lookup `upgrade` uses, on a period rather than on
+   * demand — one implementation of the question, because two would eventually
+   * disagree about what *latest* means.
+   */
+  lookupLatest: (signal: AbortSignal) => Promise<string | null>;
+  /**
+   * What this build is, which is what the notice is compared against and what
+   * decides the remedy it names.
+   *
+   * Injected rather than read from `version.ts` at the point of use, because the
+   * three facts together are an edge like any other: a test that could not vary
+   * them could only ever assert the sentence this very binary would print.
+   */
+  build: { version: string; channel: Channel; isCompiled: boolean };
 }
 
 /** The sentences that end `run` before it has started. */
@@ -117,8 +156,11 @@ const defaultDeps: RunDeps = {
   claim: claimWork,
   startSession: runSession,
   recordRun: appendRun,
+  recordDiagnosis: appendDiagnosis,
   sleep: waitFor,
   now: () => new Date(),
+  lookupLatest: (signal) => latestVersion(fetch, undefined, signal),
+  build: { version: VERSION, channel: CHANNEL, isCompiled: isCompiledExecPath(process.execPath) },
 };
 
 /** One agent's live state: what is running for it, and what is waiting. */
@@ -176,7 +218,11 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
   } catch (cause) {
     const refused = cause instanceof AuthError ? signInAgainMessage(cause.status) : null;
     if (refused) {
-      err(`${refused} (the server said: ${(cause as Error).message})`);
+      // Redacted for the same reason the polled calls' words are: this is a body
+      // written by whatever answered, and a proxy or gateway that echoes the
+      // request echoes the bearer token with it. The roster is the third call
+      // authorised the same way, so it carries the same risk.
+      err(`${refused} (the server said: ${redactSecrets((cause as Error).message)})`);
       return 1;
     }
     // Unreachable is not a reason to refuse to start: the poll will fail and say
@@ -196,7 +242,25 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
   }
 
   const presenter: Presenter = deps.isTTY ? livePresenter(out, deps.now) : plainPresenter(out, deps.now);
-  const say = (event: RunEvent) => presenter.present(event, deps.now());
+  // Every event is stamped once, here, and the same stamp is what the log prints
+  // and what the screen remembers — so a row and a line cannot disagree about
+  // when something happened.
+  //
+  // **The date is announced by the runner rather than invented by a presenter**,
+  // which is why it goes through `say` at all: a presenter that decided when to
+  // print a date would be originating a fact, and the one thing a presenter may
+  // originate is what the person asked for. `dayLine` holds the decision and is
+  // pure; this holds only the stamp it last announced against.
+  let announced: Date | null = null;
+  const say = (event: RunEvent) => {
+    const at = deps.now();
+    const date = dayLine(announced, at);
+    if (date !== null) {
+      announced = at;
+      presenter.present({ kind: "day", date }, at);
+    }
+    presenter.present(event, at);
+  };
 
   for (const agent of startup.asking) say({ kind: "configured", agent });
   for (const held of startup.held) say({ kind: "held", agent: held.agent, reason: held.reason });
@@ -208,7 +272,46 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
   }
   say({ kind: "summary", lines: summaryLines(startup, config, runLogPath(), keyStorageLine(keyStore.backend)) });
 
+  /**
+   * Write one diagnosis row, never letting it become the reason anything failed.
+   *
+   * The whole point of the file is to explain a failure, so a run that refused to
+   * proceed because it could not open its own notebook would have turned a
+   * diagnostic into an outage. A failed write is one note and the run carries on.
+   */
+  const record = async (row: Parameters<typeof appendDiagnosis>[0]) => {
+    try {
+      await deps.recordDiagnosis(row);
+    } catch (cause) {
+      say({ kind: "note", message: `The diagnosis log could not be written: ${(cause as Error).message}` });
+    }
+  };
+
+  // Written before the all-held refusal below rather than after it: a run that
+  // starts and immediately finds nobody to ask is exactly a run somebody will
+  // later want a record of, and it is one of the two shapes this whole file
+  // exists for — the other being a key store that turned out to be the wrong one.
+  await record(
+    startRow(deps.now(), {
+      // The same three facts the notice is compared against, read from the one
+      // seam that holds them rather than from `version.ts` a second time: two
+      // readings of one build are two things that can disagree, and the run
+      // writing this row is the run the notice is about.
+      version: deps.build.version,
+      channel: deps.build.channel,
+      compiled: deps.build.isCompiled,
+      runtime: runtimeFacts(),
+      keyStore: keyStore.backend.kind,
+      keyStoreWhere: keyStore.backend.where,
+      configPath: configPath(),
+      asking: [...startup.asking],
+      held: startup.held.map((h) => ({ agent: h.agent, reason: h.reason })),
+      pollMs: durationMs(config.poll) ?? 0,
+    }),
+  );
+
   if (startup.asking.length === 0) {
+    await record(stopRow(deps.now(), "all-held", 1, 0));
     await presenter.stop();
     err(ALL_HELD_MESSAGE);
     return 1;
@@ -220,6 +323,18 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
   const depths = () => new Map([...work].map(([agent, w]) => [agent, w.queue.length]));
 
   const stop = { stopped: false, wake: null as (() => void) | null };
+  /** Whether the presenter is still drawing, which is what may still be said to. */
+  let presenting = true;
+  /**
+   * The check in flight, so a stop can cut it short rather than be held by it.
+   *
+   * **This program sets an exit code and lets the event loop drain rather than
+   * calling `process.exit`**, which is what makes an outstanding request a thing
+   * that delays the prompt instead of a thing that is discarded.
+   */
+  let versionCheckAbort: AbortController | null = null;
+  /** Abandon it, if there is one. Both a stop and the last line reach for this. */
+  const abortVersionCheck = () => versionCheckAbort?.abort();
   /** Whether a tick is in flight, which is what a second poll would collide with. */
   let polling = false;
   /** When a poll a person asked for was last taken, for the minimum spacing. */
@@ -263,6 +378,8 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
     return () => stoppers.delete(stopper);
   };
   let anyFailed = false;
+  /** How many sessions this process started, so a stop row reads as a history rather than a list. */
+  let sessionsStarted = 0;
 
   /**
    * Run one unit to its end, then start whatever was waiting behind it.
@@ -275,6 +392,7 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
   const startUnit = async (agent: string, entry: AgentEntry, unit: WorkUnit): Promise<void> => {
     const state = work.get(agent)!;
     state.running = true;
+    sessionsStarted += 1;
     say({
       kind: "start",
       agent,
@@ -331,9 +449,24 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
    * revocation reported as a network blip is the worst of the two mistakes —
    * the runner would poll for days printing *could not be read* and starting
    * nothing, and exit 0 when finally stopped.
+   *
+   * @param call which of the two polled calls this was, which is the half of the
+   *   sentence that used to be missing: both are authorised the same way and both
+   *   answer the same refusal, so without it the only way to tell the count from
+   *   the claim is that one of them happens not to name the server's words.
+   * @returns the sentence to end the run with **and** the row to write it down as,
+   *   together rather than separately so the two can never say different things
+   *   about the same refusal.
    */
-  const refusal = (cause: unknown): string | null =>
-    cause instanceof AuthError ? signInAgainMessage(cause.status) : null;
+  const refusal = (cause: unknown, call: RefusedCall): { message: string; row: RefusedRow } | null => {
+    if (!(cause instanceof AuthError)) return null;
+    const said = signInAgainMessage(cause.status);
+    if (said === null) return null;
+    return {
+      message: refusedMessage(said, call, cause.status, cause.message),
+      row: refusedRow(deps.now(), call, cause.status, cause.message),
+    };
+  };
 
   const tick = async (): Promise<void> => {
     const plan = tickPlan(startup.asking, busy());
@@ -359,9 +492,10 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
       const counted = await deps.count(token, plan.ask);
       waiting = counted.waiting;
     } catch (cause) {
-      const refused = refusal(cause);
+      const refused = refusal(cause, "count");
       if (refused) {
-        sessionEnded = refused;
+        await record(refused.row);
+        sessionEnded = refused.message;
         return;
       }
       say({ kind: "note", message: `The count could not be read: ${(cause as Error).message}` });
@@ -376,9 +510,10 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
     try {
       body = await deps.claim(token, plan.ask, CLAIM_LIMIT, config.sessionsPerHour);
     } catch (cause) {
-      const refused = refusal(cause);
+      const refused = refusal(cause, "claim");
       if (refused) {
-        sessionEnded = refused;
+        await record(refused.row);
+        sessionEnded = refused.message;
         return;
       }
       say({ kind: "note", message: `The claim failed: ${(cause as Error).message}` });
@@ -443,6 +578,9 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
       return;
     }
     stop.stopped = true;
+    // The version check is the one outstanding request nothing is waiting on,
+    // and a person who pressed Ctrl-C is owed a prompt rather than a lookup.
+    abortVersionCheck();
     // Said before the wait rather than after it: every running session is now
     // given its grace period, which can be minutes, and a screen still showing a
     // countdown through that is counting down to a poll that will never happen.
@@ -483,6 +621,75 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
   };
   presenter.listen(onRequest);
 
+  /** When a version check was last *started*, which is what the period is measured from. */
+  let versionCheckedAt: number | null = null;
+  /** Whether one is still going, so a slow lookup is not started again beneath itself. */
+  let versionCheckRunning = false;
+  /** The version already announced, so a second check finding the same tag says nothing. */
+  let versionAnnounced: string | null = null;
+
+  /**
+   * Look up the published version if one is due, and say so if there is
+   * something to say.
+   *
+   * **Started and not awaited, which is the decision worth reading.** This is a
+   * poll loop whose entire value is that it asks the server on time, and an
+   * awaited network call would put the timeliness of every poll behind a request
+   * to a third party. The notice is the least urgent thing this process does and
+   * must not be able to delay the most urgent.
+   *
+   * **Not awaiting it is not the same as being free of it**, and that is the part
+   * that is easy to get wrong: this program sets an exit code and lets the loop
+   * drain, so an outstanding request keeps the process alive whether anything is
+   * waiting on it or not. `fetch` gives up after five minutes of its own accord,
+   * which is five minutes a person who pressed Ctrl-C spends watching a prompt
+   * that has not come back. So the request is bounded by
+   * `VERSION_CHECK_TIMEOUT_MS` and is aborted outright when the run ends.
+   *
+   * **Nothing is said once the presenter has been told to stop.** An answer that
+   * arrives after the screen is gone would be printed by the plain presenter
+   * anyway — it has no such guard — landing a line beneath the one that says the
+   * runner stopped.
+   *
+   * **The in-flight flag is what makes the period true rather than nominal.** The
+   * stamp is taken when the check starts, so a lookup that is slow past the next
+   * due time is not joined by a second one.
+   */
+  const checkVersion = () => {
+    const at = deps.now().getTime();
+    if (versionCheckRunning || !versionCheckDue(versionCheckedAt, at)) return;
+    versionCheckRunning = true;
+    versionCheckedAt = at;
+    const abort = new AbortController();
+    versionCheckAbort = abort;
+    // Unref'd, so the timer that bounds the request is not itself a reason the
+    // process stays up.
+    const giveUp = setTimeout(() => abort.abort(), VERSION_CHECK_TIMEOUT_MS);
+    giveUp.unref?.();
+    void deps
+      .lookupLatest(abort.signal)
+      .then((latest) => {
+        if (!presenting) return;
+        const notice = versionNoticeFor(deps.build.version, latest, deps.build.channel, deps.build.isCompiled);
+        // Null is a failed lookup — including one this runner abandoned — or a
+        // version that is already current, and every one of those is silent:
+        // nothing to the screen and nothing to the run log. A log line for the
+        // failure was offered and declined; it is not an oversight.
+        if (notice === null || notice.version === versionAnnounced) return;
+        versionAnnounced = notice.version;
+        say({ kind: "version", version: notice.version, how: notice.how });
+      })
+      // A frame that threw while drawing the notice must not become an unhandled
+      // rejection, which on this Node ends the process and takes every running
+      // session with it.
+      .catch(() => {})
+      .finally(() => {
+        clearTimeout(giveUp);
+        versionCheckRunning = false;
+        if (versionCheckAbort === abort) versionCheckAbort = null;
+      });
+  };
+
   /**
    * One tick, with the runner saying where it is on either side of it.
    *
@@ -492,6 +699,11 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
    * number is the moment the next poll is due.
    */
   const runTick = async (): Promise<void> => {
+    // Here rather than on its own timer: the tick is already the thing that
+    // happens regularly, and a second timer would be a second thing to stop.
+    // The period is the gate, so a one-minute poll does not mean a one-minute
+    // check.
+    checkVersion();
     polling = true;
     say({ kind: "phase", phase: { kind: "polling" } });
     try {
@@ -527,13 +739,38 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
     // long as a session takes with the view still drawn.
     enterFinishing();
     await Promise.all([...sessions]);
+  } catch (cause) {
+    // A throw that escapes the loop is still an ending, and the one thing this
+    // file must never leave is a start with nothing after it — that is
+    // indistinguishable from the process being killed outright, which is exactly
+    // the ambiguity it exists to remove. The throw is re-raised unchanged; all
+    // that happens here is that it stops being invisible.
+    await record(stopRow(deps.now(), "threw", 1, sessionsStarted));
+    throw cause;
   } finally {
     process.off("SIGINT", onStop);
     process.off("SIGTERM", onStop);
   }
 
+  // The exit is written down as well as printed, and that is the gap this closes:
+  // a run log holds one row per finished session and nothing at all for a runner
+  // that stopped without finishing one, which is precisely the case somebody is
+  // trying to explain the next morning.
+  //
+  // **Written before the presenter is told to stop**, because a failed write says
+  // so through `say` — and a note said after the screen is gone is a line the
+  // plain presenter would put underneath the one announcing the runner stopped.
+  const code = sessionEnded !== null ? 1 : once && anyFailed ? 1 : 0;
+  const why = sessionEnded !== null ? "session-ended" : stop.stopped ? "signal" : once ? "once" : "finished";
+  await record(stopRow(deps.now(), why, code, sessionsStarted));
+
   const lost = [...work.values()].reduce((total, w) => total + w.queue.length, 0);
   say({ kind: "stopped", lostQueued: lost });
+  // Both halves, and they are not the same thing: the abort stops the request
+  // holding the process open past its last line, and the flag stops an answer
+  // that is already on its way from being printed under it.
+  presenting = false;
+  abortVersionCheck();
   await presenter.stop();
   // The session ending is the one thing that stops the loop by itself, and it is
   // said on stderr after the view is gone — it is what a person has to act on.
@@ -541,7 +778,7 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
     err(sessionEnded);
     return 1;
   }
-  return once && anyFailed ? 1 : 0;
+  return code;
 }
 
 /**

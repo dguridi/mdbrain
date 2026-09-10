@@ -27,8 +27,9 @@
 import { createElement as h, useEffect, useState, type ReactElement } from "react";
 import { Box, Text, render, useInput, useStdin } from "ink";
 import { Spinner } from "@inkjs/ui";
-import { costText, durationText, plainLine, shortClaim, type Presenter, type RunEvent } from "./present.ts";
+import { agoText, clockText, costText, dayText, durationText, plainLine, shortClaim, type Presenter, type RunEvent } from "./present.ts";
 import { actionForKey, keyHints, type ViewRequest } from "./keys.ts";
+import { OUTCOME_KINDS } from "./outcome.ts";
 import {
   applyEvent,
   emptyView,
@@ -44,8 +45,37 @@ import {
 /** How often the countdown redraws. One second, because that is its own unit. */
 export const COUNTDOWN_TICK_MS = 1_000;
 
+/**
+ * The widths the recent list's fixed columns are held to, so the stamp at the
+ * end of every row lands in one place.
+ *
+ * Sized to the longest each field can be rather than to the longest one on
+ * screen: a column whose width came from the rows currently in it would shift
+ * every time a run ended, which is the one thing a list a person is scanning
+ * must not do. `23h59m` is the longest duration this list can hold — a session
+ * is bounded by the wall clock — and a cost is `$` and a figure, given room for
+ * one that ran into the hundreds.
+ *
+ * **The outcome's width is derived from the declaration and not written down.**
+ * Six of the seven outcomes are longer than `failed`, so a number chosen from
+ * the two a person sees most would leave every other kind pushing the columns
+ * after it sideways — and the rows it happens to be wrong about are exactly the
+ * ones somebody is scanning for. A kind added later widens the column by being
+ * declared, which is the only way this cannot go stale.
+ */
+const OUTCOME_WIDTH = Math.max(...OUTCOME_KINDS.map((kind) => kind.length));
+const DURATION_WIDTH = 6;
+const COST_WIDTH = 7;
+
 /** The gutter colour, the same one `configure` uses: one rule down the left of the frame. */
 const FRAME_COLOR = "cyan";
+
+/**
+ * The version notice, which is the one line on this screen that asks the person
+ * to go and do something. Yellow rather than the frame's cyan so it does not
+ * read as furniture, and not red, which is what a failed run is.
+ */
+const NOTICE_COLOR = "yellow";
 
 const STATE_COLOR: Record<AgentRow["state"], string> = { idle: "gray", running: "green", held: "yellow" };
 
@@ -110,7 +140,7 @@ export function countdownText(state: ViewState, now: number): string | null {
  * row is keyed on, so the detail points at the rest of the record without this
  * view ever reading it.
  */
-function runDetail(run: RecentRun): ReactElement[] {
+function runDetail(run: RecentRun, now: number): ReactElement[] {
   const { text, truncated } = messagePreview(run.message);
   const children: ReactElement[] = [
     h(Text, { key: "detail-heading", color: FRAME_COLOR }, "The run you picked"),
@@ -118,6 +148,14 @@ function runDetail(run: RecentRun): ReactElement[] {
       Text,
       { key: "detail-head", color: run.outcome === "done" ? "green" : "red" },
       `  ${run.agent}  ${run.outcome}  ${durationText(run.ms)}  ${costText(run.costUsd)}  claim ${shortClaim(run.claim)}`,
+    ),
+    // The date belongs here rather than on the row: this is the one place with
+    // room for it, and a row that carried it would push the message's own line
+    // off a narrow terminal to answer a question the row's age already answers.
+    h(
+      Text,
+      { key: "detail-when", dimColor: true },
+      `  ended ${dayText(run.at)}, ${clockText(run.at)} · ${agoText(now - run.at.getTime())}`,
     ),
   ];
   children.push(h(Text, { key: "detail-message" }, `  ${text === "" ? "(the harness said nothing)" : text}`));
@@ -145,7 +183,12 @@ export interface ScreenFrame {
 /** The whole screen. Exported so a test can draw it with its own clock. */
 export function liveView(state: ViewState, frame: ScreenFrame): ReactElement {
   const { now, keysActive, selection } = frame;
-  const width = Math.max(1, ...state.agents.map((a) => a.agent.length));
+  // One width for both lists rather than one each: they are two blocks of the
+  // same screen a few lines apart, and a name column that changed width halfway
+  // down reads as two unrelated tables. The recent list is included because it
+  // can hold an agent the roster does not — an event about an agent the view was
+  // never told about is still drawn, which is the point of that rule.
+  const width = Math.max(1, ...state.agents.map((a) => a.agent.length), ...state.recent.map((r) => r.agent.length));
   const children: ReactElement[] = [h(Text, { key: "title", color: FRAME_COLOR, bold: true }, "mdbrain run")];
   for (const line of state.summary.slice(1)) {
     children.push(h(Text, { key: `summary-${line}`, dimColor: true }, line));
@@ -173,13 +216,36 @@ export function liveView(state: ViewState, frame: ScreenFrame): ReactElement {
           // cursor is: the list grows from the top and a row is not the run it
           // was a moment ago.
           { key: `recent-${run.claim}`, color: run.outcome === "done" ? "green" : "red", bold: picked },
-          `${picked ? "› " : "  "}${run.agent}  ${run.outcome}  ${durationText(run.ms)}  ${costText(run.costUsd)}`,
+          // The clock and the age together, which is the pair the question is
+          // actually asked in: the clock alone cannot tell this morning from
+          // yesterday morning, and the age alone gives a person nothing to match
+          // against the log's own stamp. The age is a rendering of `run.at` and
+          // moves on the countdown's timer for the same reason its second hand
+          // does — the runner's state does not move with it.
+          //
+          // **Every field before it is padded, and that is what makes the column
+          // readable rather than merely present.** Four variable-width fields
+          // sat between the row's start and this one, so the stamps landed in
+          // five different places and the eye had to find each one — which is
+          // the whole of what *at a glance* costs when it is got wrong.
+          `${picked ? "› " : "  "}${run.agent.padEnd(width)}  ${run.outcome.padEnd(OUTCOME_WIDTH)}  ${durationText(run.ms).padStart(DURATION_WIDTH)}  ${costText(run.costUsd).padStart(COST_WIDTH)}  ${clockText(run.at)} · ${agoText(now - run.at.getTime())}`,
         ),
       );
     });
   }
-  if (open !== null) children.push(...runDetail(open));
+  if (open !== null) children.push(...runDetail(open, now));
 
+  // The version notice sits beside the note rather than in either list above:
+  // it is a fact about the program, not about an agent or a run, so a row in
+  // the roster would be the wrong shape for it and the recent list is a record
+  // of sessions. It is drawn *above* the note because it outlives one — a note
+  // is the last thing that happened and this stays true until the runner is
+  // restarted, so the transient line belongs nearer the countdown that also
+  // moves. It is coloured rather than dimmed for the same reason: this is the
+  // one line here that is asking the person to do something.
+  if (state.versionNotice !== null) {
+    children.push(h(Text, { key: "version", color: NOTICE_COLOR }, `  ${state.versionNotice}`));
+  }
   if (state.note !== null) children.push(h(Text, { key: "note", dimColor: true }, `  ${state.note}`));
 
   const countdown = countdownText(state, now);
@@ -214,27 +280,36 @@ interface ScreenProps {
  * The live screen: the state drawn, the countdown ticking, the keys read.
  *
  * **It holds two things of its own, and neither is the runner's.** `now` exists
- * so the countdown can subtract, and the timer behind it runs **only while there
- * is a deadline to count down to** — a runner that is polling, or one that has
- * not said yet, has nothing on screen that changes with the clock, and a timer
- * running then would be a redraw with nothing behind it. `selection` is which
- * recent run the person opened, which is a fact about the person rather than
- * about the runner, and is exactly why the keys that move it never leave this
- * component while the two that ask the runner for something always do.
+ * so the countdown can subtract and a recent run can say how long ago it was,
+ * and the timer behind it runs **whenever either of those is on screen**.
+ * `selection` is which recent run the person opened, which is a fact about the
+ * person rather than about the runner, and is exactly why the keys that move it
+ * never leave this component while the two that ask the runner for something
+ * always do.
+ *
+ * **The condition is two things and not one, which is what the ages cost.** It
+ * was the deadline alone, which was right while the countdown was the only
+ * clock-derived value: a runner that is polling, or one that has not said yet,
+ * had nothing on screen that moved. An age moves whether or not a poll is
+ * coming — and the phases with no deadline are exactly the long ones, `--once`
+ * waiting out its sessions, a stop giving them their grace, a session the server
+ * has ended. Left gated on the deadline, a run under `--once` freezes `now` at
+ * mount and every row reads *just now* for the rest of the process.
  */
 function LiveScreen({ state, onRequest }: ScreenProps): ReactElement {
   const [now, setNow] = useState(() => Date.now());
   const [selection, setSelection] = useState<Selection>(null);
   const deadline = state.poll.kind === "waiting" ? state.poll.at : null;
+  const ticking = deadline !== null || state.recent.length > 0;
   useEffect(() => {
-    if (deadline === null) return;
-    // Read the clock once on arrival too: the deadline is new, and waiting a
-    // whole second before the first number would show a countdown that starts
-    // late by exactly the interval it counts in.
+    if (!ticking) return;
+    // Read the clock once on arrival too: whatever started this is new, and
+    // waiting a whole second before the first number would show a countdown —
+    // or an age — that starts late by exactly the interval it moves in.
     setNow(Date.now());
     const timer = setInterval(() => setNow(Date.now()), COUNTDOWN_TICK_MS);
     return () => clearInterval(timer);
-  }, [deadline]);
+  }, [deadline, ticking]);
 
   const { isRawModeSupported } = useStdin();
   useInput(
@@ -287,7 +362,7 @@ export function livePresenter(out: (line: string) => void, now: () => Date = () 
         if (text !== null) out(text);
         return;
       }
-      state = applyEvent(state, event);
+      state = applyEvent(state, event, at ?? now());
       if (live) app.rerender(h(LiveScreen, { state, onRequest: forward }));
     },
     listen(next) {
