@@ -16,6 +16,8 @@
 // and it gets it wrong at the moment somebody is upgrading rather than at
 // compile time.
 
+import { posix, win32 } from "node:path";
+
 /** The platforms the replace is written for. `node:process`'s own vocabulary. */
 export type UpgradePlatform = NodeJS.Platform;
 
@@ -85,6 +87,43 @@ export function versionFromLocation(location: string | null | undefined): string
  */
 export function isCompiledExecPath(execPath: string): boolean {
   return !/[\\/](node|nodejs|bun)[0-9._-]*(\.exe)?$/i.test(execPath);
+}
+
+/** How `tar` is called to take one member out of the staged archive. */
+export interface TarExtraction {
+  /** Everything after the program name, in order. */
+  readonly argv: readonly string[];
+  /** The directory `tar` runs from, which is what makes the argv relative. */
+  readonly cwd: string;
+}
+
+/**
+ * The `tar` invocation that unpacks the new binary, as a value.
+ *
+ * **No argument may carry an absolute Windows path, and that is the whole
+ * reason this is a value rather than an argv written at the spawn.** GNU tar
+ * reads a colon in the archive name as `host:path` and goes looking for a
+ * remote machine, so `-f C:\…\mdbrain-windows-x64.tar.gz` fails to resolve a
+ * host called `C` rather than opening the file sitting at that path. Which
+ * `tar` answers is not this program's to choose and cannot be detected from
+ * here: a machine carrying Git's tools ahead of the system ones supplies GNU
+ * tar under that name, and one without them supplies bsdtar, which takes the
+ * same path happily. Naming the archive relative to the directory `tar` is told
+ * to run from keeps a drive letter out of every argument, so the two agree.
+ *
+ * **The platform is a parameter for the reason the replace steps take one**:
+ * the case that breaks is Windows, the runner that checks it is not, and a
+ * separator chosen from the ambient platform could only be checked by upgrading
+ * on the platform that gets it wrong.
+ *
+ * @param platform the platform the extraction runs on
+ * @param archive the downloaded archive, which sits inside `into`
+ * @param into the staging directory, which is where the member lands
+ * @param member the one file to take out of the archive
+ */
+export function tarExtraction(platform: UpgradePlatform, archive: string, into: string, member: string): TarExtraction {
+  const flavour = platform === "win32" ? win32 : posix;
+  return { argv: ["-xzf", flavour.relative(into, archive), member], cwd: into };
 }
 
 /** The release asset this target's binary ships in. */

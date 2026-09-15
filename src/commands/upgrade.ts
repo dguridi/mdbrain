@@ -36,6 +36,7 @@ import {
   replaceSteps,
   rollbackSteps,
   RUNNING_RUN_NOTICE,
+  tarExtraction,
   type ReplaceRecovery,
   type ReplaceStep,
 } from "../upgrade/plan.ts";
@@ -59,12 +60,15 @@ export interface UpgradeDeps {
   makeExecutable: (path: string) => Promise<void>;
 }
 
-/** Runs `tar -xzf <archive> -C <into> <member>` and answers where the member landed. */
-const extractWithTar = (archive: string, into: string, member: string): Promise<string> =>
+/** Runs `tar` over the staged archive and answers where the member landed. */
+const extractWithTar = (platform: NodeJS.Platform, archive: string, into: string, member: string): Promise<string> =>
   new Promise((resolve, reject) => {
     // `tar` is not a new dependency: the Windows install script already refuses
     // a machine without it, and it is spawnable from inside a compiled binary.
-    const child = spawn("tar", ["-xzf", archive, "-C", into, member], { stdio: "ignore" });
+    // What the machine supplies under that name is not fixed, though, which is
+    // what `tarExtraction` is shaped around.
+    const { argv, cwd } = tarExtraction(platform, archive, into, member);
+    const child = spawn("tar", [...argv], { cwd, stdio: "ignore" });
     child.on("error", reject);
     child.on("close", (code) => (code === 0 ? resolve(join(into, member)) : reject(new Error(`tar exited ${code}`))));
   });
@@ -80,7 +84,7 @@ export const defaultUpgradeDeps: UpgradeDeps = {
     await mkdir(path, { recursive: true });
   },
   removeDir: (path) => rm(path, { recursive: true, force: true }),
-  extract: extractWithTar,
+  extract: (archive, into, member) => extractWithTar(process.platform, archive, into, member),
   makeExecutable: async (path) => {
     const { chmod } = await import("node:fs/promises");
     await chmod(path, 0o755);

@@ -15,6 +15,7 @@ import {
   replaceSteps,
   rollbackSteps,
   RUNNING_RUN_NOTICE,
+  tarExtraction,
   versionFromLocation,
 } from "../src/upgrade/plan.ts";
 import { downloadUrl, latestUrl, latestVersion } from "../src/upgrade/latest.ts";
@@ -313,6 +314,37 @@ describe("upgrade: what it decides before it touches anything", () => {
     // And the two consumers reach it by name rather than by a second copy.
     expect(src("commands/upgrade.ts")).toContain("isCompiled: isCompiledExecPath(process.execPath)");
     expect(src("upgrade/sweep.ts")).toContain("!isCompiledExecPath(execPath)");
+  });
+});
+
+describe("upgrade: the tar invocation", () => {
+  const into = "C:\\Users\\dev\\bin\\.mdbrain-upgrade";
+  const archive = `${into}\\mdbrain-windows-x64.tar.gz`;
+
+  it("puts no drive letter in any argument, because GNU tar reads a colon as a remote host", () => {
+    const { argv } = tarExtraction("win32", archive, into, "mdbrain.exe");
+    for (const arg of argv) expect(arg).not.toMatch(/^[A-Za-z]:/);
+  });
+
+  it("names the archive relative to the directory tar is told to run from", () => {
+    const { argv, cwd } = tarExtraction("win32", archive, into, "mdbrain.exe");
+    expect(cwd).toBe(into);
+    expect(argv).toEqual(["-xzf", "mdbrain-windows-x64.tar.gz", "mdbrain.exe"]);
+  });
+
+  it("reads Windows separators as separators wherever the test is running", () => {
+    // The whole point of the platform parameter: a POSIX runner splitting a
+    // Windows path on `/` would leave the backslashes in one lump and the
+    // relative name would still be the absolute one.
+    const { argv } = tarExtraction("win32", archive, into, "mdbrain.exe");
+    expect(argv[1]).not.toContain("\\");
+  });
+
+  it("is the same shape on POSIX, where the archive is also inside the staging directory", () => {
+    const posixInto = "/home/dev/.local/bin/.mdbrain-upgrade";
+    const { argv, cwd } = tarExtraction("linux", `${posixInto}/mdbrain-linux-x64.tar.gz`, posixInto, "mdbrain");
+    expect(cwd).toBe(posixInto);
+    expect(argv).toEqual(["-xzf", "mdbrain-linux-x64.tar.gz", "mdbrain"]);
   });
 });
 
