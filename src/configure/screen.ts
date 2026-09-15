@@ -37,7 +37,6 @@ import {
   judgeCeiling,
   judgeCwd,
   judgeDuration,
-  judgePoll,
   judgeSelection,
   judgeTurns,
   judgeVariable,
@@ -187,8 +186,7 @@ type Phase =
   | { kind: "rename"; index: number }
   | { kind: "agents" }
   | { kind: "agent"; index: number; question: number }
-  | { kind: "ceiling" }
-  | { kind: "poll" };
+  | { kind: "ceiling" };
 
 /** A Tab cycle in progress: what it was computed from, the matches, and where in them we are. */
 interface Completion {
@@ -252,11 +250,6 @@ function ConfigureScreen({ plan, onDone }: { plan: ScreenPlan; onDone: (answers:
   const advance = (next: State) => {
     setState(next);
     plan.record?.(draftOf(next));
-  };
-
-  const finish = (poll: string) => {
-    onDone({ agents: state.agents, sessionsPerHour: state.sessionsPerHour, poll, dropped: state.dropped });
-    exit();
   };
 
   // The field owns its own text; this is the copy Tab completes from. Written as
@@ -465,7 +458,9 @@ function ConfigureScreen({ plan, onDone }: { plan: ScreenPlan; onDone: (answers:
           })
         : field(`agent-${phase.index}-${phase.question}-${state.attempt}`, state, onTyped, answerAgentText),
     );
-  } else if (phase.kind === "ceiling") {
+  } else {
+    // The last question, so a good answer finishes rather than advancing: there
+    // is no phase after this one to move to.
     question = h(
       Box,
       { flexDirection: "column" },
@@ -473,18 +468,13 @@ function ConfigureScreen({ plan, onDone }: { plan: ScreenPlan; onDone: (answers:
       field(`ceiling-${state.attempt}`, state, onTyped, (raw: string) => {
         const judged = judgeCeiling(raw);
         if (!judged.ok) setState(offer({ ...state, problem: judged.problem }, raw));
-        else advance(offer({ ...state, sessionsPerHour: judged.value, phase: { kind: "poll" }, problem: null, warning: null }, plan.existing?.poll ?? "5m"));
-      }),
-    );
-  } else {
-    question = h(
-      Box,
-      { flexDirection: "column" },
-      h(Text, null, "How often to ask for work, with a unit."),
-      field(`poll-${state.attempt}`, state, onTyped, (raw: string) => {
-        const judged = judgePoll(raw);
-        if (!judged.ok) setState(offer({ ...state, problem: judged.problem }, raw));
-        else finish(judged.value);
+        else {
+          // Recorded before the screen goes, so a write that fails leaves a draft
+          // holding every answer rather than one short of the last.
+          advance({ ...state, sessionsPerHour: judged.value, problem: null, warning: null });
+          onDone({ agents: state.agents, sessionsPerHour: judged.value, dropped: state.dropped });
+          exit();
+        }
       }),
     );
   }

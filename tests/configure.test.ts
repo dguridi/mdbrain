@@ -13,7 +13,6 @@ import {
   judgeCeiling,
   judgeCwd,
   judgeDuration,
-  judgePoll,
   judgeSelection,
   judgeVariable,
   mcpFileNameFor,
@@ -47,7 +46,6 @@ const roster: RosterAgent[] = [
 
 const existing = (): Config => ({
   version: 1,
-  poll: "5m",
   sessionsPerHour: null,
   agents: {
     "dev-bot-mdden": {
@@ -70,7 +68,6 @@ const answersFor = (names: Array<[string, string]>): Answers => ({
     bounds: { maxTurns: 50, maxBudgetUsd: 5, wallClock: "30m" },
   })),
   sessionsPerHour: null,
-  poll: "5m",
   dropped: [],
 });
 
@@ -95,9 +92,9 @@ function memoryKeyStore(seed: Record<string, string> = {}): ConnectionKeyStore &
 describe("the roster as the screen offers it", () => {
   const organizations = [{ id: "o-1", name: "markdownbrain.ai" }, { id: "o-2", name: "empty org" }];
   const agents = [
-    { id: "a-1", org_id: "o-1", display_name: "dev-bot-mdden", status: "active" },
-    { id: "a-3", org_id: "o-1", display_name: "old-bot", status: "disabled" },
-    { id: "a-9", org_id: "o-x", display_name: "orphan", status: "active" },
+    { id: "a-1", org_id: "o-1", display_name: "dev-bot-mdden", status: "active", bot_user_id: "u-dev-bot" },
+    { id: "a-3", org_id: "o-1", display_name: "old-bot", status: "disabled", bot_user_id: "u-old-bot" },
+    { id: "a-9", org_id: "o-x", display_name: "orphan", status: "active", bot_user_id: "u-orphan" },
   ];
 
   it("105-S10: every offered agent under its organization, an inactive one with its status, an organization with none named as such", () => {
@@ -112,10 +109,10 @@ describe("the roster as the screen offers it", () => {
   it("105-S42: the list is ordered by organization, then by name, with digits compared as numbers", () => {
     const orgs = [{ id: "o-b", name: "zeta org" }, { id: "o-a", name: "alpha org" }];
     const unordered = [
-      { id: "1", org_id: "o-b", display_name: "bot-10", status: "active" },
-      { id: "2", org_id: "o-a", display_name: "Yak", status: "active" },
-      { id: "3", org_id: "o-b", display_name: "bot-2", status: "active" },
-      { id: "4", org_id: "o-a", display_name: "ant", status: "active" },
+      { id: "1", org_id: "o-b", display_name: "bot-10", status: "active", bot_user_id: "u-1" },
+      { id: "2", org_id: "o-a", display_name: "Yak", status: "active", bot_user_id: "u-2" },
+      { id: "3", org_id: "o-b", display_name: "bot-2", status: "active", bot_user_id: "u-3" },
+      { id: "4", org_id: "o-a", display_name: "ant", status: "active", bot_user_id: "u-4" },
     ];
     expect(rosterAgents(orgs, unordered).map((a) => `${a.organization}/${a.name}`)).toEqual([
       "alpha org/ant",
@@ -132,9 +129,9 @@ describe("the roster as the screen offers it", () => {
     expect(owned.map((o) => o.id)).toEqual(["o-mine"]);
 
     const all = [
-      { id: "m-1", org_id: "o-mine", display_name: "mine-bot", status: "active" },
-      { id: "t-1", org_id: "o-theirs", display_name: "their-bot", status: "active" },
-      { id: "t-2", org_id: "o-theirs", display_name: "their-other-bot", status: "active" },
+      { id: "m-1", org_id: "o-mine", display_name: "mine-bot", status: "active", bot_user_id: "u-mine-bot" },
+      { id: "t-1", org_id: "o-theirs", display_name: "their-bot", status: "active", bot_user_id: "u-their-bot" },
+      { id: "t-2", org_id: "o-theirs", display_name: "their-other-bot", status: "active", bot_user_id: "u-their-other-bot" },
     ];
     const offered = rosterAgents(owned, all);
     expect(offered.map((a) => a.name)).toEqual(["mine-bot"]);
@@ -298,22 +295,19 @@ describe("the defaults and the judgements", () => {
     expect(judgeCeiling("0").ok).toBe(false);
   });
 
-  it("durations need a unit, and the poll has a floor", () => {
+  it("durations need a unit", () => {
     expect(judgeDuration("30m")).toEqual({ ok: true, value: "30m" });
     expect(judgeDuration("30").ok).toBe(false);
-    expect(judgePoll("10s").ok).toBe(false);
-    expect(judgePoll("5m")).toEqual({ ok: true, value: "5m" });
   });
 
   it("105-S8: every answer the questions accept writes a file parseConfig reads back, for several accepted shapes", () => {
-    for (const [ceiling, poll, wall] of [[4, "5m", "30m"], [null, "30s", "2h"], [10, "1h", "500h"]] as const) {
+    for (const [ceiling, wall] of [[4, "30m"], [null, "2h"], [10, "500h"]] as const) {
       const answers = answersFor([["dev-bot-mdden", "a-1"], ["spec-warden", "a-2"]]);
       answers.sessionsPerHour = ceiling;
-      answers.poll = judgePoll(poll).ok ? poll : "5m";
       for (const a of answers.agents) a.bounds = { ...a.bounds, wallClock: judgeDuration(wall).ok ? wall : "30m" };
       const config = assembleConfig(answers);
       const reading = parseConfig(serializeConfig(config));
-      expect(reading.kind === "config" && reading.config, `${ceiling} ${poll} ${wall}`).toEqual(config);
+      expect(reading.kind === "config" && reading.config, `${ceiling} ${wall}`).toEqual(config);
     }
   });
 
@@ -359,6 +353,20 @@ describe("the defaults and the judgements", () => {
     expect(lines.some((l) => l.includes("helper was dropped"))).toBe(true);
     expect(lines.some((l) => l.includes("removed /c/mcp/agent-old.json"))).toBe(true);
     expect(lines.at(-1)).toMatch(/server's, 10 sessions an hour/);
+  });
+
+  it("121-S4: the closing summary names the ceiling and says nothing about a poll", () => {
+    const answers = answersFor([["dev-bot-mdden", "a-1"]]);
+    const report = { path: "/c/config.json", mcpPaths: {}, removed: [] };
+    // Both branches of the line, since only one of them is drawn at a time and
+    // the poll used to be on the end of each.
+    const serversOwn = summaryLines(assembleConfig(answers), report, [], [], {});
+    expect(serversOwn.at(-1)).toBe(`Ceiling: the server's, 10 sessions an hour per agent.`);
+
+    const chosen = summaryLines(assembleConfig({ ...answers, sessionsPerHour: 4 }), report, [], [], {});
+    expect(chosen.at(-1)).toBe("Ceiling: 4 sessions an hour per agent.");
+
+    for (const line of [...serversOwn, ...chosen]) expect(line).not.toMatch(/Poll/i);
   });
 
   it("says nothing about a dropped rename the person then marked anyway, since it is in the file", () => {
@@ -441,7 +449,7 @@ describe("the screen", () => {
   const backspaces = (n: number) => "\u007f".repeat(n);
   const DOWN = "\u001b[B";
 
-  it("draws the roster as an arrow-key list and asks the per-agent questions in order, then the ceiling and the poll", async () => {
+  it("121-S3: draws the roster as an arrow-key list, asks the per-agent questions in order, and ends on the ceiling", async () => {
     let done: Answers | null = null;
     const { lastFrame, stdin } = render(
       configureScreen(plan({ emptyOrganizations: ["quiet org"], withheld: "One more agent is not offered here." }), (a) => { done = a; }),
@@ -464,9 +472,9 @@ describe("the screen", () => {
       await tick();
     }
     expect(lastFrame()).toContain("Most sessions an hour");
-    stdin.write("\r");
-    await tick();
-    expect(lastFrame()).toContain("How often to ask for work");
+    // No question follows it: the poll is a constant, so answering the ceiling
+    // is what finishes the wizard.
+    expect(lastFrame()).not.toContain("How often to ask for work");
     stdin.write("\r");
     await tick();
     expect(done).not.toBeNull();
@@ -476,8 +484,11 @@ describe("the screen", () => {
     expect(answers.agents[0].harnessVariable).toBe("ANTHROPIC_API_KEY");
     expect(answers.agents[0].connectionKeyVariable).toBe("MDBRAIN_KEY_DEV_BOT_MDDEN");
     expect(answers.sessionsPerHour).toBeNull();
-    expect(answers.poll).toBe("5m");
+    expect(answers).not.toHaveProperty("poll");
     expect(answers.dropped).toEqual([]);
+    // And the file those answers write holds no poll either, which is the half a
+    // walkthrough can check that `assembleConfig` alone cannot.
+    expect(serializeConfig(assembleConfig(answers))).not.toContain("poll");
   });
 
   it("never asks for a connection key: it is the server's to mint and this machine's to keep", async () => {
@@ -718,7 +729,7 @@ describe("the command", () => {
       : url.includes("organizations")
         ? [{ id: "o-1", name: "markdownbrain.ai" }, { id: "o-2", name: "quiet org" }]
         : url.includes("/agents")
-          ? [{ id: "a-1", org_id: "o-1", display_name: "dev-bot-mdden", status: "active" }]
+          ? [{ id: "a-1", org_id: "o-1", display_name: "dev-bot-mdden", status: "active", bot_user_id: "u-dev-bot" }]
           : url.includes("rpc/mint_agent_key")
             ? [{ id: "k-1", key: "smd_agent_abcdef01_minted" }]
             : { email: "diego@example.com", id: "u-1" };
@@ -766,6 +777,52 @@ describe("the command", () => {
     expect(readFileSync(join(root, "state", "session.json"), "utf8")).toBe(stateBefore);
     expect(out[0]).toBe(`Configuration written to ${configPath()}.`);
     expect(out.at(-1)).toMatch(/Connection keys are held in/);
+  });
+
+  it("121-S21: `configure` says where the key is held in either case, which is where that disclosure now lives", async () => {
+    // `run` says it only on the file fallback, because a line on every start
+    // about a keychain is what a person already assumed. Here somebody is asking
+    // rather than being told, so both branches are part of the answer — and this
+    // is what makes the change in `run` a change of venue and not a deletion.
+    for (const backend of [
+      { kind: "keychain", where: "the keychain" } as const,
+      { kind: "file", where: "/tmp/secrets.json", reason: "this runtime has no keychain to put it in" } as const,
+    ]) {
+      validSession();
+      const { out, context } = io();
+      const store = { ...memoryKeyStore(), backend };
+      const code = await withFetch(rosterReply, () => runConfigure(deps({ openKeyStore: async () => store }), context));
+      expect(code).toBe(0);
+      expect(out.at(-1)).toContain(`Connection keys are held in ${backend.where}`);
+    }
+  });
+
+  // The refusal branch of the roster read, which nothing reached before. It
+  // decides two things at once: which command the sentence tells somebody to run
+  // again, and whether the server's own words are redacted on the way out. `run`
+  // and `whoami` are both asserted this way, and this is the third of the four
+  // call sites that print such a body.
+  it("99-S11: a refused roster names `mdbrain configure` first, and redacts the server's words", async () => {
+    validSession();
+    const signature = "c2lnbmF0dXJlX2hlcmU";
+    const refusedReply = (url: string) =>
+      url.includes("/auth/v1/user")
+        ? new Response(
+            JSON.stringify({
+              code: 403,
+              msg: `Session from session_id claim in JWT does not exist (eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.${signature})`,
+            }),
+            { status: 403, headers: { "content-type": "application/json" } },
+          )
+        : rosterReply(url);
+    const { err, context } = io();
+    const code = await withFetch(refusedReply, () => runConfigure(deps(), context));
+    expect(code).toBe(1);
+    const said = err.join("\n");
+    expect(said.indexOf("mdbrain configure")).toBeGreaterThan(-1);
+    expect(said.indexOf("mdbrain configure")).toBeLessThan(said.indexOf("mdbrain login"));
+    expect(said).toContain("[redacted]");
+    expect(said).not.toContain(signature);
   });
 
   it("105-S50: the key is asked of the server and kept on this machine, and never written into the config", async () => {
@@ -864,8 +921,8 @@ describe("the command", () => {
           : url.includes("/agents")
             ? new Response(
                 JSON.stringify([
-                  { id: "a-1", org_id: "o-1", display_name: "dev-bot-mdden", status: "active" },
-                  { id: "z-1", org_id: "o-9", display_name: "someone-elses-bot", status: "active" },
+                  { id: "a-1", org_id: "o-1", display_name: "dev-bot-mdden", status: "active", bot_user_id: "u-dev-bot" },
+                  { id: "z-1", org_id: "o-9", display_name: "someone-elses-bot", status: "active", bot_user_id: "u-someone-else" },
                 ]),
                 { status: 200 },
               )

@@ -81,8 +81,6 @@ export interface AgentEntry {
 /** The whole file, as this build understands it. */
 export interface Config {
   version: typeof CONFIG_VERSION;
-  /** How often `run` asks, with a unit. */
-  poll: string;
   /** The runner's ceiling on sessions an hour per agent, or null to let the server's stand. */
   sessionsPerHour: number | null;
   agents: Record<string, AgentEntry>;
@@ -91,10 +89,26 @@ export interface Config {
 /** What a read of the text produced: a config, or the sentence refusing it. */
 export type ConfigReading = { kind: "config"; config: Config } | { kind: "problem"; message: string };
 
-export const DEFAULT_POLL = "5m";
 export const DEFAULT_BOUNDS: Bounds = { maxTurns: 50, maxBudgetUsd: 5, wallClock: "30m" };
-/** The least often `run` may be asked to poll. */
-export const MIN_POLL_MS = 30_000;
+/**
+ * How often `run` asks for work, as a fixed interval nobody sets.
+ *
+ * **A constant rather than a setting, because work no longer arrives by poll.**
+ * The runner is told when work lands and folds a burst into one read; the poll
+ * is what makes a signal that is never sent, never delivered, or lost to a
+ * socket nobody noticed had died cost latency instead of work. A safety net has
+ * no interesting values, so offering one was a question with no answer a person
+ * could reason about — and every answer to it was a way to make the net weaker.
+ *
+ * Forty-five minutes is chosen as long enough to be cheap and short enough to
+ * still be a net: it is nine times fewer requests an hour than the five minutes
+ * it replaces, and it bounds how long a unit can sit unstarted when its signal
+ * did not arrive. **That bound is the exposure to know about** — the runner does
+ * not ask for an agent that is already in a session, and a session ending is not
+ * a database write, so nothing announces the moment a unit held back that way
+ * becomes askable. The next poll is what finds it, and the next poll is this.
+ */
+export const POLL_MS = 45 * 60_000;
 /** The longest duration a timer can hold: past this, `setTimeout` fires at once rather than never. */
 export const MAX_DURATION_MS = 2_147_483_647;
 
@@ -221,9 +235,10 @@ export function parseConfig(text: string): ConfigReading {
     return problem(`config.json is version ${value.version}, which this build does not know.`);
   }
 
-  const poll = value.poll === undefined ? DEFAULT_POLL : value.poll;
-  if (typeof poll !== "string" || durationMs(poll) === null) return problem("poll must be a duration with a unit, such as 5m.");
-  if (durationMs(poll)! < MIN_POLL_MS) return problem("poll must be at least 30s.");
+  // A `poll` left in the file by an older build is read past rather than
+  // refused: this reader takes the keys it knows and ignores the rest, so the
+  // setting going away costs no version bump and no migration, and the key stops
+  // being written on the next save.
 
   let sessionsPerHour: number | null = null;
   if (value.sessionsPerHour !== undefined && value.sessionsPerHour !== null) {
@@ -245,7 +260,7 @@ export function parseConfig(text: string): ConfigReading {
     if (typeof read === "string") return problem(read);
     agents[name] = read;
   }
-  return { kind: "config", config: { version: CONFIG_VERSION, poll, sessionsPerHour, agents } };
+  return { kind: "config", config: { version: CONFIG_VERSION, sessionsPerHour, agents } };
 }
 
 /**
@@ -273,7 +288,7 @@ export function serializeConfig(config: Config): string {
       bounds: { maxTurns: entry.bounds.maxTurns, maxBudgetUsd: entry.bounds.maxBudgetUsd, wallClock: entry.bounds.wallClock },
     };
   }
-  const out: Record<string, unknown> = { version: config.version, poll: config.poll };
+  const out: Record<string, unknown> = { version: config.version };
   if (config.sessionsPerHour !== null) out.sessionsPerHour = config.sessionsPerHour;
   out.agents = agents;
   return `${JSON.stringify(out, null, 2)}\n`;

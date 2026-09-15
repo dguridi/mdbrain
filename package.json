@@ -1,6 +1,6 @@
 {
   "name": "@markdown-den/agent-runner",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "mdbrain — the runner you can log into",
@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@inkjs/ui": "^2.0.0",
+    "@markdown-den/collab-core": "*",
     "ink": "^7.1.1",
     "react": "19.2.4"
   },

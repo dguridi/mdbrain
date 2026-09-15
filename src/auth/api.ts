@@ -189,10 +189,28 @@ export interface Agent {
   org_id: string;
   display_name: string;
   status: string;
+  /**
+   * The account the agent acts as, which is what a roster dedupes on and what
+   * its colour is derived from.
+   *
+   * Read here rather than looked up later because there is nowhere later to look
+   * it up from: this is the only roster read the runner makes. The column has
+   * always existed and the SELECT policy already admits any organization member,
+   * so asking for it is one more name in the select and no migration.
+   */
+  bot_user_id: string;
 }
 
-async function selectRows<T>(path: string, accessToken: string): Promise<T[]> {
-  const res = await fetch(`${PROJECT_URL}/rest/v1/${path}`, { headers: headers(accessToken) });
+/**
+ * One PostgREST read under the caller's own RLS.
+ *
+ * @param signal bounds the wait where a caller has one to give. Most reads here
+ *   are made by a command that is about to exit and can be left to the network's
+ *   own timeout; a caller inside `run` is not, because an abandoned request with
+ *   nothing cancelling it keeps the process alive past its last printed line.
+ */
+async function selectRows<T>(path: string, accessToken: string, signal?: AbortSignal): Promise<T[]> {
+  const res = await fetch(`${PROJECT_URL}/rest/v1/${path}`, { headers: headers(accessToken), signal: signal ?? null });
   if (!res.ok) throw new AuthError(res.status, await readError(res));
   return (await res.json()) as T[];
 }
@@ -209,7 +227,7 @@ export function listOrganizations(accessToken: string): Promise<Organization[]> 
 }
 
 export function listAgents(accessToken: string): Promise<Agent[]> {
-  return selectRows<Agent>("agents?select=id,org_id,display_name,status&order=display_name", accessToken);
+  return selectRows<Agent>("agents?select=id,org_id,display_name,status,bot_user_id&order=display_name", accessToken);
 }
 
 /** One organization membership of the signed-in account, with the role it holds there. */
@@ -253,6 +271,94 @@ export async function mintAgentKey(accessToken: string, agentId: string): Promis
   const key = row?.key;
   if (typeof key !== "string" || key === "") throw new AuthError(0, "The server's answer did not contain a connection key.");
   return key;
+}
+
+/**
+ * The brains this runner should listen to for work signals.
+ *
+ * A runner is configured with agent names and learns which brain a unit came
+ * from only when it is handed one — which is exactly too late to have been
+ * listening. So it asks, once at startup, and the answer is the set of topics to
+ * join.
+ *
+ * **The answer is not a permission and is not treated as one.** It is a listening
+ * hint: every brain in it is one the caller could already see, and being told
+ * about one grants nothing — the claim is still authorised on its own, and a
+ * signal still only causes a read. A brain missing from the answer costs the
+ * latency of one poll interval and nothing else.
+ *
+ * Through PostgREST under the caller's own RLS rather than the app, because it is
+ * a plain read of the database with no server-side work in front of it.
+ *
+ * @param signal bounds the wait, and the caller is expected to pass one: this
+ *   read sits ahead of the first poll, so a request that hangs would stall the
+ *   thing it exists to make faster — a runner that never starts looking for work
+ *   because it is still asking which rooms to listen in.
+ */
+export async function signalBrains(
+  accessToken: string,
+  agents: readonly string[],
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const res = await fetch(`${PROJECT_URL}/rest/v1/rpc/signal_brains`, {
+    method: "POST",
+    headers: headers(accessToken),
+    body: JSON.stringify({ p_agent_names: agents }),
+    signal: signal ?? null,
+  });
+  if (!res.ok) throw new AuthError(res.status, await readError(res));
+  const body: unknown = await res.json();
+  if (!Array.isArray(body)) return [];
+  return body
+    .map((row) => (row as Record<string, unknown>)?.workspace_id)
+    .filter((id): id is string => typeof id === "string" && id !== "");
+}
+
+/**
+ * What those brains are called, by id.
+ *
+ * The runner is handed brain ids and never names, so the one place a person sees
+ * which brain an agent is working in would otherwise be a UUID. This is the read
+ * that answers it: a plain `workspaces` select through the same helper every
+ * other read here uses, filtered to the ids the listen lookup came back with.
+ *
+ * **A plain read rather than widening `signal_brains` to return the name.** That
+ * RPC is `SECURITY INVOKER` and the `workspaces` SELECT policy admits the owner
+ * and any member, so both answer the same question to the same person — but
+ * changing an RPC's return type needs a `DROP` and a `CREATE` in a new migration,
+ * and this needs none. The migration is the better choice only if something else
+ * comes to want the name on that call.
+ *
+ * **It answers with what it could read and never refuses the caller.** A name
+ * this cannot see is simply absent from the map, which is the same shape as the
+ * whole read failing — and the caller's line drops the name rather than waiting
+ * for it, so nothing on the path that starts work depends on this.
+ *
+ * @param ids the brains to name; an empty list is answered without a request
+ * @param signal bounds the wait, and the caller is expected to pass one for the
+ *   same reason `signalBrains` is: this is made by the command a person leaves
+ *   running, so a request nothing cancels holds the process open after it has
+ *   said it stopped — for a field that only ever decorates a line.
+ * @returns id to name, holding only the rows that came back
+ */
+export async function listWorkspaceNames(
+  accessToken: string,
+  ids: readonly string[],
+  signal?: AbortSignal,
+): Promise<Map<string, string>> {
+  const wanted = [...new Set(ids)].filter((id) => id !== "");
+  if (wanted.length === 0) return new Map();
+  // One request for the whole set rather than one each: this runs beside the
+  // listen lookup, which happens once per process while no link is open, and a
+  // request per brain would
+  // turn a runner watching a dozen into a dozen round trips for a cosmetic field.
+  const filter = `in.(${wanted.map((id) => encodeURIComponent(id)).join(",")})`;
+  const rows = await selectRows<{ id: string; name: string }>(`workspaces?select=id,name&id=${filter}`, accessToken, signal);
+  const names = new Map<string, string>();
+  for (const row of rows) {
+    if (typeof row?.id === "string" && typeof row?.name === "string" && row.name !== "") names.set(row.id, row.name);
+  }
+  return names;
 }
 
 /**

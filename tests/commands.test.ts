@@ -290,20 +290,51 @@ describe("whoami when the session was ended somewhere else", () => {
     return withRuntime(LIVE, reply, async () => ({ code: await whoami.run(io.io as never), io }));
   };
 
-  it("99-S4: says the session is no longer accepted, and names `mdbrain login`", async () => {
+  it("99-S4: says the request was refused rather than blaming the roster", async () => {
     const { code, io } = await runWhoami((url) =>
       url.includes("/auth/v1/user") ? json(REVOKED, 403) : json([]));
     expect(code).toBe(1);
     const said = io.err.join("\n");
-    expect(said).toContain("no longer accepted");
+    expect(said).toContain("refused this request");
     expect(said).toContain("mdbrain login");
     expect(said).not.toContain("Could not read the roster");
+  });
+
+  // 99-S11 driven through the command rather than the builder: which command the
+  // sentence names is the call site's decision, so the call site is where a wrong
+  // one would ship. Sending somebody to `mdbrain login` first costs a
+  // re-authentication that the retry usually makes unnecessary.
+  it("99-S11: recommends running `whoami` again before re-authenticating", async () => {
+    const { io } = await runWhoami((url) =>
+      url.includes("/auth/v1/user") ? json(REVOKED, 403) : json([]));
+    const said = io.err.join("\n");
+    expect(said.indexOf("mdbrain whoami")).toBeGreaterThan(-1);
+    expect(said.indexOf("mdbrain whoami")).toBeLessThan(said.indexOf("mdbrain login"));
   });
 
   it("99-S4: and keeps the server's own words, since the status cannot say which cause it was", async () => {
     const { io } = await runWhoami((url) =>
       url.includes("/auth/v1/user") ? json(REVOKED, 403) : json([]));
     expect(io.err.join("\n")).toContain("Session from session_id claim in JWT does not exist");
+  });
+
+  // Kept, but not kept raw. The body is written by whatever answered — the app's
+  // route, or a proxy that echoed the request and the bearer with it — and this
+  // line goes to a terminal and from there into whatever people paste when they
+  // ask for help. `run`'s roster read is asserted this way already; the claim is
+  // put here to the call site that prints it, because redacting is the call
+  // site's decision and a site that forgets is what ships the token.
+  it("99-S4: and redacts anything credential-shaped out of them first", async () => {
+    const signature = "c2lnbmF0dXJlX2hlcmU";
+    const leaked = `${REVOKED.msg} (eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.${signature})`;
+    const { io } = await runWhoami((url) =>
+      url.includes("/auth/v1/user") ? json({ code: 403, msg: leaked }, 403) : json([]));
+    const said = io.err.join("\n");
+    expect(said).toContain("[redacted]");
+    expect(said).not.toContain(signature);
+    // And the ordinary words survive, or the redaction would have taken the
+    // reason with the token and left the person nothing to read.
+    expect(said).toContain("Session from session_id claim in JWT does not exist");
   });
 
   // The failure the sentence must NOT claim. A server fault is not a signed-out
@@ -314,6 +345,8 @@ describe("whoami when the session was ended somewhere else", () => {
       url.includes("/auth/v1/user") ? json({ msg: "internal error" }, 500) : json([]));
     expect(code).toBe(1);
     expect(io.err.join("\n")).toContain("Could not read the roster");
-    expect(io.err.join("\n")).not.toContain("no longer accepted");
+    // Named rather than the old wording, which this sentence no longer contains:
+    // an assertion against a phrase nothing can produce passes without measuring.
+    expect(io.err.join("\n")).not.toContain("mdbrain login");
   });
 });

@@ -1,7 +1,9 @@
 import { describe, it, expect } from "vitest";
 import { base64url, challengeFor, createVerifier } from "../src/auth/pkce.ts";
 import { handoverRefusalMessage, readHandover, routeHandoverRequest } from "../src/auth/handover.ts";
-import { parseSession, sessionAction, signInAgainMessage, REFRESH_MARGIN_SECONDS, SESSION_NOT_ACCEPTED_MESSAGE } from "../src/auth/session.ts";
+import { parseSession, sessionAction, signInAgainMessage, sessionNotAcceptedMessage, LOGIN_COMMAND, REFRESH_MARGIN_SECONDS } from "../src/auth/session.ts";
+
+const RUN = "mdbrain run";
 import { configDir, sessionPath, stateDir } from "../src/config/paths.ts";
 import { ANON_KEY, PROJECT_URL, keyRole } from "../src/auth/project.ts";
 
@@ -287,20 +289,58 @@ describe("signInAgainMessage", () => {
   // against a real stack. It is also what it answers for a damaged token, which
   // is why the sentence names the remedy they share rather than asserting one.
   it("99-S4: a 403 is the credentials no longer being accepted", () => {
-    expect(signInAgainMessage(403)).toBe(SESSION_NOT_ACCEPTED_MESSAGE);
+    expect(signInAgainMessage(403, RUN)).toBe(sessionNotAcceptedMessage(RUN));
   });
 
   // Kept, though the caller cannot produce it: that endpoint answers 401 only
   // when no bearer was sent at all, and this one always sends the token it holds.
   it("99-S4: and so is a 401, which costs nothing to keep", () => {
-    expect(signInAgainMessage(401)).toBe(SESSION_NOT_ACCEPTED_MESSAGE);
+    expect(signInAgainMessage(401, RUN)).toBe(sessionNotAcceptedMessage(RUN));
   });
 
   // Sending somebody to `mdbrain login` over a server fault wastes their time on
   // something logging in again cannot touch.
   it("99-S5: nothing else is", () => {
     for (const status of [200, 404, 429, 500, 502]) {
-      expect(signInAgainMessage(status)).toBeNull();
+      expect(signInAgainMessage(status, RUN)).toBeNull();
     }
+  });
+});
+
+// The sentence itself, which is a separate decision from which statuses reach it:
+// what a refusal establishes, and which action it is worth recommending first.
+describe("sessionNotAcceptedMessage", () => {
+  // A refusal on one call is not proof the session is over — the same stored
+  // session is routinely accepted by the very next invocation — and `mdbrain login`
+  // is the expensive remedy, one needless re-authentication per machine.
+  it("99-S11: recommends the command that was refused before the one that re-authenticates", () => {
+    const said = sessionNotAcceptedMessage(RUN);
+    expect(said.indexOf(RUN)).toBeGreaterThan(-1);
+    expect(said.indexOf(RUN)).toBeLessThan(said.indexOf(LOGIN_COMMAND));
+    expect(said).not.toMatch(/no longer accepted/);
+  });
+
+  it("99-S11: and names the path's own command, rather than one command for all of them", () => {
+    expect(sessionNotAcceptedMessage("mdbrain whoami")).toContain("mdbrain whoami");
+    expect(sessionNotAcceptedMessage("mdbrain configure")).toContain("mdbrain configure");
+    expect(sessionNotAcceptedMessage(RUN)).not.toContain("mdbrain whoami");
+  });
+
+  // The case that is still real even though it was not the one observed. It is
+  // reached by retrying rather than asserted up front, which is the whole change.
+  it("99-S12: stays honest about the session that really has ended", () => {
+    expect(sessionNotAcceptedMessage(RUN)).toMatch(/genuinely ended/);
+  });
+
+  // On the one path where the refused command *is* the expensive remedy there is
+  // nothing cheaper to recommend, and advice that names itself twice reads as a loop.
+  it("99-S12: and does not send `login` back to `login` as though it were the next step", () => {
+    const said = sessionNotAcceptedMessage(LOGIN_COMMAND);
+    expect(said.match(/mdbrain login/g)).toHaveLength(1);
+    // The premise the other paths rest on is false here: nothing was stored
+    // before this, so a sentence claiming the session was being accepted until
+    // now would contradict the line `login` prints directly above it.
+    expect(said).not.toContain("often accepted on the very next attempt");
+    expect(said).toContain("just handed over");
   });
 });

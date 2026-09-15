@@ -196,7 +196,18 @@ export async function openConnectionKeyStore(
   );
 }
 
-/** The sentence a caller says about where a key ended up. Said every time, never only on the fallback. */
+/**
+ * The sentence a caller says about where a key ended up.
+ *
+ * **Which of the two branches is worth saying is the caller's to decide, and
+ * the two callers decide differently.** `configure` says it every time, because
+ * somebody is standing there asking and a key going into the keychain is part of
+ * the answer. `run` says it only on the file fallback: a line on every start
+ * that tells a person what they already assumed is the kind of furniture that
+ * makes the lines beside it harder to find, and the fallback branch is the one
+ * that is news — it is the only surface in the program that says connection keys
+ * are sitting in a plaintext file.
+ */
 export function keyStorageLine(backend: SecretBackend): string {
   return backend.kind === "keychain"
     ? `  Connection keys are held in ${backend.where}.`

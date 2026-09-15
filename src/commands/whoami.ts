@@ -8,6 +8,7 @@
 import type { CommandSpec } from "../cli.ts";
 import { AuthError, currentUser, listAgents, listOrganizations } from "../auth/api.ts";
 import { signInAgainMessage } from "../auth/session.ts";
+import { redactSecrets } from "../run/diagnosis.ts";
 import { groupRoster, renderRoster } from "./roster.ts";
 import { readySession } from "./session.ts";
 
@@ -41,11 +42,15 @@ export const whoami: CommandSpec = {
       // The server's own words are kept rather than replaced, and that matters
       // more than it looks: the status alone cannot separate a revoked session
       // from a damaged session file or a token minted for another project, since
-      // `GET /auth/v1/user` answers 403 to all three. The sentence names the
-      // likely cause and the remedy they share; GoTrue's own message is what says
-      // which of them actually happened.
-      const revoked = cause instanceof AuthError ? signInAgainMessage(cause.status) : null;
-      const detail = (cause as Error).message;
+      // `GET /auth/v1/user` answers 403 to all three. The sentence names no cause
+      // at all; GoTrue's own message is what says which of them actually happened.
+      //
+      // Redacted on the way through, because those words are not this program's:
+      // a proxy or gateway that echoes the request echoes the bearer token with
+      // it, and this line goes to a terminal and from there into whatever people
+      // paste when they ask for help.
+      const revoked = cause instanceof AuthError ? signInAgainMessage(cause.status, "mdbrain whoami") : null;
+      const detail = redactSecrets((cause as Error).message);
       err(revoked ? `${revoked} (the server said: ${detail})` : `Could not read the roster: ${detail}`);
       return 1;
     }

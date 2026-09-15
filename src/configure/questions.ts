@@ -28,12 +28,10 @@ import type { Agent, Membership, Organization } from "../auth/api.ts";
 import {
   CONFIG_VERSION,
   DEFAULT_BOUNDS,
-  DEFAULT_POLL,
   SESSION_CAP_HARD_MAX,
   durationMs,
   isVariableName,
   looksLikeSecret,
-  MIN_POLL_MS,
   newAgentMap,
   type AgentEntry,
   type Bounds,
@@ -378,9 +376,6 @@ export function parseDraft(text: string): ConfigureDraft | null {
   const dropped = Array.isArray(raw.dropped) ? raw.dropped.filter((v): v is string => typeof v === "string") : [];
   const read: ConfigureDraft = { version: DRAFT_VERSION, chosen, agents, dropped };
   if (typeof raw.sessionsPerHour === "number" || raw.sessionsPerHour === null) read.sessionsPerHour = raw.sessionsPerHour;
-  // The poll is deliberately not held: it is the last question, so a draft that
-  // reached it has nothing left to lose, and a field nothing ever writes is a
-  // read-back path that only ever misleads.
   return read;
 }
 
@@ -508,15 +503,10 @@ export function judgeCeiling(input: string): Judgement<number | null> {
   return { ok: true, value: n };
 }
 
-export function judgePoll(input: string): Judgement<string> {
-  return judgeDuration(input, MIN_POLL_MS);
-}
-
 /** What the screen hands back when every question has been answered. */
 export interface Answers {
   agents: Array<{ name: string; id: string } & AgentDefaults>;
   sessionsPerHour: number | null;
-  poll: string;
   /** Renamed entries the person chose not to keep under the new name — dropped, and said so. */
   dropped: RenamedEntry[];
 }
@@ -533,7 +523,7 @@ export function assembleConfig(answers: Answers): Config {
       bounds: a.bounds,
     };
   }
-  return { version: CONFIG_VERSION, poll: answers.poll || DEFAULT_POLL, sessionsPerHour: answers.sessionsPerHour, agents };
+  return { version: CONFIG_VERSION, sessionsPerHour: answers.sessionsPerHour, agents };
 }
 
 /** What the write reports: where the config went, the MCP file each agent got, and the stale files removed. */
@@ -586,8 +576,8 @@ export function summaryLines(
   lines.push("");
   lines.push(
     config.sessionsPerHour === null
-      ? `Ceiling: the server's, ${SESSION_CAP_HARD_MAX} sessions an hour per agent. Poll: every ${config.poll}.`
-      : `Ceiling: ${config.sessionsPerHour} sessions an hour per agent. Poll: every ${config.poll}.`,
+      ? `Ceiling: the server's, ${SESSION_CAP_HARD_MAX} sessions an hour per agent.`
+      : `Ceiling: ${config.sessionsPerHour} sessions an hour per agent.`,
   );
   return lines;
 }

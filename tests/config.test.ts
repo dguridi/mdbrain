@@ -10,6 +10,7 @@ import {
   SESSION_CAP_HARD_MAX,
   durationMs,
   parseConfig,
+  POLL_MS,
   serializeConfig,
   type Config,
 } from "../src/config/schema.ts";
@@ -69,7 +70,6 @@ describe("the config file's schema", () => {
     const reading = parseConfig(JSON.stringify(rest));
     expect(reading.kind).toBe("config");
     if (reading.kind !== "config") return;
-    expect(reading.config.poll).toBe("5m");
     expect(reading.config.sessionsPerHour).toBeNull();
     const { bounds: _b, ...entry } = good().agents["dev-bot-mdden"];
     const withoutBounds = parseConfig(JSON.stringify(good({ agents: { "dev-bot-mdden": entry } })));
@@ -93,8 +93,6 @@ describe("the config file's schema", () => {
     expect(refused(agentWith({ harness: "codex" }))).toMatch(/harness names a harness this build does not have/);
     expect(refused(agentWith({ cwd: "checkout" }))).toMatch(/cwd must be an absolute path/);
     expect(refused(agentWith({ bounds: { wallClock: "30" } }))).toMatch(/wallClock must be a duration with a unit/);
-    expect(refused(good({ poll: "300" }))).toMatch(/poll must be a duration/);
-    expect(refused(good({ poll: "5s" }))).toMatch(/at least 30s/);
     expect(refused(good({ sessionsPerHour: SESSION_CAP_HARD_MAX + 1 }))).toMatch(/above the server's ceiling/);
     expect(refused(good({ agents: {} }))).toMatch(/at least one agent/);
   });
@@ -148,6 +146,34 @@ describe("the config file's schema", () => {
     const again = parseConfig(text);
     expect(again.kind === "config" && again.config).toEqual(reading.config);
     expect(serializeConfig(reading.config)).toBe(text);
+  });
+
+  it("121-S1: a file still carrying a poll reads as a valid configuration, and the key is ignored", () => {
+    // `good()` writes `"poll": "5m"`, which is exactly the file an older build
+    // left behind. It has to keep reading, or the setting going away would need
+    // a version bump and a migration on every machine that has one.
+    const reading = parseConfig(JSON.stringify(good({ poll: "5m" })));
+    expect(reading.kind).toBe("config");
+    if (reading.kind !== "config") return;
+    expect(reading.config.version).toBe(CONFIG_VERSION);
+    expect(reading.config).not.toHaveProperty("poll");
+
+    // Including the values the old range checks refused, since nothing reads
+    // this key any more and refusing it would be refusing a file over a field
+    // this build has no opinion about.
+    for (const poll of ["1s", "2h", "300", 5, null]) {
+      expect(parseConfig(JSON.stringify(good({ poll }))).kind).toBe("config");
+    }
+  });
+
+  it("121-S2: a configuration written by this build carries no poll field", () => {
+    const reading = parseConfig(JSON.stringify(good({ poll: "5m" })));
+    if (reading.kind !== "config") throw new Error("not a config");
+    const text = serializeConfig(reading.config);
+    expect(text).not.toContain("poll");
+    expect(JSON.parse(text)).not.toHaveProperty("poll");
+    // The interval it replaced, as the one number with one home.
+    expect(POLL_MS).toBe(45 * 60_000);
   });
 
   it("reads a duration with a unit and refuses one without", () => {

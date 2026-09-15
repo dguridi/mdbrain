@@ -79,6 +79,100 @@ const NOTICE_COLOR = "yellow";
 
 const STATE_COLOR: Record<AgentRow["state"], string> = { idle: "gray", running: "green", held: "yellow" };
 
+/** The mark and the words of the one connection row, and the colour of the mark. */
+export interface ConnectionRow {
+  /** Green when work signals are arriving, amber while they may come back, red when they are not. */
+  color: "green" | "yellow" | "red";
+  /** What the light says, without the mark. */
+  text: string;
+  /** The presence clause, dimmed and appended — or null when presence is fine or unsaid. */
+  presence: string | null;
+}
+
+/**
+ * The one connection row, from the listening state and the presence one.
+ *
+ * **One row rather than two, and it is the listening one.** The two sockets were
+ * drawn one under the other and the pair read as noise on a screen that is
+ * mostly furniture; of the two, this is the one whose failure costs work. A
+ * presence failure costs a dot in somebody else's browser, and it survives here
+ * as a clause rather than a line of its own.
+ *
+ * **A word as well as a mark, because the colour is redundancy and never the
+ * information.** A bare dot says nothing to a reader who is colour-blind and
+ * nothing at all in a terminal that drops colour — a piped `mdbrain run`, a CI
+ * log, a `tmux` with a poor palette — and this is the row somebody is reading
+ * precisely when they are deciding whether the runner works.
+ *
+ * **`polling only` is load-bearing on every state where no signal can arrive**,
+ * which is the three that carry it and not `partial`. The countdown to the
+ * catch-up sweep is drawn on the very next line, so the two together say the
+ * whole thing: work is arriving by that sweep, and the next one is in so many
+ * minutes. That pairing is what keeps a runner that has gone deaf from also
+ * being invisible.
+ *
+ * `partial` is amber and says none of it, deliberately: some rooms are held, so
+ * signals do still arrive and *polling only* would be false. What it says instead
+ * is the count, which is the fact a reader of a partly-connected runner needs.
+ *
+ * **Presence never changes the colour**, only adds its clause. The colour belongs
+ * to the consequence this row is about, and reddening the work-signal light for a
+ * presence failure would say the more expensive thing had happened.
+ *
+ * Pure, and exported, so the whole vocabulary is assertable without a terminal —
+ * which is the property that made it safe to stop composing this sentence in the
+ * reducer.
+ *
+ * **A presence state with no listening state draws nothing, and that is a
+ * consequence worth naming rather than an oversight.** Presence has no row of
+ * its own any more, only a clause on this one, so there is nowhere for it to land
+ * until the runner has said where it is listening — and inventing a mark and a
+ * word for a presence-only row would be inventing vocabulary this spec does not
+ * have. In practice the gap is milliseconds: `run` says a listening state before
+ * its first tick either way, because a lookup that came back opens a link that
+ * reports, and a lookup that came back empty makes the runner say `silent`
+ * itself. What it does cost is a runner whose link never reports at all, which
+ * would hide a presence failure as well as its own.
+ *
+ * @param listening where the work-signal socket stands, or null if unsaid
+ * @param connection where presence stands, or null if unsaid
+ * @returns the row, or null when the runner has not said where it is listening —
+ *   silence rather than a claim, exactly as the two separate lines did
+ */
+export function connectionRow(
+  listening: ViewState["listening"],
+  connection: ViewState["connection"],
+): ConnectionRow | null {
+  if (listening === null) return null;
+  const { state, held, total } = listening;
+  const brains = (n: number) => `${n} ${n === 1 ? "brain" : "brains"}`;
+  const light = ((): Omit<ConnectionRow, "presence"> => {
+    switch (state) {
+      case "listening":
+        // No count here, because the count is the half nobody is reading this
+        // row for. A healthy row answers one question — is the runner hearing
+        // anything — and *for work* answers it in the words the run log
+        // already uses (`listeningText`). The number returns the moment it
+        // means something: `partial` says how many of how many are held, and
+        // `silent` says there are none.
+        return { color: "green", text: "listening for work" };
+      case "partial":
+        return { color: "yellow", text: `listening · ${held} of ${brains(total)}` };
+      case "retrying":
+        return { color: "yellow", text: "reconnecting · polling only" };
+      case "unavailable":
+        return { color: "red", text: "not listening · polling only" };
+      case "silent":
+        return { color: "red", text: "no brains to listen to · polling only" };
+    }
+  })();
+  // Said only when it is not connected, and not at all until the runner has
+  // said: presence being fine is furniture, and a screen that filled the
+  // silence would be inventing the one state a person would act on.
+  const presence = connection !== null && connection !== "connected" ? "presence down" : null;
+  return { ...light, presence };
+}
+
 /** One agent's row: its state, the spinner when it is running, and what it is doing. */
 function agentLine(row: AgentRow, width: number): ReactElement {
   const trailing: string[] = [];
@@ -110,6 +204,23 @@ function agentLine(row: AgentRow, width: number): ReactElement {
  * the poll is a turn of the loop away and the arithmetic saying otherwise is the
  * clock's rounding, not a fact about the runner.
  *
+ * **It counts down to a catch-up sweep rather than to the next poll, and both
+ * words are load-bearing.** The socket above it is live and work usually
+ * arrives on it within seconds of landing; this deadline is the sweep that
+ * collects whatever the listening missed. At forty-five minutes a line reading
+ * *next poll in 36 minutes* invites the one misreading that costs something —
+ * that the number is counting down to the only thing that is going to happen —
+ * and the ways to act on that misreading are to sit and watch it or to press
+ * poll-now repeatedly. *Catch-up* says the sweep collects what was missed
+ * rather than doing the whole job, and *sweep* says it is a tidying pass over
+ * something already handled.
+ *
+ * **When the socket is unhealthy the sweep is the whole route rather than a
+ * catch-up, and the row above is what says so.** This line is deliberately the
+ * same in both worlds: `polling only` is drawn immediately above it and carries
+ * that difference, and a countdown whose words changed underneath a reader
+ * would cost more than the understatement it fixed.
+ *
  * **A runner that will not poll again says so instead of counting.** Otherwise
  * the countdown keeps running through a shutdown, or through the whole of a
  * `--once` run waiting on its sessions, and counts down to a poll that is never
@@ -125,7 +236,7 @@ export function countdownText(state: ViewState, now: number): string | null {
       return "no more polls — waiting for the sessions that are running";
     case "waiting": {
       const left = state.poll.at - now;
-      return left <= 0 ? "next poll due now" : `next poll in ${durationText(left)}`;
+      return left <= 0 ? "catch-up sweep due now" : `catch-up sweep in ${durationText(left)}`;
     }
   }
 }
@@ -247,6 +358,23 @@ export function liveView(state: ViewState, frame: ScreenFrame): ReactElement {
     children.push(h(Text, { key: "version", color: NOTICE_COLOR }, `  ${state.versionNotice}`));
   }
   if (state.note !== null) children.push(h(Text, { key: "note", dimColor: true }, `  ${state.note}`));
+  // Below the note and above the countdown, which is the pairing that makes an
+  // unhealthy state readable: this row says work is arriving by poll and the
+  // next line says when the next one is.
+  const row = connectionRow(state.listening, state.connection);
+  if (row !== null) {
+    children.push(
+      h(
+        Text,
+        { key: "connection", color: row.color },
+        `  ● ${row.text}`,
+        // Nested rather than concatenated, so the clause is dimmed while the
+        // light keeps its colour — presence is a footnote on this row and must
+        // not read as the thing the colour is about.
+        row.presence === null ? null : h(Text, { key: "presence", dimColor: true }, ` · ${row.presence}`),
+      ),
+    );
+  }
 
   const countdown = countdownText(state, now);
   if (countdown !== null) children.push(h(Text, { key: "countdown", color: FRAME_COLOR }, `  ${countdown}`));

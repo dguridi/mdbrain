@@ -110,30 +110,33 @@ export function renamedAgents(config: Config, roster: ReadonlyMap<string, string
 /**
  * The lines printed before the first poll.
  *
- * What is asked for, what is held and why, the ceiling, the poll and where the
- * run log is — the five things a person needs to tell *nothing is happening
- * because nothing is waiting* from *nothing is happening because I am not
- * running*.
+ * **What is left after the block was cut down to what a person acts on.** Every
+ * line here answers *nothing is happening because nothing is waiting* against
+ * *nothing is happening because I am not running*; a line that only restated
+ * something the screen already draws below it, or a number nobody acts on
+ * mid-run, made the two lines that do answer it harder to find.
+ *
+ * So the agents asked for are not named — the live view lists every one of them
+ * as idle or working, and the plain log has already printed an `asking` line per
+ * agent — and neither the ceiling nor the interval is stated. What stays is a
+ * held agent and its reason, which is the one fact nothing else on screen
+ * carries, and where the run log is.
+ *
+ * **The empty branch of the asking line stays, and what it is worth is smaller
+ * than it looks.** `planStartup` empties `asking` exactly when every configured
+ * agent is held, so this line never appears without the held lines that explain
+ * it, and `run` refuses immediately afterwards with a sentence of its own. It is
+ * kept because the block should state its own conclusion rather than leave it to
+ * be inferred from a list — not because anything would otherwise go unsaid.
+ *
+ * @param keyStorage where the connection keys are held, or null to say nothing.
+ *   The caller decides: it is said on the file fallback and kept back on the
+ *   keychain, so the notice lands where it is news.
  */
-export function summaryLines(
-  startup: Startup,
-  config: Config,
-  runLogPath: string,
-  keyStorage: string | null,
-): string[] {
+export function summaryLines(startup: Startup, runLogPath: string, keyStorage: string | null): string[] {
   const lines: string[] = ["mdbrain run"];
-  lines.push(
-    startup.asking.length > 0
-      ? `  Asking for ${startup.asking.join(", ")}.`
-      : "  Asking for nobody: every configured agent is held.",
-  );
+  if (startup.asking.length === 0) lines.push("  Asking for nobody: every configured agent is held.");
   for (const held of startup.held) lines.push(`  Held: ${held.agent} — ${held.reason}`);
-  lines.push(
-    config.sessionsPerHour === null
-      ? "  Ceiling: the server's own."
-      : `  Ceiling: ${config.sessionsPerHour} sessions an hour per agent.`,
-  );
-  lines.push(`  Polling every ${config.poll}.`);
   lines.push(`  Run log: ${runLogPath}`);
   if (keyStorage !== null) lines.push(keyStorage);
   return lines;

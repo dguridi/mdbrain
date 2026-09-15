@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
@@ -15,8 +15,9 @@ import {
 import { childEnvironment, claudeHarness, harnessFor, type Invocation } from "../src/run/harness.ts";
 import { OUTCOME_KINDS, UNREADABLE_OUTCOME_MESSAGE, readOutcome, resultObject, type OutcomeKind, type SessionEnd } from "../src/run/outcome.ts";
 import { logRow, rowText } from "../src/run/log.ts";
+import { SIGNAL_DEBOUNCE_MS, SIGNAL_MIN_GAP_MS } from "../src/run/signal.ts";
 import { agoText, clockText, costText, dayLine, durationText, plainLine, plainPresenter, shortClaim, type RunEvent } from "../src/run/present.ts";
-import type { Config } from "../src/config/schema.ts";
+import { POLL_MS, type Config } from "../src/config/schema.ts";
 
 import type { WorkUnit } from "../src/work/instruction.ts";
 import {
@@ -27,9 +28,10 @@ import {
   messagePreview,
   moveSelection,
   selectedRun,
+  waitedText,
 } from "../src/run/view.ts";
 import { render } from "ink-testing-library";
-import { countdownText, liveScreenFor, liveView, type ScreenFrame } from "../src/run/screen.ts";
+import { connectionRow, countdownText, liveScreenFor, liveView, type ScreenFrame } from "../src/run/screen.ts";
 import { KEY_BINDINGS, actionForKey, keyHints, type KeyModifiers, type ViewRequest } from "../src/run/keys.ts";
 
 const cwd = process.platform === "win32" ? "C:\\work\\checkout" : "/work/checkout";
@@ -79,7 +81,7 @@ const entry = (over: Record<string, unknown> = {}) => ({
 });
 
 const config = (agents: Record<string, unknown> = { "dev-bot-mdden": entry() }, over: Record<string, unknown> = {}): Config =>
-  ({ version: 1, poll: "5m", sessionsPerHour: 10, agents, ...over }) as Config;
+  ({ version: 1, sessionsPerHour: 10, agents, ...over }) as Config;
 
 const unit = (agent = "dev-bot-mdden", claim = "c1f0", seq = 8412, over: Partial<WorkUnit["instruction"]> = {}): WorkUnit => ({
   kind: "file-arrived",
@@ -166,28 +168,52 @@ describe("run: startup", () => {
     expect(renamed).toEqual([{ configuredAs: "dev-bot", nowCalled: "dev-bot-mdden", id: "agent-1" }]);
   });
 
-  it("105-S22: the summary names the agents asked for, the agents held and why, the ceiling, the poll and the run log", () => {
+  it("105-S22: the summary names the agents held and why, and the run log", () => {
     const plan = planStartup(
       config({ alice: entry(), bob: entry({ env: { harness: "B_KEY", connectionKey: "K_B" } }) }),
       { ANTHROPIC_API_KEY: "x" },
       () => true,
       null,
     );
-    const lines = summaryLines(plan, config(), "/state/runs.jsonl", "  Connection keys are held in the keychain.");
+    const lines = summaryLines(plan, "/state/runs.jsonl", "  Connection keys are held in a file.");
     const text = lines.join("\n");
-    expect(text).toContain("Asking for alice.");
     expect(text).toContain("Held: bob — B_KEY is not set.");
-    expect(text).toContain("Ceiling: 10 sessions an hour per agent.");
-    expect(text).toContain("Polling every 5m.");
     expect(text).toContain("Run log: /state/runs.jsonl");
-    expect(text).toContain("Connection keys are held in the keychain.");
+    expect(text).toContain("Connection keys are held in a file.");
   });
 
-  it("105-S22: with no ceiling of its own, the summary says the server's stands", () => {
-    const plan = planStartup(config(), { ANTHROPIC_API_KEY: "x" }, () => true, null);
-    expect(summaryLines(plan, config(undefined, { sessionsPerHour: null }), "/r", null).join("\n")).toContain(
-      "Ceiling: the server's own.",
+  it("121-S17: a healthy runner with a working keychain says its name and where the log is, and nothing else", () => {
+    const plan = planStartup(
+      config({ alice: entry(), bob: entry() }),
+      { ANTHROPIC_API_KEY: "x" },
+      () => true,
+      null,
     );
+    expect(plan.held).toEqual([]);
+    // Two lines rather than six, and the live view draws one of them: the block
+    // sat above a roster that already names every agent, and a countdown that
+    // already says when the next poll is.
+    expect(summaryLines(plan, "/state/runs.jsonl", null)).toEqual(["mdbrain run", "  Run log: /state/runs.jsonl"]);
+  });
+
+  it("121-S18: a held agent keeps its line and its reason, which is the fact nothing else on screen carries", () => {
+    const plan = planStartup(
+      config({ alice: entry(), bob: entry({ env: { harness: "B_KEY", connectionKey: "K_B" } }) }),
+      { ANTHROPIC_API_KEY: "x" },
+      () => true,
+      null,
+    );
+    const lines = summaryLines(plan, "/r", null);
+    expect(lines).toContain("  Held: bob — B_KEY is not set.");
+    // And the agents that are fine are not named: the roster below says so.
+    expect(lines.join("\n")).not.toContain("alice");
+  });
+
+  it("121-S19: a runner that will ask for nobody still says so, since it has no held lines to explain it", () => {
+    const plan = planStartup(config({ alice: entry() }), {}, () => true, null);
+    expect(plan.asking).toEqual([]);
+    const lines = summaryLines(plan, "/r", null);
+    expect(lines).toContain("  Asking for nobody: every configured agent is held.");
   });
 });
 
@@ -490,7 +516,7 @@ describe("run: the plain presenter", () => {
   it("105-S57: every event is one line, and the label column lines up", () => {
     const events: RunEvent[] = [
       { kind: "poll", agents: ["dev-bot-mdden", "spec-warden"], waiting: 2 },
-      { kind: "start", agent: "dev-bot-mdden", claim: "3f2a1111-aaaa", unitKind: "file-arrived", seq: 8412, workspace: "01-ideas" },
+      { kind: "start", agent: "dev-bot-mdden", claim: "3f2a1111-aaaa", unitKind: "file-arrived", seq: 8412, workspace: "01-ideas", file: "01-ideas/37-a-doctor-command.md", brain: "markdown brain", recordedAt: AT.toISOString() },
       { kind: "skipped", agent: "spec-warden", reason: "spec-warden: a session is already running." },
       { kind: "held", agent: "bob", reason: "B_KEY is not set." },
       { kind: "queued", agent: "dev-bot-mdden", depth: 1 },
@@ -633,6 +659,21 @@ async function drive(over: Partial<import("../src/commands/run.ts").RunDeps> = {
   const rows: unknown[] = [];
   const notes: import("../src/run/diagnosis.ts").DiagnosisRow[] = [];
   const spawned: Array<{ command: string; args: string[]; env: Record<string, string> }> = [];
+  // The presence connection, stood in: what it was asked to publish, the tokens
+  // it was handed, and whether it was closed.
+  const wanted: Array<Map<string, string>> = [];
+  const refreshed: string[] = [];
+  let closes = 0;
+  let opened: import("../src/run/realtime.ts").PresenceLinkOptions | null = null;
+  // The listening connection, stood in the same way: what it was told to listen
+  // to, the tokens it was handed, whether it was closed, and — the one that
+  // matters — a handle on the callback a delivered signal arrives through.
+  const signalRefreshed: string[] = [];
+  /** Each call of the brain-name read, with the ids it was given. */
+  const nameAsks: string[][] = [];
+  let signalCloses = 0;
+  let signalsOpened: import("../src/run/signals.ts").SignalLinkOptions | null = null;
+  let fire: ((dueInMs: number) => void) | null = null;
   const deps: import("../src/commands/run.ts").RunDeps = {
     isTTY: false,
     env: { ANTHROPIC_API_KEY: "sk-live" },
@@ -645,7 +686,7 @@ async function drive(over: Partial<import("../src/commands/run.ts").RunDeps> = {
     }),
     loadConfiguration: async () => ({ kind: "config", config: config() }),
     session: async () => ({ kind: "ready", accessToken: "token" }),
-    roster: async () => [{ id: "agent-1", org_id: "o", display_name: "dev-bot-mdden", status: "active" }],
+    roster: async () => [{ id: "agent-1", org_id: "o", display_name: "dev-bot-mdden", status: "active", bot_user_id: "u-agent-1" }],
     count: async () => ({ waiting: 1, capped: false }),
     claim: async () => ({ work: [unit()], refused: [] }),
     startSession: async (request) => {
@@ -661,11 +702,52 @@ async function drive(over: Partial<import("../src/commands/run.ts").RunDeps> = {
     sleep: async () => {},
     now: () => new Date(2026, 8, 4, 12, 4, 1),
     lookupLatest: async () => null,
+    openPresence: (options) => {
+      opened = options;
+      return {
+        want: (desired) => wanted.push(new Map(desired)),
+        refresh: (token) => refreshed.push(token),
+        close: () => {
+          closes += 1;
+        },
+      };
+    },
+    presenceNonce: () => "nonce",
+    listenTo: async () => ["brain-1"],
+    nameBrains: async (_token, ids) => {
+      nameAsks.push([...ids]);
+      return new Map(ids.map((id) => [id, "markdown brain"]));
+    },
+    openSignals: (options) => {
+      signalsOpened = options;
+      fire = options.onSignal;
+      return {
+        refresh: (token) => signalRefreshed.push(token),
+        close: () => {
+          signalCloses += 1;
+        },
+      };
+    },
     build: { version: "0.1.0", channel: "direct", isCompiled: true },
     ...over,
   };
   const code = await runRun(deps, { positional: [], flags: { once: true, ...flags }, out: (l) => out.push(l), err: (l) => err.push(l) });
-  return { code, out, err, rows, notes, spawned };
+  return {
+    code,
+    out,
+    err,
+    rows,
+    notes,
+    spawned,
+    presence: { wanted, refreshed, closes: () => closes, opened: () => opened as import("../src/run/realtime.ts").PresenceLinkOptions | null },
+    signals: {
+      refreshed: signalRefreshed,
+      closes: () => signalCloses,
+      opened: () => signalsOpened as import("../src/run/signals.ts").SignalLinkOptions | null,
+      fire: (dueInMs = 0) => fire?.(dueInMs),
+    },
+    nameAsks,
+  };
 }
 
 describe("run: the command, driven end to end", () => {
@@ -791,6 +873,39 @@ describe("run: the command, driven end to end", () => {
     expect(asked).toBe(1);
   });
 
+  it("105-S100: a session that throws instead of reporting still frees its agent and lets the queue drain", async () => {
+    // Two units for one agent, and the first one's spawner throws rather than
+    // coming back with a spawn problem — an edge nothing in the session path
+    // anticipates, which is exactly why it is worth holding. Everything that
+    // ends a unit runs after that await: the running flag, the queue behind it,
+    // and the announcement that frees the agent. Removing the guard was measured
+    // rather than argued: one session starts, the second never does, and the run
+    // ends with a stop row reading `threw` that names no unit. A run that had
+    // already stopped waiting on that session records nothing at all.
+    let sessions = 0;
+    const thrown = await drive({
+      claim: async () => ({
+        work: [unit("dev-bot-mdden", "c1", 1), unit("dev-bot-mdden", "c2", 2)],
+        refused: [],
+      }),
+      startSession: async (request) => {
+        sessions += 1;
+        if (sessions === 1) throw new Error("the spawner came apart");
+        return { stdout: good(), stderr: "", exitCode: 0, timedOut: false, stopped: false, signal: null, spawnProblem: null };
+      },
+    });
+    // The second unit ran, which is the whole property: the queue behind a unit
+    // that came apart is not stranded with it.
+    expect(sessions).toBe(2);
+    expect(thrown.rows).toHaveLength(2);
+    expect(thrown.rows[0]).toMatchObject({ outcome: "spawn-failed" });
+    // Reported rather than swallowed, and the underlying message is carried —
+    // an outcome that named only itself would leave nobody able to say what
+    // came apart.
+    expect(thrown.out.join("\n")).toContain("the spawner came apart");
+    expect(thrown.code).toBe(1);
+  });
+
   it("105-S78: the prompt reaches the harness with the triggering file substituted into it", async () => {
     const started = await drive({
       claim: async () => ({
@@ -847,6 +962,301 @@ describe("run: the command, driven end to end", () => {
     expect(busy.out.join("\n")).toContain("queued    dev-bot-mdden  1 waiting");
   });
 
+  it("117-S1: a connection that cannot even be built does not stop the run", async () => {
+    // The regression that would matter most, and the one a happy-path test
+    // cannot see: presence is a consumer of the socket, and work is not.
+    const dead = await drive({
+      openPresence: () => {
+        throw new Error("no socket here");
+      },
+    });
+    expect(dead.code).toBe(0);
+    expect(dead.rows).toHaveLength(1);
+    expect(dead.out.join("\n")).toContain("work still arrives by poll");
+  });
+
+  it("117-S1: a socket that will not connect costs the roster dot and nothing else", async () => {
+    const degraded = await drive({
+      openPresence: (options) => {
+        options.onState("unavailable");
+        return { want: () => {}, refresh: () => {}, close: () => {} };
+      },
+    });
+    expect(degraded.code).toBe(0);
+    // Polled, claimed and ran exactly as it does with a socket.
+    expect(degraded.rows).toHaveLength(1);
+    expect(degraded.spawned).toHaveLength(1);
+    // And said it once, in the vocabulary both presenters share.
+    const said = degraded.out.filter((line) => line.includes("presence  "));
+    expect(said).toHaveLength(1);
+    expect(said[0]).toContain("work still arrives by poll");
+  });
+
+  it("117-S4: the poll happens on the runner's own schedule, whatever the socket did", async () => {
+    // In this landing the poll IS the cursor read, and nothing signals. What
+    // matters is that it is not conditional on the connection: a runner whose
+    // socket never opened still asks, claims and runs.
+    const count = vi.fn(async () => ({ waiting: 1, capped: false }));
+    const silent = await drive({
+      count,
+      openPresence: () => ({ want: () => {}, refresh: () => {}, close: () => {} }),
+    });
+    expect(count).toHaveBeenCalledTimes(1);
+    expect(silent.rows).toHaveLength(1);
+  });
+
+  it("the socket's token is refreshed on a tick that asks nobody, which is when it matters", async () => {
+    // A tick asks nobody exactly when every configured agent is already running
+    // — which is the only time the socket is joined and its roster entry is the
+    // thing depending on a live token. Refreshing only on a tick that asked
+    // would mean a single-agent runner never refreshed while it mattered.
+    let release = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let reads = 0;
+    const long = await drive(
+      {
+        session: async () => {
+          reads += 1;
+          if (reads < 6) return { kind: "ready", accessToken: `token-${reads}` };
+          release();
+          return { kind: "stop", reason: "sign-in", message: "Sign in with \`mdbrain login\`." };
+        },
+        startSession: async () => {
+          await held;
+          return { stdout: good(), stderr: "", exitCode: 0, timedOut: false, stopped: false, signal: null, spawnProblem: null };
+        },
+      },
+      { once: false },
+    );
+    // token-1 is the startup read, before any tick. The first tick asked and
+    // started the session; token-3 and token-4 are the two upkeep steps inside
+    // the wait, which the interval is now long enough to be divided into; and
+    // token-5 is the second tick, which asked nobody because the only agent was
+    // still running — and refreshed all the same, which is the whole point.
+    expect(long.presence.refreshed).toEqual(["token-2", "token-3", "token-4", "token-5"]);
+    expect(long.out.join("\n")).toContain("skipped");
+  }, 10_000);
+
+  it("121-S5: the fixed interval is waited out in token-upkeep steps, and no tick asks for work in between", async () => {
+    // The refresh rides the tick, which is only safe while a poll is far shorter
+    // than a token's hour. Three quarters of an hour is not, so the token a socket
+    // holds can expire before the tick that would replace it — and a work topic
+    // lost that way is never rejoined by anything the socket itself can see,
+    // because the connection stays up and keeps heartbeating.
+    const slept: number[] = [];
+    let ticks = 0;
+    const slow = await drive(
+      {
+        // Nothing to do, so every tick is a count and no claim: what is being
+        // measured is the upkeep between polls, not the work.
+        count: async () => {
+          ticks += 1;
+          return { waiting: 0, capped: false };
+        },
+        session: async () => {
+          if (ticks >= 2) return { kind: "stop", reason: "sign-in", message: "Sign in with `mdbrain login`." };
+          return { kind: "ready", accessToken: `token-${slept.length}` };
+        },
+        sleep: async (ms) => {
+          slept.push(ms);
+        },
+      },
+      { once: false },
+    );
+
+    // The wait is cut into steps no longer than a token may be held, rather than
+    // taken as one long sleep nothing happens during.
+    expect(Math.max(...slept)).toBeLessThanOrEqual(15 * 60_000);
+    // One interval is three steps of a quarter of an hour, and they add back up to
+    // the interval itself: the wait is divided, never shortened.
+    expect(slept.slice(0, 3)).toEqual([900_000, 900_000, 900_000]);
+    expect(slept.slice(0, 3).reduce((a, b) => a + b, 0)).toBe(POLL_MS);
+    // Both sockets are handed every token the upkeep read, and the two links are
+    // never allowed to drift apart on which one they hold.
+    expect(slow.signals.refreshed.length).toBeGreaterThan(1);
+    expect(slow.signals.refreshed).toEqual(slow.presence.refreshed);
+    // And an upkeep is not a poll: it costs no count and claims nothing, so the
+    // call volume the interval was configured to bound is unchanged.
+    expect(ticks).toBeLessThan(slow.signals.refreshed.length);
+  }, 10_000);
+
+  // Dividing the wait put an `await` in the middle of it, and a wake is only
+  // held by whatever sleep is running when it arrives. `waitFor` spends its
+  // `wake` and nulls it the moment a step finishes, so a signal coming due while
+  // the upkeep's session read is in flight calls nothing — and only a second ask
+  // on the far side of the upkeep can still see that it happened.
+  it("117-S24: a signal that comes due while the upkeep is in flight still ends the wait", async () => {
+    vi.useFakeTimers();
+    try {
+      await signalDuringUpkeep();
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 30_000);
+
+  async function signalDuringUpkeep() {
+    const { AuthError } = await import("../src/auth/api.ts");
+    let fire: ((dueInMs: number) => void) | null = null;
+    let counts = 0;
+    let sessions = 0;
+    let release: (() => void) | null = null;
+    let hold = false;
+    const waits: number[] = [];
+
+    const running = drive(
+      {
+        openSignals: (options) => {
+          fire = options.onSignal;
+          return { refresh: () => {}, close: () => {} };
+        },
+        // The real sleeper's contract, and the whole of what this case turns on:
+        // a wake resolves the step once and is then spent and nulled.
+        sleep: (ms, stop) => {
+          if (stop.stopped) return Promise.resolve();
+          return new Promise<void>((resolve) => {
+            waits.push(ms);
+            const timer = setTimeout(finish, ms);
+            stop.wake = finish;
+            function finish() {
+              clearTimeout(timer);
+              stop.wake = null;
+              resolve();
+            }
+          });
+        },
+        session: async () => {
+          sessions += 1;
+          if (hold) {
+            hold = false;
+            await new Promise<void>((r) => (release = r));
+          }
+          return { kind: "ready", accessToken: `token-${sessions}` };
+        },
+        count: async () => {
+          counts += 1;
+          if (counts >= 2) throw new AuthError(401, "that is enough");
+          return { waiting: 0, capped: false };
+        },
+      },
+      { once: false },
+    );
+
+    for (let i = 0; i < 50 && waits.length === 0; i++) await vi.advanceTimersByTimeAsync(1);
+    expect(counts).toBe(1);
+    expect(waits[0]).toBe(900_000);
+
+    // The next session read is the upkeep's, and it is held open so the signal
+    // lands in exactly the window the divided wait introduced.
+    hold = true;
+    await vi.advanceTimersByTimeAsync(900_000);
+    for (let i = 0; i < 50 && release === null; i++) await vi.advanceTimersByTimeAsync(1);
+    expect(release).not.toBeNull();
+
+    fire!(0);
+    await vi.advanceTimersByTimeAsync(SIGNAL_DEBOUNCE_MS + 1_000);
+    release!();
+    await vi.advanceTimersByTimeAsync(1);
+
+    // The read the signal asked for, rather than one taken a further quarter of
+    // an hour later when the next step happened to end.
+    expect(counts).toBe(2);
+    await running;
+  }
+
+  it("117-S21: a startup that learned no brains asks again on the tick, rather than staying deaf for the life of the run", async () => {
+    // Every failure on the lookup path — a refusal, a server slower than the
+    // bound, a network not up yet — answers with no brains. Taking that answer
+    // once meant a runner spent days without a socket on the strength of five
+    // seconds during boot, which is when a machine can least afford to answer.
+    let asked = 0;
+    let sessions = 0;
+    const late = await drive(
+      {
+        listenTo: async () => {
+          asked += 1;
+          return asked === 1 ? [] : ["brain-1"];
+        },
+        count: async () => ({ waiting: 0, capped: false }),
+        session: async () => {
+          sessions += 1;
+          if (sessions > 3) return { kind: "stop", reason: "sign-in", message: "Sign in with `mdbrain login`." };
+          return { kind: "ready", accessToken: `token-${sessions}` };
+        },
+      },
+      { once: false },
+    );
+    expect(asked).toBeGreaterThan(1);
+    // The link is opened by the tick that finally got an answer, on that tick's
+    // own token, and is not opened twice once it is up.
+    expect(late.signals.opened()?.brains).toEqual(["brain-1"]);
+    expect(late.signals.closes()).toBe(1);
+  }, 10_000);
+
+  it("117-S22: a link that is already open is not re-opened, and the lookup stops being made", async () => {
+    let asked = 0;
+    const up = await drive({
+      listenTo: async () => {
+        asked += 1;
+        return ["brain-1"];
+      },
+    });
+    // One answer at startup is enough: the tick asks only while there is no link.
+    expect(asked).toBe(1);
+    expect(up.signals.opened()?.brains).toEqual(["brain-1"]);
+  });
+
+  it("117-S3: the socket never outlives the run", async () => {
+    const stopped = await drive();
+    expect(stopped.presence.closes()).toBe(1);
+  });
+
+  it("117-S5, 117-S6: a stretch of queued units is one unbroken presence session", async () => {
+    const two = await drive({
+      claim: async () => ({ work: [unit("dev-bot-mdden", "c1"), unit("dev-bot-mdden", "c2")], refused: [] }),
+    });
+    expect(two.rows).toHaveLength(2);
+    // Asserted on what the runner asked for rather than on what a socket did:
+    // between the two units the flag goes false and true again, and every
+    // reading in between still names the same agent in the same brain — except
+    // the momentary empty one the linger is there to absorb.
+    const naming = two.presence.wanted.filter((desired) => desired.size > 0);
+    expect(naming.length).toBeGreaterThanOrEqual(2);
+    for (const desired of naming) expect(desired.get("dev-bot-mdden")).toBe("01-ideas");
+    // And the last word is that nobody is running, so the linger can run out.
+    expect(two.presence.wanted.at(-1)?.size).toBe(0);
+  });
+
+  it("117-S5: presence is published for the brain the unit named, not a configured one", async () => {
+    const elsewhere = await drive({
+      claim: async () => ({ work: [unit("dev-bot-mdden", "c1", 1, { workspace: "another-brain" })], refused: [] }),
+    });
+    expect(elsewhere.presence.wanted.some((desired) => desired.get("dev-bot-mdden") === "another-brain")).toBe(true);
+  });
+
+  it("the connection is opened with this runner's own session and the agents it will ask for", async () => {
+    const opened = (await drive()).presence.opened();
+    expect(opened?.accessToken).toBe("token");
+    expect([...(opened?.identities.keys() ?? [])]).toEqual(["dev-bot-mdden"]);
+    expect(opened?.identities.get("dev-bot-mdden")).toEqual({ userId: "u-agent-1", name: "dev-bot-mdden" });
+    expect(opened?.url).toContain("/realtime/v1/websocket");
+  });
+
+  it("publishes for nobody when the roster could not be read, rather than for a guess", async () => {
+    const blind = await drive({
+      roster: async () => {
+        throw new Error("the roster timed out");
+      },
+    });
+    expect(blind.presence.opened()?.identities.size).toBe(0);
+  });
+
+  it("hands the socket the same fresh token each poll, since it outlives one by days", async () => {
+    const refreshed = (await drive()).presence.refreshed;
+    expect(refreshed).toEqual(["token"]);
+  });
+
   it("a session without a connection key on this machine is an outcome naming `configure`", async () => {
     const noKey = await drive({
       openKeyStore: async () => ({
@@ -895,8 +1305,14 @@ describe("run: the live view", () => {
       unitKind: "file-arrived",
       seq: 8412,
       workspace: "01-ideas",
+      file: "01-ideas/37-a-doctor-command.md",
+      brain: "markdown brain",
+      recordedAt: AT.toISOString(),
     }, AT);
-    expect(running.agents[0]).toMatchObject({ state: "running", note: "file-arrived #8412 · 01-ideas" });
+    expect(running.agents[0]).toMatchObject({
+      state: "running",
+      note: "file-arrived #8412 · 01-ideas/37-a-doctor-command.md · markdown brain",
+    });
 
     const back = applyEvent(running, { kind: "done", agent: "dev-bot-mdden", claim: "c1", ms: 1000, costUsd: 1, turns: 2, message: "Done." }, AT);
     expect(back.agents[0]).toMatchObject({ state: "idle", note: null });
@@ -905,7 +1321,7 @@ describe("run: the live view", () => {
     // spinner, so this is the only place anything renders one.
     const drawn = render(liveView(running, frame())).lastFrame() ?? "";
     expect(drawn).toContain("dev-bot-mdden");
-    expect(drawn).toContain("file-arrived #8412 · 01-ideas");
+    expect(drawn).toContain("file-arrived #8412 · 01-ideas/37-a-doctor-command.md · markdown brain");
   });
 
   it("105-S54: every value on screen comes from an event — the view has no clock and no state of its own", () => {
@@ -914,7 +1330,7 @@ describe("run: the live view", () => {
     // thing that is timer-driven, and it is Ink's rather than this state's.
     const events: RunEvent[] = [
       { kind: "configured", agent: "a" },
-      { kind: "start", agent: "a", claim: "c", unitKind: "k", seq: 1, workspace: "w" },
+      { kind: "start", agent: "a", claim: "c", unitKind: "k", seq: 1, workspace: "w", file: null, brain: null, recordedAt: AT.toISOString() },
       { kind: "done", agent: "a", claim: "c", ms: 5, costUsd: null, turns: null, message: "Done." },
     ];
     expect(feed(events)).toEqual(feed(events));
@@ -996,7 +1412,7 @@ describe("run: the live view", () => {
     const events: RunEvent[] = [
       { kind: "configured", agent: "dev-bot-mdden" },
       { kind: "poll", agents: ["dev-bot-mdden"], waiting: 1 },
-      { kind: "start", agent: "dev-bot-mdden", claim: "c1", unitKind: "file-arrived", seq: 1, workspace: "w" },
+      { kind: "start", agent: "dev-bot-mdden", claim: "c1", unitKind: "file-arrived", seq: 1, workspace: "w", file: null, brain: null, recordedAt: AT.toISOString() },
       { kind: "done", agent: "dev-bot-mdden", claim: "c1", ms: 1000, costUsd: 0.5, turns: 3, message: "Done." },
     ];
     const printed: string[] = [];
@@ -1015,7 +1431,7 @@ describe("run: the live view", () => {
   it("a queued unit shows depth, and finishing one takes it back down", () => {
     const queued = feed([
       { kind: "configured", agent: "a" },
-      { kind: "start", agent: "a", claim: "c1", unitKind: "k", seq: 1, workspace: "w" },
+      { kind: "start", agent: "a", claim: "c1", unitKind: "k", seq: 1, workspace: "w", file: null, brain: null, recordedAt: AT.toISOString() },
       { kind: "queued", agent: "a", depth: 2 },
     ]);
     expect(queued.agents[0]).toMatchObject({ state: "running", queued: 2 });
@@ -1026,7 +1442,7 @@ describe("run: the live view", () => {
   it("a tick-level skip changes nothing: the agent is already running, which is that fact said usefully", () => {
     const before = feed([
       { kind: "configured", agent: "a" },
-      { kind: "start", agent: "a", claim: "c", unitKind: "k", seq: 1, workspace: "w" },
+      { kind: "start", agent: "a", claim: "c", unitKind: "k", seq: 1, workspace: "w", file: null, brain: null, recordedAt: AT.toISOString() },
     ]);
     expect(applyEvent(before, { kind: "skipped", agent: "a", reason: "a: a session is already running." }, AT)).toBe(before);
   });
@@ -1059,6 +1475,12 @@ describe("run: what the review found", () => {
     expect(polls).toBe(1);
     expect(refused.code).toBe(1);
     expect(refused.err.join("\n")).toMatch(/mdbrain login/);
+    // 99-S11: the cheap action first. Every refusal on this path arrives under
+    // `mdbrain run`, and it is the invocation that has been observed to succeed
+    // straight after one, so recommending a login ahead of it is the wrong order.
+    const shown = refused.err.join("\n");
+    expect(shown.indexOf("mdbrain run")).toBeGreaterThan(-1);
+    expect(shown.indexOf("mdbrain run")).toBeLessThan(shown.indexOf("mdbrain login"));
     // And it is not reported as a network blip, which is the mistake that hides
     // a revocation behind a sentence about the network.
     expect(refused.out.join("\n")).not.toContain("could not be read");
@@ -1221,7 +1643,7 @@ describe("run: the origin the app is reached at", () => {
         // Status 0, so it is never mistaken for the session being over: the
         // runner must not tell somebody to sign in again over a bad address.
         expect((cause as InstanceType<typeof AuthError>).status).toBe(0);
-        expect(signInAgainMessage((cause as InstanceType<typeof AuthError>).status)).toBeNull();
+        expect(signInAgainMessage((cause as InstanceType<typeof AuthError>).status, "mdbrain run")).toBeNull();
       }
     } finally {
       globalThis.fetch = original;
@@ -1244,16 +1666,20 @@ describe("run: the countdown and the keys", () => {
       { kind: "phase", phase: { kind: "waiting", at: NOW + 252_000 } },
     ]);
     expect(waiting.poll).toEqual({ kind: "waiting", at: NOW + 252_000 });
-    expect(countdownText(waiting, NOW)).toBe("next poll in 4m12s");
-    expect(countdownText(waiting, NOW + 251_000)).toBe("next poll in 1s");
+    expect(countdownText(waiting, NOW)).toBe("catch-up sweep in 4m12s");
+    expect(countdownText(waiting, NOW + 251_000)).toBe("catch-up sweep in 1s");
     // A deadline the clock has already passed is a poll about to happen, not a
     // negative number: the loop is one turn away and the arithmetic is rounding.
-    expect(countdownText(waiting, NOW + 300_000)).toBe("next poll due now");
+    expect(countdownText(waiting, NOW + 300_000)).toBe("catch-up sweep due now");
+    // The three strings above are the whole of the wording: at forty-five
+    // minutes a countdown to *the next poll* reads as the only thing that is
+    // going to happen, when the socket drawn above it is live and usually gets
+    // there first.
 
     expect(countdownText(applyEvent(waiting, { kind: "phase", phase: { kind: "polling" } }, AT), NOW)).toBe("polling now");
     // A runner that has not said where it is says nothing rather than guessing.
     expect(countdownText(emptyView, NOW)).toBeNull();
-    expect(render(liveView(waiting, frame())).lastFrame()).toContain("next poll in 4m12s");
+    expect(render(liveView(waiting, frame())).lastFrame()).toContain("catch-up sweep in 4m12s");
   });
 
   it("105-S71: a runner that will not poll again stops counting down to a poll", () => {
@@ -1267,7 +1693,7 @@ describe("run: the countdown and the keys", () => {
     ]);
     expect(finishing.poll).toEqual({ kind: "finishing" });
     expect(countdownText(finishing, NOW)).toBe("no more polls — waiting for the sessions that are running");
-    expect(render(liveView(finishing, frame())).lastFrame()).not.toContain("next poll in");
+    expect(render(liveView(finishing, frame())).lastFrame()).not.toContain("catch-up sweep in");
   });
 
   it("105-S60: a countdown is a screen's business and never a plain line", () => {
@@ -1368,7 +1794,7 @@ describe("run: the countdown and the keys", () => {
       asked = true;
     });
     expect(asked).toBe(false);
-    expect(plain.out.join("\n")).not.toContain("next poll in");
+    expect(plain.out.join("\n")).not.toContain("catch-up sweep in");
     expect(plain.out.join("\n")).not.toContain("poll now");
   });
 
@@ -1426,13 +1852,13 @@ describe("run: the countdown and the keys", () => {
     // remainder of the one nobody waited out.
     const said = deadlines.filter((d): d is number => d !== null);
     expect(said).toHaveLength(2);
-    // The first poll is at 12:00:01 and the deadline it sets is five minutes on.
-    expect(said[0]).toBe(new Date(2026, 8, 4, 12, 0, 1).getTime() + 300_000);
+    // The first poll is at 12:00:01 and the deadline it sets is an interval on.
+    expect(said[0]).toBe(new Date(2026, 8, 4, 12, 0, 1).getTime() + POLL_MS);
     // The key is pressed at 12:00:21, twenty seconds into that wait, and the
-    // poll it causes lands at 12:00:22. **The next deadline is five minutes
-    // after that** — 12:05:22 — rather than the 12:05:01 an unreset interval
+    // poll it causes lands at 12:00:22. **The next deadline is a whole interval
+    // after that** — 12:45:22 — rather than the 12:45:01 an unreset interval
     // would have kept, which is the whole of what resetting means.
-    expect(said[1]).toBe(new Date(2026, 8, 4, 12, 0, 22).getTime() + 300_000);
+    expect(said[1]).toBe(new Date(2026, 8, 4, 12, 0, 22).getTime() + POLL_MS);
     // Two ticks, each announcing itself, and one `finishing` at the end.
     expect(deadlines.filter((d) => d === null)).toHaveLength(3);
   });
@@ -2115,7 +2541,10 @@ describe("run: the diagnosis log", () => {
 
   it("a refused poll names which of the two calls it was, the status, and the server's words", async () => {
     const { refusedMessage, SAID_LIMIT } = await import("../src/run/diagnosis.ts");
-    const said = "Your session is no longer accepted.";
+    const { sessionNotAcceptedMessage } = await import("../src/auth/session.ts");
+    // The real sentence rather than a stand-in, so this composes what an operator
+    // is actually shown: the wording and the suffix are printed as one line.
+    const said = sessionNotAcceptedMessage("mdbrain run");
 
     const counting = refusedMessage(said, "count", 401, "Sign in to ask for work.");
     const claiming = refusedMessage(said, "claim", 401, "Sign in to ask for work.");
@@ -2280,5 +2709,882 @@ describe("run: the diagnosis log", () => {
     expect(refused.code).toBe(1);
     expect(refused.err.join("\n")).not.toContain(token);
     expect(refused.err.join("\n")).toContain("[redacted]");
+  });
+});
+
+describe("run: where the two connections stand, on both presenters", () => {
+  const NOW = new Date(2026, 8, 4, 12, 4, 1).getTime();
+  const frame = (over: Partial<ScreenFrame> = {}): ScreenFrame => ({ now: NOW, keysActive: true, selection: null, ...over });
+  const feed = (events: RunEvent[]) => events.reduce((state, event) => applyEvent(state, event, AT), emptyView);
+  const STATES = ["connected", "retrying", "unavailable"] as const;
+  const LISTENING = ["listening", "partial", "retrying", "unavailable", "silent"] as const;
+  // Ink wraps at the frame's width, and the run log's sentences are longer than
+  // that — so a drawn line arrives split across rows, with the frame's own
+  // border and its colour escapes spliced into the middle of it. A comparison
+  // against a sentence fails on a screen that is perfectly right, which is why
+  // the border and the escapes come out before the whitespace is collapsed.
+  // Removing them only ever makes a `not.toContain` harder to satisfy, so
+  // nothing below is weakened by it.
+  const flat = (text: string | undefined) =>
+    (text ?? "")
+      .replace(new RegExp("\\u001b\\[[0-9;]*m", "g"), "")
+      .replace(/[│┌┐└┘─]/g, " ")
+      .replace(/\s+/g, " ");
+  const listening = (state: (typeof LISTENING)[number], held = 1, total = 2): RunEvent => ({ kind: "listening", state, held, total });
+
+  it("121-S11: the run log still carries the full sentence for both sockets, in channel.ts's own words", async () => {
+    const { connectionText, listeningText } = await import("../src/run/channel.ts");
+    // The surface the shortening is deliberately kept away from: this is the
+    // file somebody greps when a runner has gone quiet overnight, and it is the
+    // one place the long sentence earns its length.
+    for (const state of STATES) {
+      const line = plainLine({ at: AT, event: { kind: "connection", state } });
+      expect(line).toContain(connectionText(state));
+      expect(line).toContain("presence");
+    }
+    for (const state of LISTENING) {
+      const line = plainLine({ at: AT, event: listening(state) });
+      expect(line).toContain(listeningText(state, 1, 2));
+      expect(line).toContain("listening");
+    }
+  });
+
+  it("121-S7: presence connected and the socket listening draws one green row saying it is listening for work", () => {
+    const view = feed([{ kind: "configured", agent: "a" }, { kind: "connection", state: "connected" }, listening("listening", 2, 2)]);
+    expect(connectionRow(view.listening, view.connection)).toEqual({ color: "green", text: "listening for work", presence: null });
+
+    const drawn = flat(render(liveView(view, frame())).lastFrame());
+    expect(drawn).toContain("● listening for work");
+    // The healthy row says what it is listening FOR and not how many it holds:
+    // the count is the half a reader deciding whether the runner works is not
+    // asking about, and every state where it means something still carries it.
+    expect(drawn).not.toContain("2 brains");
+    // One row where there were two: the presence sentence is not drawn beside it.
+    expect(drawn).not.toContain("agents will appear in a brain's roster");
+    expect((drawn.match(/●/g) ?? []).length).toBe(1);
+  });
+
+  it("121-S8: presence unavailable costs the row a clause and never its colour", () => {
+    for (const state of ["retrying", "unavailable"] as const) {
+      const view = feed([{ kind: "configured", agent: "a" }, { kind: "connection", state }, listening("listening", 2, 2)]);
+      // The colour belongs to the consequence the row is about. Reddening the
+      // work-signal light for a presence failure would say the more expensive
+      // thing had happened.
+      expect(connectionRow(view.listening, view.connection)).toEqual({
+        color: "green",
+        text: "listening for work",
+        presence: "presence down",
+      });
+      expect(flat(render(liveView(view, frame())).lastFrame())).toContain("● listening for work · presence down");
+    }
+  });
+
+  it("121-S9: an unhealthy socket is coloured as a notice and says work is arriving by poll", () => {
+    const expected = {
+      retrying: { color: "yellow", text: "reconnecting · polling only" },
+      unavailable: { color: "red", text: "not listening · polling only" },
+      silent: { color: "red", text: "no brains to listen to · polling only" },
+    } as const;
+    for (const [state, row] of Object.entries(expected)) {
+      const view = feed([{ kind: "configured", agent: "a" }, listening(state as (typeof LISTENING)[number], 0, 0)]);
+      expect(connectionRow(view.listening, view.connection)).toEqual({ ...row, presence: null });
+      // The word rather than the colour, because a terminal that drops colour is
+      // exactly where this row is most likely to be read — a piped run, a CI log.
+      expect(flat(render(liveView(view, frame())).lastFrame())).toContain(`● ${row.text}`);
+    }
+  });
+
+  it("121-S10: a partly held socket says how many of how many brains", async () => {
+    const view = feed([{ kind: "configured", agent: "a" }, listening("partial", 1, 2)]);
+    expect(connectionRow(view.listening, view.connection)).toEqual({ color: "yellow", text: "listening · 1 of 2 brains", presence: null });
+    expect(flat(render(liveView(view, frame())).lastFrame())).toContain("● listening · 1 of 2 brains");
+    // The singular left this row with the healthy count, and it did not leave a
+    // gap behind: `partial` needs one brain held and one not, so its total is
+    // never one and `listening · 1 of 1 brain` is unreachable rather than
+    // untested. Asserted against the state machine itself, because that is what
+    // makes the plural above a fact instead of the case somebody happened to pick.
+    const { aggregateListening } = await import("../src/run/channel.ts");
+    expect(aggregateListening({ held: 1, total: 1, everOpen: true, settled: true })).toBe("listening");
+    // The rule rather than the five strings: `polling only` is carried by
+    // exactly the states where no signal can arrive. `listening` and `partial`
+    // hold rooms, so signals do still reach them and the phrase would be false;
+    // the other three can receive none. Driven over the whole of LISTENING and
+    // asserted in both directions, so a state added to the vocabulary without a
+    // decision about this fails here rather than quietly inheriting whichever
+    // answer its own text happens to give.
+    const holdsRooms = new Set(["listening", "partial"]);
+    for (const state of LISTENING) {
+      const text = connectionRow({ state, held: 1, total: 2 }, null)?.text ?? "";
+      expect([state, text.includes("polling only")]).toEqual([state, !holdsRooms.has(state)]);
+    }
+  });
+
+  it("117-S28: a runner that is not listening says so until it is, and the note cannot erase it", () => {
+    const deaf = feed([{ kind: "configured", agent: "a" }, listening("silent", 0, 0)]);
+
+    // Every sender that owns the single `note` slot. None of them reaches this
+    // row, which is the whole reason it is not a note — a runner left up for
+    // days would otherwise lose it to the first of them to fire.
+    const battered = [
+      { kind: "note", message: "a renamed agent" },
+      { kind: "note", message: "the count could not be read" },
+      { kind: "poll", agents: ["a"], waiting: 0 },
+      { kind: "asked", taken: true, reason: null },
+    ].reduce((state, event) => applyEvent(state, event as RunEvent, AT), deaf);
+    expect(flat(render(liveView(battered, frame())).lastFrame())).toContain("● no brains to listen to · polling only");
+
+    // And it goes away by being replaced, which is the transition the whole row
+    // exists to make visible: the runner found a brain and is now being told.
+    const heard = applyEvent(battered, listening("listening", 2, 2), AT);
+    const drawn = flat(render(liveView(heard, frame())).lastFrame());
+    expect(drawn).toContain("● listening for work");
+    expect(drawn).not.toContain("no brains to listen to");
+  });
+
+  it("117-S25: says nothing at all until the runner has, since silence is not unavailable", () => {
+    expect(emptyView.listening).toBeNull();
+    expect(emptyView.connection).toBeNull();
+    // **Presence alone draws nothing, including when it is unhealthy**, and that
+    // is the consequence of it being a clause rather than a row: there is nowhere
+    // for it to land until the runner has said where it is listening, and
+    // inventing a mark and a word for a presence-only row would be the screen
+    // deciding something the spec's vocabulary does not cover. `run` says a
+    // listening state before its first tick either way, so the window is
+    // milliseconds — but it is a window, and this is where it is written down.
+    for (const state of STATES) expect(connectionRow(null, state)).toBeNull();
+
+    const quiet = flat(render(liveView(feed([{ kind: "configured", agent: "a" }]), frame())).lastFrame());
+    // The control that makes the absence mean something: this frame is drawn and
+    // does hold the agent's row, so it is a frame that could have carried a light.
+    expect(quiet).toContain("a idle");
+    expect(quiet).not.toContain("●");
+  });
+
+  it("the reducer keeps the state and its counts rather than a composed sentence", async () => {
+    const { listeningText } = await import("../src/run/channel.ts");
+    for (const state of LISTENING) {
+      const seen = applyEvent(emptyView, listening(state, 1, 2), AT);
+      expect(seen.listening).toEqual({ state, held: 1, total: 2 });
+      // The property that made it safe to stop composing here: the screen's own
+      // vocabulary is a pure function, so none of the run log's wording leaks on
+      // to it and nothing about either surface needs a terminal to assert.
+      expect(connectionRow(seen.listening, null)?.text).not.toBe(listeningText(state, 1, 2));
+    }
+  });
+});
+
+describe("run: work that arrives without being asked for", () => {
+  it("listens to the brains it was told about, on the project's own socket", async () => {
+    const driven = await drive({ listenTo: async () => ["brain-1", "brain-2"] });
+    const opened = driven.signals.opened();
+    expect(opened?.brains).toEqual(["brain-1", "brain-2"]);
+    expect(opened?.url).toContain("realtime/v1/websocket");
+    expect(driven.signals.closes()).toBe(1);
+  });
+
+  it("117-S28: a runner that learned no brains says it is not listening, rather than looking like a quiet brain", async () => {
+    const { listeningText } = await import("../src/run/channel.ts");
+    const deaf = await drive({ listenTo: async () => [] });
+    expect(deaf.signals.opened()).toBeNull();
+    // The line is the runner's own here: there is no link to report it, which is
+    // exactly the case that was indistinguishable from nothing happening.
+    expect(deaf.out.join("\n")).toContain(listeningText("silent", 0, 0));
+  });
+
+  it("117-S27: the link's own states reach the presenter, so a refused room is visible", async () => {
+    const { listeningText } = await import("../src/run/channel.ts");
+    const driven = await drive({
+      openSignals: (options) => {
+        options.onState?.("partial", 1, 2);
+        return { refresh: () => {}, close: () => {} };
+      },
+    });
+    expect(driven.out.join("\n")).toContain(listeningText("partial", 1, 2));
+  });
+
+  it("asks about the agents it will actually be asking for work", async () => {
+    const asked: string[][] = [];
+    await drive({
+      listenTo: async (_token, agents) => {
+        asked.push([...agents]);
+        return [];
+      },
+    });
+    // Asked more than once, because an answer of no brains is the one every
+    // failure on this path gives and is not taken as final. What is pinned here
+    // is who is asked about, and that is the same set every time.
+    expect(asked.length).toBeGreaterThan(0);
+    for (const agents of asked) expect(agents).toEqual(["dev-bot-mdden"]);
+  });
+
+  // The safety net, stated where it would break: neither failure on this path may
+  // cost a claim, because the poll is what actually finds work.
+  it("117-S16: a brain list that cannot be read leaves a runner that still claims and runs, and says it is deaf", async () => {
+    const { listeningText } = await import("../src/run/channel.ts");
+    const driven = await drive({
+      listenTo: async () => {
+        throw new Error("refused");
+      },
+    });
+    expect(driven.code).toBe(0);
+    expect(driven.spawned).toHaveLength(1);
+    expect(driven.signals.opened()).toBeNull();
+    // Surviving the failure was always the rule; saying so is what was missing,
+    // and it is the difference between a degraded runner and a quiet brain.
+    expect(driven.out.join("\n")).toContain(listeningText("silent", 0, 0));
+  });
+
+  it("117-S16: a socket that is up and silent costs latency and not work", async () => {
+    // The link is opened and never fires: the unit is claimed and run anyway,
+    // which is the whole of the property the poll exists to keep.
+    const driven = await drive();
+    expect(driven.code).toBe(0);
+    expect(driven.spawned).toHaveLength(1);
+  });
+
+  it("hands the listening socket the same fresh token the presence one gets", async () => {
+    const driven = await drive({ session: async () => ({ kind: "ready", accessToken: "token-2" }) });
+    expect(driven.signals.refreshed).toEqual(driven.presence.refreshed);
+    expect(driven.signals.refreshed).toContain("token-2");
+  });
+});
+
+describe("run: a signal ends the wait the loop is sitting in", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("a signal for work that is not claimable yet ends the wait at the moment it becomes claimable", async () => {
+    vi.useFakeTimers();
+    const { AuthError } = await import("../src/auth/api.ts");
+    let fire: ((dueInMs: number) => void) | null = null;
+    let counts = 0;
+    let waits = 0;
+    const running = drive(
+      {
+        openSignals: (options) => {
+          fire = options.onSignal;
+          return { refresh: () => {}, close: () => {} };
+        },
+        sleep: (_ms, stop) =>
+          new Promise<void>((resolve) => {
+            waits += 1;
+            stop.wake = () => resolve();
+          }),
+        count: async () => {
+          counts += 1;
+          if (counts >= 2) throw new AuthError(401, "that is enough");
+          return { waiting: 0, capped: false };
+        },
+      },
+      { once: false },
+    );
+
+    for (let i = 0; i < 20 && waits === 0; i++) await vi.advanceTimersByTimeAsync(1);
+    expect(counts).toBe(1);
+
+    // A mention: its row opens now and is claimable a minute from now. Reading at
+    // once would find nothing, and — since the moment it becomes claimable has no
+    // write of its own to announce it — nothing would ever look again.
+    fire!(60_000);
+    await vi.advanceTimersByTimeAsync(59_000);
+    expect(counts).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    const driven = await running;
+    expect(counts).toBe(2);
+    expect(driven.code).toBe(1);
+  });
+
+  it("work claimable now is not delayed by a later prediction, and the later one still gets its read", async () => {
+    vi.useFakeTimers();
+    const { AuthError } = await import("../src/auth/api.ts");
+    let fire: ((dueInMs: number) => void) | null = null;
+    const at: number[] = [];
+    let clock = 0;
+    const running = drive(
+      {
+        now: () => new Date(clock),
+        openSignals: (options) => {
+          fire = options.onSignal;
+          return { refresh: () => {}, close: () => {} };
+        },
+        sleep: (_ms, stop) =>
+          new Promise<void>((resolve) => {
+            stop.wake = () => resolve();
+          }),
+        count: async () => {
+          at.push(clock);
+          if (at.length >= 3) throw new AuthError(401, "that is enough");
+          return { waiting: 0, capped: false };
+        },
+      },
+      { once: false },
+    );
+
+    for (let i = 0; i < 20 && at.length === 0; i++) await vi.advanceTimersByTimeAsync(1);
+
+    // A file arriving (claimable now) and a mention (claimable in a minute), in
+    // that order. The first must not be held back to wait for the second, and the
+    // second must not be folded into the first's read and lost.
+    fire!(0);
+    fire!(60_000);
+
+    clock = SIGNAL_DEBOUNCE_MS;
+    await vi.advanceTimersByTimeAsync(SIGNAL_DEBOUNCE_MS);
+    expect(at).toHaveLength(2);
+
+    // The re-armed read is floored a minimum gap after the one just taken, so the
+    // second lands at the later of that floor and the moment it predicted.
+    clock = 60_000 + SIGNAL_MIN_GAP_MS;
+    await vi.advanceTimersByTimeAsync(60_000 + SIGNAL_MIN_GAP_MS);
+    const driven = await running;
+    expect(at).toHaveLength(3);
+    expect(driven.code).toBe(1);
+  });
+
+  // Driven through the command rather than through the debounce, because the
+  // property is not "a timer fired" but "the loop polled when it would otherwise
+  // have been asleep" — and the wait here is the real one: it ends only on a wake.
+  it("117-S14: forty signals inside the window end the wait once", async () => {
+    vi.useFakeTimers();
+    const { AuthError } = await import("../src/auth/api.ts");
+    let fire: ((dueInMs: number) => void) | null = null;
+    let counts = 0;
+    let waits = 0;
+    const running = drive(
+      {
+        openSignals: (options) => {
+          fire = options.onSignal;
+          return { refresh: () => {}, close: () => {} };
+        },
+        sleep: (_ms, stop) =>
+          new Promise<void>((resolve) => {
+            waits += 1;
+            stop.wake = () => resolve();
+          }),
+        count: async () => {
+          counts += 1;
+          // The second poll is the one the signal caused, and throwing here is
+          // how this run ends without a stop it has no way to send itself.
+          if (counts >= 2) throw new AuthError(401, "that is enough");
+          return { waiting: 0, capped: false };
+        },
+      },
+      { once: false },
+    );
+
+    // Let the first tick run and the loop reach its wait.
+    for (let i = 0; i < 20 && waits === 0; i++) await vi.advanceTimersByTimeAsync(1);
+    expect(counts).toBe(1);
+    expect(fire).not.toBeNull();
+
+    for (let i = 0; i < 40; i++) fire!(0);
+    // Nothing yet: the read is armed, not taken.
+    await vi.advanceTimersByTimeAsync(SIGNAL_DEBOUNCE_MS - 1);
+    expect(counts).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(2);
+    const driven = await running;
+    expect(counts).toBe(2);
+    expect(waits).toBe(1);
+    expect(driven.code).toBe(1);
+  });
+
+  // On the real clock, because the point is a read that must not be taken and a
+  // fake clock would only show a timer this test declined to advance.
+  //
+  // **This is the case for both stop guards at once, and it has to be.** The
+  // handler asks `stopping()` before arming and the read it arms asks again
+  // before taking; either one alone absorbs a signal that lands after the run,
+  // so removing either alone changes nothing anybody can observe and no case can
+  // honestly red. Removing the pair is what costs something — a read taken and a
+  // loop woken after the run has ended — and that is what this asserts. The
+  // predicate is one named function for the same reason: two copies of one
+  // condition are what makes a half-deletion look safe.
+  //
+  // **`wakes` is the assertion that carries the guards.** No read can be taken
+  // here whatever they do: the run is over, so there is no loop for a woken
+  // sleep to return into and `count()` is unreachable — `counts` holds under
+  // every neuter of the pair. What the guards prevent is the wake, so `wakes` is
+  // the half that reds when both go. `counts` is kept because it is still true
+  // and is the half the name promises, not because it watches anything.
+  it("a signal that lands after the run has ended takes no read and wakes nobody", async () => {
+    const { AuthError } = await import("../src/auth/api.ts");
+    let fire: ((dueInMs: number) => void) | null = null;
+    let counts = 0;
+    let waits = 0;
+    let wakes = 0;
+    const running = drive(
+      {
+        openSignals: (options) => {
+          fire = options.onSignal;
+          return { refresh: () => {}, close: () => {} };
+        },
+        sleep: (_ms, stop) =>
+          new Promise<void>((resolve) => {
+            waits += 1;
+            stop.wake = () => {
+              wakes += 1;
+              resolve();
+            };
+            // The poll interval simply elapsing, which is how this run reaches
+            // its second tick without a signal. It matters that no signal caused
+            // a read here: the rate floor is thirty seconds, so a signal-driven
+            // read would absorb the case's own signal before either guard was
+            // asked anything, and the case would pass with the guards deleted.
+            setTimeout(resolve, 0);
+          }),
+        count: async () => {
+          counts += 1;
+          if (counts >= 2) throw new AuthError(401, "that is enough");
+          return { waiting: 0, capped: false };
+        },
+      },
+      { once: false },
+    );
+
+    const driven = await running;
+    expect(driven.code).toBe(1);
+    expect(waits).toBeGreaterThan(0);
+    expect(fire).not.toBeNull();
+    const took = counts;
+    const woke = wakes;
+
+    fire!(0);
+    await new Promise((r) => setTimeout(r, SIGNAL_DEBOUNCE_MS + 500));
+    expect(counts).toBe(took);
+    expect(wakes).toBe(woke);
+  }, 20_000);
+});
+
+describe("run: what the signal path may not cost", () => {
+  // On the real clock deliberately: the point is that the ceiling holds against a
+  // dependency that honours nothing — neither resolving nor observing the abort —
+  // and a fake clock would only prove that a timer this test advanced fired.
+  it("a brain list that never answers does not stall the first poll", async () => {
+    const driven = await drive({
+      // A request that hangs, which is what a wedged server looks like from here.
+      listenTo: () => new Promise<string[]>(() => {}),
+    });
+    expect(driven.code).toBe(0);
+    expect(driven.spawned).toHaveLength(1);
+    // Nothing to listen to, and the run went on regardless.
+    expect(driven.signals.opened()).toBeNull();
+  }, 20_000);
+
+  // The same ceiling as the lookup above, and a stronger claim: that one is
+  // waited for and bounded, this one is not waited for at all. What it buys is a
+  // field on a line, so it must not be able to cost the first poll a millisecond.
+  it("121-S16: a brain-name read that never answers does not stall the first poll", async () => {
+    const started = Date.now();
+    const driven = await drive({
+      // A request that hangs and observes nothing — neither resolving nor
+      // honouring the abort, which is what a wedged server looks like from here.
+      nameBrains: () => new Promise<Map<string, string>>(() => {}),
+    });
+    expect(driven.code).toBe(0);
+    expect(driven.spawned).toHaveLength(1);
+    // Comfortably under the 5s bound the read is held to, which is the number a
+    // version that waited for it would land just past.
+    expect(Date.now() - started).toBeLessThan(2_000);
+    // And the session that ran named no brain, which is the accepted state.
+    expect(driven.out.join("\n")).toContain("start");
+  }, 20_000);
+
+  it("121-S24: a run that has printed its last line abandons the name request rather than holding the process open", async () => {
+    let handed: AbortSignal | null = null;
+    const started = Date.now();
+    const driven = await drive({
+      nameBrains: (_token, _ids, signal) => {
+        handed = signal ?? null;
+        // Never answers and never gives up on its own: the only thing that can
+        // end this request is somebody aborting it.
+        return new Promise<Map<string, string>>(() => {});
+      },
+    });
+    expect(driven.code).toBe(0);
+    expect(handed).not.toBeNull();
+    // The timer that bounds the *wait* would also abort this, five seconds in —
+    // so the assertion is worth nothing unless the run finished well short of
+    // it. Aborted by then means the run's own ending did it.
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(handed!.aborted).toBe(true);
+  }, 20_000);
+
+  it("the roster read that could not be made redacts what answered it", async () => {
+    const driven = await drive({
+      roster: async () => {
+        // A gateway echoing the request it could not forward, which is the shape
+        // that carries the bearer back out onto somebody's terminal.
+        throw new Error("upstream refused: Authorization: Bearer abc123def456ghi");
+      },
+    });
+    const said = driven.err.join("\n");
+    expect(said).toContain("Could not read the roster");
+    expect(said).toContain("[redacted]");
+    expect(said).not.toContain("abc123def456ghi");
+  });
+});
+
+describe("run: the line that names the work", () => {
+  const start = (over: Partial<Extract<RunEvent, { kind: "start" }>> = {}): RunEvent => ({
+    kind: "start",
+    agent: "dev-bot-mdden",
+    claim: "3f2a1111-aaaa",
+    unitKind: "file-changed",
+    seq: 7,
+    workspace: "96c4b572-7b22-44ea-8596-84b05e46d5c5",
+    file: "04-specs/117-a-socket-the-runner-holds.md",
+    brain: "markdown brain",
+    recordedAt: AT.toISOString(),
+    ...over,
+  });
+  const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/;
+  const noteFor = (event: RunEvent) =>
+    applyEvent(applyEvent(emptyView, { kind: "configured", agent: "dev-bot-mdden" }, AT), event, AT).agents[0].note;
+
+  it("121-S12: a unit naming a file reads as the kind, the sequence, the path and the brain — and no UUID", () => {
+    expect(noteFor(start())).toBe("file-changed #7 · 04-specs/117-a-socket-the-runner-holds.md · markdown brain");
+    expect(noteFor(start())).not.toMatch(UUID);
+    expect(noteFor(start({ unitKind: "file-arrived", file: "01-ideas/71-agent-runner-revision.md" }))).toBe(
+      "file-arrived #7 · 01-ideas/71-agent-runner-revision.md · markdown brain",
+    );
+  });
+
+  it("121-S13: a mention names no file, which is a ruling rather than a gap", () => {
+    // Mentions coalesce, so one wake can stand for five comments and there is no
+    // single thread to name even in principle. The line is the kind, the seq and
+    // the brain.
+    expect(noteFor(start({ unitKind: "agent-mentioned", file: null }))).toBe("agent-mentioned #7 · markdown brain");
+  });
+
+  it("121-S14: a brain the runner has no name for costs the name and nothing else — the UUID does not come back", () => {
+    const note = noteFor(start({ brain: null }));
+    expect(note).toBe("file-changed #7 · 04-specs/117-a-socket-the-runner-holds.md");
+    // The whole point of the change: there is no fallback to the id, in any state.
+    expect(note).not.toMatch(UUID);
+    expect(noteFor(start({ brain: null, file: null }))).toBe("file-changed #7");
+  });
+
+  it("121-S15: the run log keeps the workspace id and gains the path", () => {
+    // The opposite trade from the screen's, for the opposite reader: a log line
+    // is correlated against the database later, where an id is the only thing
+    // that joins, and a screen is read now, where a name is.
+    const line = plainLine({ at: AT, event: start() })!;
+    expect(line).toContain("96c4b572-7b22-44ea-8596-84b05e46d5c5");
+    expect(line).toContain("04-specs/117-a-socket-the-runner-holds.md");
+    expect(line).toContain("file-changed #7");
+    // The brain's name is the screen's half and is deliberately not here.
+    expect(line).not.toContain("markdown brain");
+    // A unit with no file leaves the line exactly the shape it already had.
+    expect(plainLine({ at: AT, event: start({ file: null }) })!).toMatch(/96c4b572-7b22-44ea-8596-84b05e46d5c5$/);
+  });
+
+  it("121-S16: the names are read once for the whole set, and a read that fails still starts the session", async () => {
+    const driven = await drive({ listenTo: async () => ["brain-1", "brain-2"] });
+    // The ids the listen lookup came back with reach the read, whole.
+    expect(driven.nameAsks).toEqual([["brain-1", "brain-2"]]);
+
+    // And the read itself makes one request for the set, which the stand-in
+    // above cannot see: it records the ids it was handed and never calls
+    // anything. Driven here against the real function, since *one read for the
+    // whole set* is a claim about the request rather than about the caller.
+    const { listWorkspaceNames } = await import("../src/auth/api.ts");
+    const calls: Array<{ url: string; signal: AbortSignal | null | undefined }> = [];
+    const original = globalThis.fetch;
+    globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), signal: init?.signal });
+      return Promise.resolve(
+        new Response(JSON.stringify([{ id: "brain-1", name: "markdown brain" }, { id: "brain-2", name: "" }]), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }) as typeof fetch;
+    try {
+      const names = await listWorkspaceNames("t", ["brain-1", "brain-2", "brain-1", ""]);
+      expect(calls).toHaveLength(1);
+      expect(calls[0].url).toContain("workspaces?select=id,name&id=in.(brain-1,brain-2)");
+      // A name that came back empty is absent rather than blank, so the line
+      // drops the name — 121-S14's state — rather than ending in a separator.
+      expect([...names]).toEqual([["brain-1", "markdown brain"]]);
+
+      // No ids is no request at all.
+      calls.length = 0;
+      expect(await listWorkspaceNames("t", [])).toEqual(new Map());
+      expect(calls).toHaveLength(0);
+
+      // The caller's bound has to reach `fetch`. `run` arms an abort on this
+      // read precisely so an abandoned request cannot hold the process open
+      // past its last printed line, and a signal that stops at the helper
+      // cancels nothing while looking exactly like one that works.
+      const abort = new AbortController();
+      await listWorkspaceNames("t", ["brain-1"], abort.signal);
+      expect(calls.at(-1)?.signal).toBe(abort.signal);
+    } finally {
+      globalThis.fetch = original;
+    }
+
+    const refused = await drive({
+      nameBrains: async () => {
+        throw new Error("no");
+      },
+    });
+    // The session ran regardless, and its line simply names no brain.
+    expect(refused.rows).toHaveLength(1);
+    expect(refused.out.join("\n")).toContain("start");
+    expect(refused.code).toBe(0);
+  });
+});
+
+describe("run: where the connection keys are said to be", () => {
+  it("121-S20: `run` says nothing when the keychain holds them, and says it with its reason when a file does", async () => {
+    const quiet = await drive();
+    // `drive`'s default store is a keychain, which is what a person already
+    // assumes: the line was not news, and it cost a line of the block on every
+    // start.
+    expect(quiet.out.join("\n")).not.toContain("Connection keys are held");
+
+    const fallback = await drive({
+      openKeyStore: async () => ({
+        backend: { kind: "file", where: "/state/secrets.json", reason: "this runtime has no keychain to put it in" },
+        get: async () => "smd_agent_deadbeef_secret",
+        set: async () => {},
+        forget: async () => {},
+      }),
+    });
+    const said = fallback.out.join("\n");
+    // The one surface in the program that tells a person their connection keys
+    // are in a plaintext file rather than the keychain they assumed.
+    expect(said).toContain("Connection keys are held in /state/secrets.json");
+    expect(said).toContain("this runtime has no keychain to put it in");
+  });
+});
+
+
+describe("run: the countdown a signal restarts", () => {
+  // The behaviour holds by construction — `run` says a deadline only at the line
+  // it is about to sleep on, and a signal-driven tick comes back round to that
+  // same line with the flag cleared — but nothing pinned it. A refactor of the
+  // `if (!pollAsked)` guard could restore exactly the defect this case names
+  // with every other signal test still green.
+  it("121-S6: a signal that ends a wait leaves the next deadline a whole interval from the tick it caused", async () => {
+    // The real sleeper, so the wake the signal's read reaches is the one `run`
+    // is waiting on; a stubbed sleep registers no wake and the causal chain
+    // under test would not exist.
+    const { waitFor } = await import("../src/commands/run.ts");
+    let at = new Date(2026, 8, 4, 12, 0, 0).getTime();
+    let fire: ((dueInMs: number) => void) | null = null;
+    let waits = 0;
+    const ticks: number[] = [];
+
+    const result = await drive(
+      {
+        isTTY: true,
+        now: () => new Date(at),
+        openSignals: (options) => {
+          fire = options.onSignal;
+          return { refresh: () => {}, close: () => {} };
+        },
+        count: async () => {
+          ticks.push(at);
+          return { waiting: 0, capped: false };
+        },
+        sleep: (ms, signal) => {
+          const waiting = waitFor(ms, signal);
+          waits += 1;
+          if (waits === 1) {
+            // Twenty minutes into the interval, work lands and is signalled.
+            at += 20 * 60_000;
+            fire!(0);
+          } else {
+            // The second wait is not what is being measured; end the run.
+            captured.handler?.("quit");
+          }
+          return waiting;
+        },
+      },
+      { once: false },
+    );
+
+    expect(result.code).toBe(0);
+    // Two ticks: the one at start, and the one the signal caused.
+    expect(ticks).toHaveLength(2);
+    expect(ticks[1] - ticks[0]).toBe(20 * 60_000);
+
+    const said = captured.events
+      .filter((e): e is Extract<RunEvent, { kind: "phase" }> => e.kind === "phase")
+      .map((e) => (e.phase.kind === "waiting" ? e.phase.at : null))
+      .filter((deadline): deadline is number => deadline !== null);
+
+    // One deadline before each wait, and each is a whole interval from the tick
+    // that had just happened.
+    expect(said).toHaveLength(2);
+    expect(said[0]).toBe(ticks[0] + POLL_MS);
+    expect(said[1]).toBe(ticks[1] + POLL_MS);
+    // Which is the whole of it: a loop that inherited the remainder of the wait
+    // nobody sat out would have said the same moment twice, and the countdown
+    // would run down to a poll that had already happened.
+    expect(said[1]).toBe(said[0] + 20 * 60_000);
+    expect(said[1]).not.toBe(said[0]);
+  }, 30_000);
+});
+
+describe("run: the read a session's end asks for", () => {
+  // The real sleeper, so the wake the armed read reaches is the one `run` is
+  // sitting on. Each of these ends the run from its second wait, so a version
+  // that takes no read never reaches one and the case reds as a timeout.
+  const driveFreed = async (over: Partial<import("../src/commands/run.ts").RunDeps> = {}, flags: Record<string, unknown> = {}) => {
+    const { waitFor } = await import("../src/commands/run.ts");
+    let waits = 0;
+    const counts: number[] = [];
+    const claims: number[] = [];
+    const driven = await drive(
+      {
+        isTTY: true,
+        count: async () => {
+          counts.push(Date.now());
+          return { waiting: counts.length === 1 ? 1 : 0, capped: false };
+        },
+        claim: async () => {
+          claims.push(Date.now());
+          return claims.length === 1 ? { work: [unit()], refused: [] } : { work: [], refused: [] };
+        },
+        sleep: (ms, signal) => {
+          waits += 1;
+          const waiting = waitFor(ms, signal);
+          // The first wait is the one the session's end has to cut short; from
+          // the second there is nothing left to measure, so end the run.
+          if (waits >= 2) captured.handler?.("quit");
+          return waiting;
+        },
+        ...over,
+      },
+      { once: false, ...flags },
+    );
+    return { driven, counts, claims };
+  };
+
+  it("117-S33: an agent whose session ends with nothing queued causes a read, which no trigger could have announced", async () => {
+    const started = Date.now();
+    const { driven, counts } = await driveFreed();
+    expect(driven.code).toBe(0);
+    // Two ticks: the one that found the unit, and the one the session's end
+    // asked for. Without it the second would be a poll interval away — which is
+    // three quarters of an hour, and is exactly how a unit that came due while
+    // its agent was busy used to sit unclaimed.
+    expect(counts).toHaveLength(2);
+    expect(Date.now() - started).toBeLessThan(15_000);
+    // Through the signal window rather than beside it, so the read lands a
+    // debounce after the session rather than instantly.
+    expect(counts[1] - counts[0]).toBeGreaterThanOrEqual(SIGNAL_DEBOUNCE_MS - 500);
+  }, 30_000);
+
+  it("117-S34: a queue draining unit by unit costs one read for the whole queue, not one per unit", async () => {
+    // Two units for one agent: the first runs, the second waits behind it, and
+    // the agent is only free when the second finishes. A read after each would
+    // be a request for an agent that is still busy.
+    //
+    // What this holds is the COST, not the call. The `return` after the
+    // recursive `startUnit` is what makes the announcement happen once, and
+    // removing it leaves this green — the debounce and `SIGNAL_MIN_GAP_MS` fold
+    // the extra call into the read this case was already counting. The guard is
+    // still right and is covered by those two rather than by anything here.
+    let claimed = 0;
+    const { driven, counts } = await driveFreed({
+      claim: async () => {
+        claimed += 1;
+        return claimed === 1
+          ? { work: [unit("dev-bot-mdden", "c1", 1), unit("dev-bot-mdden", "c2", 2)], refused: [] }
+          : { work: [], refused: [] };
+      },
+    });
+    expect(driven.code).toBe(0);
+    expect(driven.rows).toHaveLength(2);
+    expect(counts).toHaveLength(2);
+  }, 30_000);
+
+  it("117-S35: `--once` counts exactly once, however many sessions end under it", async () => {
+    // It runs exactly one tick by definition and is waiting out the sessions that
+    // tick started. A read here would make `--once` ask twice.
+    //
+    // Same distinction as the case above: the explicit `once` guard in
+    // `onAgentFreed` is not what this proves. Removing it leaves this green,
+    // because by the time a session ends under `--once` the loop is already in
+    // its finishing wait and an armed read never becomes a tick. The guard says
+    // the intent at the place a reader looks for it; the count is the property.
+    let counts = 0;
+    const driven = await drive({
+      count: async () => {
+        counts += 1;
+        return { waiting: 1, capped: false };
+      },
+    });
+    expect(driven.code).toBe(0);
+    expect(driven.rows).toHaveLength(1);
+    expect(counts).toBe(1);
+  }, 20_000);
+});
+
+describe("run: how long a unit waited before it was started", () => {
+  it("121-S22: a unit that sat says so on the working line, and one claimed as it was written says nothing", () => {
+    const at = new Date(2026, 8, 4, 12, 4, 1);
+    const start = (recordedAt: Date): RunEvent => ({
+      kind: "start",
+      agent: "dev-bot-mdden",
+      claim: "c1",
+      unitKind: "file-changed",
+      seq: 236,
+      workspace: "96c4b572-7b22-44ea-8596-84b05e46d5c5",
+      file: "04-specs/117-a-socket-the-runner-holds.md",
+      brain: "markdown brain",
+      recordedAt: recordedAt.toISOString(),
+    });
+    const noteFor = (recordedAt: Date) =>
+      applyEvent(applyEvent(emptyView, { kind: "configured", agent: "dev-bot-mdden" }, at), start(recordedAt), at).agents[0].note;
+
+    // The incident this exists for: an event written at 18:11:45Z whose session
+    // began at 18:47:47Z, drawn until now exactly like one written a second ago.
+    expect(noteFor(new Date(at.getTime() - 36 * 60_000))).toBe(
+      "file-changed #236 · 04-specs/117-a-socket-the-runner-holds.md · markdown brain · waited 36m",
+    );
+    // And a fresh one says nothing, so the clause is a signal rather than
+    // furniture on every line.
+    expect(noteFor(at)).toBe("file-changed #236 · 04-specs/117-a-socket-the-runner-holds.md · markdown brain");
+  });
+
+  it("121-S22: the moment the event carries is the unit's own, not the moment it was claimed", async () => {
+    // The two cases either side of this one build a `start` by hand, so they
+    // pin what the reducer does with the field and nothing about where it comes
+    // from. This drives the command: the whole of the feature is that the stamp
+    // is the unit's envelope moment rather than a clock read at claim time, and
+    // reading a clock here would make every wait zero and every line silent.
+    const driven = await drive({ isTTY: true });
+    expect(driven.code).toBe(0);
+    const started = captured.events.filter((e): e is Extract<RunEvent, { kind: "start" }> => e.kind === "start");
+    expect(started).toHaveLength(1);
+    expect(started[0].recordedAt).toBe(unit().at);
+  });
+
+  it("121-S23: the wait is a finished fact at the moment the session starts, and does not tick", () => {
+    // Computed from the event's own stamp, so this reducer stays clockless and
+    // the rule that only three things on screen move without an event holds.
+    const source = readFileSync(fileURLToPath(new URL("../src/run/view.ts", import.meta.url)), "utf8");
+    expect(source).not.toMatch(/setInterval|setTimeout|Date\.now/);
+
+    // Under a minute is silence: a `file-changed` unit cannot be claimed until
+    // its file has been quiet for a session window, so seconds would be noise on
+    // every line.
+    expect(waitedText(0)).toBeNull();
+    expect(waitedText(59_999)).toBeNull();
+    expect(waitedText(60_000)).toBe("waited 1m");
+    expect(waitedText(36 * 60_000)).toBe("waited 36m");
+    expect(waitedText(59 * 60_000 + 59_000)).toBe("waited 59m");
+    expect(waitedText(3 * 3_600_000)).toBe("waited 3h");
+    expect(waitedText(25 * 3_600_000)).toBe("waited 1d");
+    // Clocks that disagree, and a stamp that is not one: neither invents a wait.
+    expect(waitedText(-5_000)).toBeNull();
+    expect(waitedText(Number.NaN)).toBeNull();
   });
 });

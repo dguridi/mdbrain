@@ -20,6 +20,7 @@ const agent = (id: string, orgId: string, name: string, status = "active") => ({
   org_id: orgId,
   display_name: name,
   status,
+  bot_user_id: `u-${id}`,
 });
 
 describe("the command line", () => {

@@ -30,6 +30,7 @@
 // wall clock is what ends one of those, and the spinner was never watching it.
 
 import type { OutcomeKind } from "./outcome.ts";
+import type { ConnectionState, ListeningState } from "./channel.ts";
 import type { RunEvent, RunPhase } from "./present.ts";
 import type { ScreenAction } from "./keys.ts";
 import { versionNoticeText } from "../upgrade/notice.ts";
@@ -115,6 +116,32 @@ export interface ViewState {
   /** How much work the last poll found, when it said. */
   waiting: number | null;
   poll: PollPhase;
+  /**
+   * Where the presence connection stands, or null until the runner has said.
+   *
+   * Null is not "unavailable": a runner publishing for nobody says nothing at
+   * all, and a screen that filled the silence would be inventing the one state
+   * the person would actually act on.
+   */
+  connection: ConnectionState | null;
+  /**
+   * Where the work-signal socket stands, and over how many rooms — or null until
+   * the runner has said.
+   *
+   * **The state and its counts rather than a composed sentence, and that is a
+   * deliberate break from how the presence line works.** The two surfaces are now
+   * asked different questions: the run log is grepped by somebody working out why
+   * a runner went quiet overnight, and wants `channel.ts`'s full sentence; the
+   * screen is glanced at, and wants a mark and a word. One function cannot answer
+   * both, so the reducer keeps the fact and each presenter says it its own way.
+   * What is kept from the rule that is being broken is that the screen's short
+   * form is still *one pure function*, so the whole vocabulary can be asserted
+   * without a terminal exactly as the long form can.
+   *
+   * Null carries the same meaning it does for the presence connection: nothing
+   * has been said, which is not the same as nothing being wrong.
+   */
+  listening: { state: ListeningState; held: number; total: number } | null;
 }
 
 /** A view that has seen nothing yet. */
@@ -126,7 +153,69 @@ export const emptyView: ViewState = {
   versionNotice: null,
   waiting: null,
   poll: { kind: "unknown" },
+  connection: null,
+  listening: null,
 };
+
+/**
+ * What a running agent's row says it is working on.
+ *
+ * **The workspace id never appears here, in any state.** It was two thirds of
+ * this line and meant nothing to the person reading it: thirty-six characters
+ * that push the part they came to read off a narrow terminal, to identify a
+ * brain they know by name. The id is not replaced by a shorter id — it is gone,
+ * and the fields that took its place are the ones a person can act on.
+ *
+ * Each part is written only when there is one, so a missing name costs the name
+ * and nothing else. A mention names no file and never will: mentions coalesce, so
+ * one wake can stand for five comments and there is no single thread to name.
+ *
+ * @param event the session that started
+ * @returns the kind, the sequence, and whichever of the path and the brain's name
+ *   are known
+ */
+function workingLine(event: Extract<RunEvent, { kind: "start" }>, at: Date): string {
+  const parts = [`${event.unitKind} #${event.seq}`];
+  if (event.file !== null) parts.push(event.file);
+  if (event.brain !== null) parts.push(event.brain);
+  const waited = waitedText(at.getTime() - Date.parse(event.recordedAt));
+  if (waited !== null) parts.push(waited);
+  return parts.join(" · ");
+}
+
+/**
+ * How long a unit sat between being written and being started, or null when that
+ * is not worth saying.
+ *
+ * **The complaint this answers is that a stale wake and a fresh one are drawn
+ * identically.** A unit whose agent was busy when it came due waits for the next
+ * poll — or for somebody else's event to cause a read — so a session can begin
+ * over half an hour after the write that asked for it, and the only causal story
+ * available to somebody watching is *the thing that just happened caused this*.
+ * It did not, and this is the field that says so.
+ *
+ * **Computed once, at the moment the session starts, and it does not tick.** The
+ * wait is a finished fact by then: it is how long the unit sat, not how long ago
+ * it was written. That keeps this reducer clockless and keeps the rule that only
+ * three things on screen move without an event behind them — this is not a
+ * fourth.
+ *
+ * **Coarse on purpose, and silent under a minute.** A `file-changed` unit cannot
+ * be claimed until its file has been quiet for a session window, so it is always
+ * at least that old by construction and a figure in seconds would be noise on
+ * every line. Minutes are the unit the question is actually asked in, and the
+ * case worth seeing is tens of them.
+ *
+ * @param ms how long the unit waited; a negative value means the clocks disagree
+ * @returns the clause to append, or null to say nothing
+ */
+export function waitedText(ms: number): string | null {
+  if (!Number.isFinite(ms) || ms < 60_000) return null;
+  const minutes = Math.floor(ms / 60_000);
+  if (minutes < 60) return `waited ${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  return hours < 24 ? `waited ${hours}h` : `waited ${Math.floor(hours / 24)}d`;
+}
 
 function withRow(state: ViewState, agent: string, change: (row: AgentRow) => AgentRow): ViewState {
   let found = false;
@@ -175,11 +264,7 @@ export function applyEvent(state: ViewState, event: RunEvent, at: Date): ViewSta
     case "queued":
       return withRow(state, event.agent, (row) => ({ ...row, queued: event.depth }));
     case "start":
-      return withRow(state, event.agent, (row) => ({
-        ...row,
-        state: "running",
-        note: `${event.unitKind} #${event.seq} · ${event.workspace}`,
-      }));
+      return withRow(state, event.agent, (row) => ({ ...row, state: "running", note: workingLine(event, at) }));
     case "done": {
       const next = withRow(state, event.agent, (row) => ({
         ...row,
@@ -219,6 +304,17 @@ export function applyEvent(state: ViewState, event: RunEvent, at: Date): ViewSta
       return state;
     case "note":
       return { ...state, note: event.message };
+    case "connection":
+      // Its own field rather than the note, for the reason the version notice
+      // has one: a note is a single slot six senders overwrite, and a connection
+      // that went away is true until it comes back.
+      return { ...state, connection: event.state };
+    case "listening":
+      // Kept as the fact rather than composed into a sentence, which is what
+      // lets the log keep `channel.ts`'s full wording while the screen draws a
+      // mark and a word. Neither presenter is allowed to invent a state, so the
+      // three fields travel together and are replaced together.
+      return { ...state, listening: { state: event.state, held: event.held, total: event.total } };
     case "version":
       // Composed here rather than on the screen, so the line a log file keeps
       // and the line a person reads are the same sentence. A later notice

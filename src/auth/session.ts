@@ -151,30 +151,56 @@ export function refreshUnreachableMessage(detail: string): string {
  * **401 is kept anyway**, costing nothing: if a caller ever does reach this
  * without a bearer, *sign in again* is still the right thing to say.
  *
- * **The wording covers the class rather than one member of it.** A 403 here is a
- * revoked session, a damaged session file or a token for another project, and
- * those are not distinguishable by status. They have the same remedy, so the
- * sentence names the likely cause without asserting it, and the caller appends
- * the server's own words so the actual reason is still on screen. Keying on
- * GoTrue's message text would separate them, and is deliberately not done: it
- * was measured against a local stack and production runs a hosted build, so it
- * would be a guess dressed as precision.
+ * **The wording names no cause, because the status establishes none.** A refusal
+ * here is a revoked session, a damaged session file, a token minted for another
+ * project, or a refusal on the server's side that is not about the credentials at
+ * all, and those are not distinguishable by status. So the sentence describes what
+ * happened rather than asserting why, the caller appends the server's own words,
+ * and running the command again is what separates the refusal that clears from the
+ * one that does not. Keying on GoTrue's message text would separate the first three,
+ * and is deliberately not done: it was measured against a local stack and production
+ * runs a hosted build, so it would be a guess dressed as precision.
  *
  * @param status the HTTP status the request was refused with
+ * @param retry the command to run again, which is the command that was refused
  * @returns the sentence to print, or null when this is not that failure
  */
-export function signInAgainMessage(status: number): string | null {
-  return status === 403 || status === 401 ? SESSION_NOT_ACCEPTED_MESSAGE : null;
+export function signInAgainMessage(status: number, retry: string): string | null {
+  return status === 403 || status === 401 ? sessionNotAcceptedMessage(retry) : null;
 }
 
+/** The command that mints a fresh session, which is the expensive remedy. */
+export const LOGIN_COMMAND = "mdbrain login";
+
 /**
- * What a mid-command refusal is told to the person.
+ * What a mid-command refusal is told to the person, and which action to try first.
  *
  * A sibling of {@link REFRESH_REFUSED_MESSAGE} rather than the same sentence: a
- * refused *refresh* really is the session ending, while a refused *request* is
- * the credentials not being accepted, which has one more cause. Saying "your
- * session has ended" over a damaged session file would be confidently wrong about
- * something the person can see is not true.
+ * refused *refresh* really is the session ending, while a refused *request* is one
+ * request not being accepted, which is a weaker fact than it looks. **The same
+ * stored session is routinely accepted by the very next invocation**, so asserting
+ * that it is no longer accepted is wrong about the common case, and sending the
+ * reader to `mdbrain login` over it costs a re-authentication nobody needed — one
+ * per machine, across a fleet. The cheap action therefore goes first, and the
+ * expensive one is kept for the refusal that survives it.
+ *
+ * The genuinely-ended session is still a real case and the sentence has to stay
+ * honest about it, which is what the second clause is for: it is reached by
+ * retrying rather than asserted up front.
+ *
+ * @param retry the command to run again, which is the command that was refused —
+ *   naming a different one sends the reader to a different failure
+ * @returns the sentence to print
  */
-export const SESSION_NOT_ACCEPTED_MESSAGE =
-  "Your session is no longer accepted — it may have been signed out from the app, or the stored session may be damaged. Run `mdbrain login`.";
+export function sessionNotAcceptedMessage(retry: string): string {
+  // **The login path gets its own sentence rather than a tail grafted onto this
+  // one.** Both halves of the premise fail there: there is no session that was
+  // already being accepted, since the one being refused was minted seconds ago,
+  // and repeating the command is a whole browser round-trip rather than the cheap
+  // half of a pair. The advice is still *try again before concluding anything*,
+  // which is the part that generalises.
+  if (retry === LOGIN_COMMAND) {
+    return `markdown-den refused the first call made with the session it just handed over, and one refusal is not always about the session. Run \`${LOGIN_COMMAND}\` again; if it is refused a second time, the account it handed over is not one this server will accept.`;
+  }
+  return `markdown-den refused this request, and that may not be about your session: the same stored session is often accepted on the very next attempt. Run \`${retry}\` again first; run \`${LOGIN_COMMAND}\` only if the refusal repeats, which is the case that usually means the session has genuinely ended.`;
+}

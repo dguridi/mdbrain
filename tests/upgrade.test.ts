@@ -127,7 +127,7 @@ describe("upgrade: what it decides before it touches anything", () => {
     w.deps.fetch = (async (url: string) => {
       const at = String(url);
       if (at === latestUrl()) {
-        return new Response(null, { status: 302, headers: { location: "https://github.com/x/y/releases/tag/v0.2.0" } });
+        return new Response(null, { status: 302, headers: { location: `https://github.com/x/y/releases/tag/v${NEWER}` } });
       }
       if (at.endsWith("checksums.txt")) return new Response(body("checksums"), { status: 200 });
       return new Response(body("artifact"), { status: 404 });
@@ -160,7 +160,7 @@ describe("upgrade: what it decides before it touches anything", () => {
     m.deps.fetch = (async (url: string) => {
       const at = String(url);
       if (at === latestUrl()) {
-        return new Response(null, { status: 302, headers: { location: "https://github.com/x/y/releases/tag/v0.2.0" } });
+        return new Response(null, { status: 302, headers: { location: `https://github.com/x/y/releases/tag/v${NEWER}` } });
       }
       if (at.endsWith("checksums.txt")) return new Response(mirrorBody("checksums"), { status: 500 });
       return new Response(mirrorBody("artifact"), { status: 200 });

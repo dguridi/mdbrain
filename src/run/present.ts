@@ -38,6 +38,7 @@
 
 import type { OutcomeKind } from "./outcome.ts";
 import type { ViewRequest } from "./keys.ts";
+import { connectionText, listeningText, type ConnectionState, type ListeningState } from "./channel.ts";
 import { versionNoticeText } from "../upgrade/notice.ts";
 
 /**
@@ -73,7 +74,38 @@ export type RunEvent =
   | { kind: "refused"; agent: string; reason: string }
   /** A unit is waiting behind one that is running. `depth` is the queue after it. */
   | { kind: "queued"; agent: string; depth: number }
-  | { kind: "start"; agent: string; claim: string; unitKind: string; seq: number; workspace: string }
+  /**
+   * A session started. It carries the file and the brain's name as well as the
+   * brain's id, because **the two presenters want different halves of that**: a
+   * log line is correlated against the database later, where the id is the only
+   * thing that joins, and a screen is read now, where a name is. Each takes what
+   * its own reader needs and neither invents the other.
+   *
+   * `file` is the path the trigger fired about, or null when the event names no
+   * file — a mention names none even in principle, since mentions coalesce and
+   * one wake can stand for five. `brain` is the workspace's name, or null when
+   * the runner has none: the names are read alongside the brain list, so a lookup
+   * that failed, or a claim from a brain that list did not name, leaves it unknown
+   * rather than delaying the session for it.
+   *
+   * `recordedAt` is when the event this unit came from was **written**, which is
+   * not when it was claimed and is the difference this field exists to show. A
+   * unit can sit unclaimed for a long time — its agent was busy when it came due,
+   * and nothing re-read until something else caused one — and without this the
+   * screen draws a stale wake and a fresh one identically. It is the unit's own
+   * `at`, carried rather than looked up.
+   */
+  | {
+      kind: "start";
+      agent: string;
+      claim: string;
+      unitKind: string;
+      seq: number;
+      workspace: string;
+      file: string | null;
+      brain: string | null;
+      recordedAt: string;
+    }
   /**
    * A session ended well. `message` is the harness’s own result text, carried but
    * **not printed by the plain presenter**: it can be paragraphs, the plain
@@ -123,6 +155,39 @@ export type RunEvent =
    * lives in one pure function both presenters call.
    */
   | { kind: "version"; version: string; how: string }
+  /**
+   * Where the presence connection stands.
+   *
+   * **The connection's state and nothing about presence itself**, which is a
+   * split rather than a matter of taste: the runner reports what it did, and the
+   * app reports what is. Whether an agent shows in a roster is the browser's to
+   * say, and a terminal claiming it would be a second answer to a question that
+   * already has one.
+   *
+   * Sent only when the state changes, so a socket retrying against a network
+   * that is down is one line rather than a narration of every attempt. Carries
+   * the state rather than the sentence, so both presenters say the same words
+   * and one pure function chose them.
+   */
+  | { kind: "connection"; state: ConnectionState }
+  /**
+   * Where the socket that listens for work stands.
+   *
+   * **Its own event rather than a widening of presence's**, because the two
+   * sockets mean different things to the person reading. Presence being down
+   * costs a dot in somebody else's browser and nothing here; this being down is
+   * the difference between work starting within seconds of landing and work
+   * starting at the end of a poll interval — which is three quarters of an
+   * hour, fixed, and not a range anybody can shorten.
+   *
+   * **It exists because every way this fails is otherwise silent.** A brain list
+   * that could not be read, a join refused, a room taken back by an expired
+   * token: each leaves a runner that is polling and looks exactly like a runner
+   * in a brain where nothing is happening. Carries the counts as well as the
+   * state so *some of them* can be said, and sent only when the aggregate
+   * changes.
+   */
+  | { kind: "listening"; state: ListeningState; held: number; total: number }
   /** The last thing said: what stopping cost. */
   | { kind: "stopped"; lostQueued: number };
 
@@ -274,9 +339,13 @@ export function plainLine(stamped: StampedEvent): string | null {
     case "queued":
       return line("queued", `${event.agent}  ${event.depth} waiting`);
     case "start":
+      // The workspace id stays and the path is added beside it. The id is what a
+      // row read back out of the database joins on; the path is what tells two
+      // otherwise identical lines apart when somebody is reading the file rather
+      // than querying it.
       return line(
         "start",
-        `${event.agent}  claim ${shortClaim(event.claim)}  ${event.unitKind} #${event.seq}  ${event.workspace}`,
+        `${event.agent}  claim ${shortClaim(event.claim)}  ${event.unitKind} #${event.seq}  ${event.workspace}${event.file === null ? "" : `  ${event.file}`}`,
       );
     case "done":
       return line(
@@ -300,6 +369,10 @@ export function plainLine(stamped: StampedEvent): string | null {
       return line("note", event.message);
     case "version":
       return line("version", versionNoticeText({ version: event.version, how: event.how }));
+    case "connection":
+      return line("presence", connectionText(event.state));
+    case "listening":
+      return line("listening", listeningText(event.state, event.held, event.total));
     case "stopped":
       return line(
         "stopped",

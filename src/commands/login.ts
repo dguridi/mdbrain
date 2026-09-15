@@ -10,7 +10,8 @@
 import type { CommandSpec } from "../cli.ts";
 import { challengeFor, createVerifier } from "../auth/pkce.ts";
 import { AuthError, currentUser } from "../auth/api.ts";
-import { signInAgainMessage } from "../auth/session.ts";
+import { LOGIN_COMMAND, signInAgainMessage } from "../auth/session.ts";
+import { redactSecrets } from "../run/diagnosis.ts";
 import { listenForSession, openBrowser } from "../auth/listen.ts";
 import { saveSession } from "../auth/store.ts";
 import { sessionPath } from "../config/paths.ts";
@@ -126,9 +127,14 @@ export const login: CommandSpec = {
       out(`Signed in as ${user.email ?? user.id ?? "your account"}.`);
     } catch (cause) {
       const refusal = cause instanceof AuthError ? cause : null;
-      const refused = refusal ? signInAgainMessage(refusal.status) : null;
+      const refused = refusal ? signInAgainMessage(refusal.status, LOGIN_COMMAND) : null;
       if (refusal && refused) {
-        err(`The session that was handed over is not accepted (the server said: ${refusal.message}).`);
+        // Redacted for the same reason the other three refusal paths are: the
+        // body belongs to whatever answered, and a proxy or gateway that echoes
+        // the request echoes the bearer with it. The token in flight here is the
+        // one that was minted seconds ago, so it is the longest-lived of the
+        // four, not the shortest.
+        err(`The session that was handed over is not accepted (the server said: ${redactSecrets(refusal.message)}).`);
         err("");
         err(refused);
         return 1;

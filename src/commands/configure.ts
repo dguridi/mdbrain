@@ -39,6 +39,7 @@ import { join } from "node:path";
 import type { CommandContext, CommandSpec } from "../cli.ts";
 import { AuthError, currentUser, listAgents, listMemberships, listOrganizations, mintAgentKey } from "../auth/api.ts";
 import { signInAgainMessage } from "../auth/session.ts";
+import { redactSecrets } from "../run/diagnosis.ts";
 import { clearDraft, loadConfig, loadDraft, saveConfig, saveDraft, syncMcpConfigs } from "../config/store.ts";
 import { configPath } from "../config/paths.ts";
 import { keyStorageLine, openConnectionKeyStore, type ConnectionKeyStore } from "../config/secrets.ts";
@@ -193,8 +194,11 @@ export async function runConfigure(deps: ConfigureDeps, context: CommandContext)
     stillVisible = new Set(agents.map((a) => a.id));
     ownsSomething = owned.length > 0;
   } catch (cause) {
-    const refused = cause instanceof AuthError ? signInAgainMessage(cause.status) : null;
-    const detail = (cause as Error).message;
+    const refused = cause instanceof AuthError ? signInAgainMessage(cause.status, "mdbrain configure") : null;
+    // Redacted for the reason the roster read in `run` is: the body belongs to
+    // whatever answered, and a proxy that echoes the request echoes the bearer
+    // with it.
+    const detail = redactSecrets((cause as Error).message);
     err(refused ? `${refused} (the server said: ${detail})` : `Could not read the roster: ${detail}`);
     return 1;
   }
