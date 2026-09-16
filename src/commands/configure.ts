@@ -46,6 +46,7 @@ import { keyStorageLine, openConnectionKeyStore, type ConnectionKeyStore } from 
 import {
   agentChoices,
   assembleConfig,
+  NOTHING_TO_MANAGE,
   organizationsWithoutAgents,
   ownedOrganizations,
   rosterAgents,
@@ -80,14 +81,10 @@ export function noTerminalMessage(path: string): string {
   return `mdbrain configure needs a terminal to ask its questions. Write ${path} by hand, or copy one from a configured machine.`;
 }
 
-/** The sentence for an account that owns no organization, and so has no agent it may run. */
-export const NOTHING_TO_CONFIGURE =
-  "No agents here belong to an organization you own, so there is none this machine may run. Agents are added and removed by an organization's owner, and the same right decides what this command offers.";
-
 /**
  * The sentence for an owner whose organizations simply hold no agent yet.
  *
- * A different fact from the one above and it must not borrow its words: being
+ * A different fact from `NOTHING_TO_MANAGE` and it must not borrow its words: being
  * told about ownership when the remedy is *create an agent* sends a person to
  * look at their permissions for something that is not there.
  */
@@ -190,7 +187,7 @@ export async function runConfigure(deps: ConfigureDeps, context: CommandContext)
     const owned = ownedOrganizations(organizations, memberships);
     roster = rosterAgents(owned, agents);
     emptyOrganizations = organizationsWithoutAgents(owned, agents);
-    withheld = withheldAgentsLine(agents.length, roster.length);
+    withheld = withheldAgentsLine(agents.length - roster.length);
     stillVisible = new Set(agents.map((a) => a.id));
     ownsSomething = owned.length > 0;
   } catch (cause) {
@@ -206,7 +203,7 @@ export async function runConfigure(deps: ConfigureDeps, context: CommandContext)
     // Two different empty lists. An owner with no agents yet needs to create
     // one; someone who owns nothing needs a different sentence, and the two are
     // told apart by whether any organization was offered at all.
-    err(ownsSomething ? nothingYetMessage(emptyOrganizations) : NOTHING_TO_CONFIGURE);
+    err(ownsSomething ? nothingYetMessage(emptyOrganizations) : NOTHING_TO_MANAGE);
     return 1;
   }
 
@@ -303,7 +300,7 @@ export const configure: CommandSpec = {
   // app looks identical from here to one that works.
   flags: [
     ...(login.flags ?? []),
-    { name: NEW_KEYS_FLAG, summary: "mint a fresh connection key even for an agent this machine already holds one for" },
+    { name: NEW_KEYS_FLAG, summary: "mint new connection keys, replacing any this machine already holds" },
   ],
   run(context) {
     return runConfigure(

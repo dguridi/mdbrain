@@ -55,6 +55,18 @@ export function holdReason(
 export interface Startup {
   asking: string[];
   held: HeldReason[];
+  /**
+   * The agents configured here that this command never asks for: `pollsWork` is
+   * false, so they exist for `mdbrain as` and for nothing this process does.
+   *
+   * **Kept apart from `held` rather than folded into it**, because the two are
+   * different facts with different remedies. A hold is something that went
+   * wrong — an unset variable, a directory that moved — and every one of them is
+   * a line a person is meant to read and act on. This is a decision somebody
+   * already took, and reporting it in the same voice would put a settled answer
+   * in the list of problems and teach a reader to skim it.
+   */
+  attended: string[];
 }
 
 /**
@@ -72,12 +84,23 @@ export function planStartup(
 ): Startup {
   const asking: string[] = [];
   const held: HeldReason[] = [];
+  const attended: string[] = [];
   for (const [agent, entry] of Object.entries(config.agents)) {
+    // Taken before the hold checks rather than after, and that ordering is the
+    // decision: every one of those checks asks whether this agent could run
+    // *here, now, under this process*, and none of them is this process's
+    // business for an agent it will never ask for. An identity-only agent whose
+    // harness variable is unset in the shell `run` was started from is not held;
+    // it is simply not this command's.
+    if (!entry.pollsWork) {
+      attended.push(agent);
+      continue;
+    }
     const reason = holdReason(agent, entry, env, directoryExists, rosterNames);
     if (reason === null) asking.push(agent);
     else held.push({ agent, reason });
   }
-  return { asking, held };
+  return { asking, held, attended };
 }
 
 /** An agent configured here under a name the roster now gives a different id. */
@@ -123,11 +146,14 @@ export function renamedAgents(config: Config, roster: ReadonlyMap<string, string
  * carries, and where the run log is.
  *
  * **The empty branch of the asking line stays, and what it is worth is smaller
- * than it looks.** `planStartup` empties `asking` exactly when every configured
- * agent is held, so this line never appears without the held lines that explain
- * it, and `run` refuses immediately afterwards with a sentence of its own. It is
- * kept because the block should state its own conclusion rather than leave it to
- * be inferred from a list — not because anything would otherwise go unsaid.
+ * than it looks.** `planStartup` empties `asking` only when every configured
+ * agent is held or every one of them is identity-only, so this line never
+ * appears without the lines that explain it, and `run` refuses immediately
+ * afterwards with a sentence of its own. It is kept because the block should
+ * state its own conclusion rather than leave it to be inferred from a list — not
+ * because anything would otherwise go unsaid. **It says which of the two it is**,
+ * because the remedies have nothing in common: one is a machine with something
+ * wrong on it, the other is a machine that was configured this way on purpose.
  *
  * @param keyStorage where the connection keys are held, or null to say nothing.
  *   The caller decides: it is said on the file fallback and kept back on the
@@ -135,8 +161,21 @@ export function renamedAgents(config: Config, roster: ReadonlyMap<string, string
  */
 export function summaryLines(startup: Startup, runLogPath: string, keyStorage: string | null): string[] {
   const lines: string[] = ["mdbrain run"];
-  if (startup.asking.length === 0) lines.push("  Asking for nobody: every configured agent is held.");
+  if (startup.asking.length === 0) {
+    lines.push(
+      startup.held.length === 0
+        ? "  Asking for nobody: every agent configured here is identity-only."
+        : "  Asking for nobody: every configured agent is held.",
+    );
+  }
   for (const held of startup.held) lines.push(`  Held: ${held.agent} — ${held.reason}`);
+  // One line however many there are, because it carries no reason to read: what
+  // a held line is for is telling a person what to fix, and there is nothing
+  // here to fix. What it does carry is that the names are configured, so an
+  // agent absent from the roster below is absent on purpose.
+  if (startup.attended.length > 0) {
+    lines.push(`  Identity only, not asked for work: ${startup.attended.join(", ")}.`);
+  }
   lines.push(`  Run log: ${runLogPath}`);
   if (keyStorage !== null) lines.push(keyStorage);
   return lines;

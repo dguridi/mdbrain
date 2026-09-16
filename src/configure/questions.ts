@@ -22,6 +22,16 @@
 // agents with one display name cannot both be run here**: the file is keyed by
 // name because the claim request matches by name, so a second agent of the
 // same name would either overwrite the first or receive its work.
+//
+// **Which agents this machine runs and which of them poll for work are two
+// questions, asked in that order.** The first says whose identity this machine
+// holds — a key, a connection file, a checkout — and the second says which of
+// those the runner may take work as. They were one question for as long as there
+// was only one thing to do with an identity; `mdbrain as` is what separated
+// them, and the second list is offered from the first's answer so a poller can
+// only ever be an agent already chosen. Nothing here refuses an empty second
+// list: a machine whose agents are all driven by hand is a configuration, and
+// `run` is where that is worth a sentence rather than here.
 
 import { basename, dirname, isAbsolute, join, resolve as resolvePath, sep } from "node:path";
 import type { Agent, Membership, Organization } from "../auth/api.ts";
@@ -92,7 +102,7 @@ export function rosterAgents(organizations: Organization[], agents: Agent[]): Ro
 }
 
 /** One ordering for every list here: case-insensitive, and digits as numbers. */
-function compareNames(a: string, b: string): number {
+export function compareNames(a: string, b: string): number {
   return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
 }
 
@@ -113,18 +123,33 @@ export function organizationsWithoutAgents(organizations: Organization[], agents
  * The sentence naming agents the account can see but not manage, or null when
  * there are none.
  *
- * The filter above is a silence otherwise, and a silence is the one thing this
- * screen must not answer with: an agent missing from the list because it belongs
- * to somebody else's organization looks exactly like an agent that does not
- * exist.
+ * The filter above is a silence otherwise, and a silence is the one thing a
+ * list of agents must not answer with: an agent missing because it belongs to
+ * somebody else's organization looks exactly like an agent that does not exist.
+ *
+ * It takes the count already worked out rather than the two totals to subtract,
+ * because its callers reach the same number from different sides — the picker
+ * from what it read against what it offered, `whoami` from what it read against
+ * what it listed — and a shared subtraction only one of them means is how a
+ * sentence starts being true in one place and wrong in the other.
  */
-export function withheldAgentsLine(visible: number, offered: number): string | null {
-  const withheld = visible - offered;
+export function withheldAgentsLine(withheld: number): string | null {
   if (withheld < 1) return null;
   return withheld === 1
-    ? "One more agent is not offered here: it is in an organization you do not own, so you cannot run it."
-    : `${withheld} more agents are not offered here: they are in organizations you do not own, so you cannot run them.`;
+    ? "One agent is not shown here: it is in an organization you do not own, so you cannot run it."
+    : `${withheld} agents are not shown here: they are in organizations you do not own, so you cannot run them.`;
 }
+
+/**
+ * The sentence for an account that owns no organization, and so has no agent it
+ * may run.
+ *
+ * Shared by the picker and by `whoami` deliberately: they are the same fact
+ * reached by the same right, and two wordings of it would let one command tell
+ * somebody their account is fine while the other tells them it is not.
+ */
+export const NOTHING_TO_MANAGE =
+  "No agents here belong to an organization you own, so there is none this machine may run. Agents are added and removed by an organization's owner, and the same right decides what these commands show.";
 
 /** One line of the agent list. `value` is the agent's id, which is what survives a rename. */
 export interface AgentOption {
@@ -245,6 +270,58 @@ export function judgeSelection(chosen: string[], options: AgentOption[]): Judgem
   return { ok: true, value: chosen };
 }
 
+/** What the second question offers: the agents just chosen, and which of them are marked. */
+export interface PollingChoices {
+  options: AgentOption[];
+  /** The ids marked on arrival — the agents that would poll if the answer were Enter. */
+  preselected: string[];
+}
+
+/**
+ * Which of the chosen agents are offered as pollers, and which arrive marked.
+ *
+ * Offered from the first answer rather than from the roster, in the first
+ * answer's own order, so the two lists read as one decision taken in two steps
+ * and a poller cannot be an agent this machine does not hold.
+ *
+ * **Three sources for the marks, most recent first**, which is `agentDefaults`'
+ * rule applied to a list-level answer: a draft that reached this question **and
+ * was asked about this agent**, then the existing config, then *everything*. The
+ * last is what makes this question free to add — a person who has never heard of
+ * it answers Enter and gets the behaviour they already had. **An agent the config
+ * does not know is marked**, for the same reason: a newly chosen agent is one
+ * somebody just added to the machine, and adding an agent has always meant
+ * adding a worker.
+ */
+export function pollingChoices(
+  chosen: readonly string[],
+  options: readonly AgentOption[],
+  existing: Config | null,
+  draft: ConfigureDraft | null = null,
+): PollingChoices {
+  const byId = new Map(options.map((o) => [o.value, o]));
+  const offered = chosen
+    .map((id) => byId.get(id))
+    .filter((o): o is AgentOption => o !== undefined);
+  const entryById = new Map(Object.values(existing?.agents ?? {}).map((entry) => [entry.id, entry]));
+  // `undefined` is *this draft never reached the question* and `[]` is *it did,
+  // and the answer was nobody* — the same distinction `harnessVariable` makes,
+  // and load-bearing for the same reason: treating the second as the first would
+  // re-mark every agent a person had just unmarked.
+  //
+  // **And the draft only answers for the agents it was itself asked about.** A
+  // draft is a previous run's answers, and a run that marks an agent the previous
+  // one did not was never asked whether that agent polls — so reading its absence
+  // from `pollers` as *no* would write `pollsWork: false` for an agent nobody
+  // unmarked, which is the one outcome this question must not produce silently.
+  const answered = draft?.pollers;
+  const asked = new Set(draft?.chosen ?? []);
+  const preselected = offered
+    .filter((o) => (answered && asked.has(o.value) ? answered.includes(o.value) : (entryById.get(o.value)?.pollsWork ?? true)))
+    .map((o) => o.value);
+  return { options: offered, preselected };
+}
+
 /**
  * The file an agent's workspace connection is written to, as a name.
  *
@@ -273,6 +350,14 @@ export interface AgentDefaults {
    */
   connectionKeyVariable: string;
   bounds: Bounds;
+  /**
+   * Whether `run` asks for this agent's work — the second selection's answer,
+   * carried here because it decides which of the remaining questions exist.
+   *
+   * Not asked per agent: it is one list answered once, and asking it again here
+   * would be two places a person could say two different things.
+   */
+  pollsWork: boolean;
 }
 
 /**
@@ -297,6 +382,9 @@ export function agentDefaults(
     harnessVariable: draft?.harnessVariable !== undefined ? draft.harnessVariable : harnessFromExisting,
     connectionKeyVariable: existing?.env.connectionKey ?? connectionKeyVariableFor(agentName),
     bounds: draft?.bounds ?? existing?.bounds ?? DEFAULT_BOUNDS,
+    // A starting value only. The answer is the second selection's, and the
+    // caller overwrites this with it before the first question is asked.
+    pollsWork: existing?.pollsWork ?? true,
   };
 }
 
@@ -331,6 +419,11 @@ export interface ConfigureDraft {
   version: number;
   /** The agents marked, by id, in the order they are asked about. */
   chosen: string[];
+  /**
+   * The agents marked as pollers, by id — **absent until the question has been
+   * answered**, since an empty list is a real answer to it.
+   */
+  pollers?: string[];
   agents: Record<string, DraftAgent>;
   /** The ids of renamed entries the person chose NOT to keep — an answer like any other. */
   dropped: string[];
@@ -375,6 +468,10 @@ export function parseDraft(text: string): ConfigureDraft | null {
   }
   const dropped = Array.isArray(raw.dropped) ? raw.dropped.filter((v): v is string => typeof v === "string") : [];
   const read: ConfigureDraft = { version: DRAFT_VERSION, chosen, agents, dropped };
+  // Only when the key is there, so *never answered* survives the round trip: a
+  // missing key read as an empty list would offer a later run a configuration in
+  // which nobody polls, which is the opposite of what a draft is for.
+  if (Array.isArray(raw.pollers)) read.pollers = raw.pollers.filter((v): v is string => typeof v === "string");
   if (typeof raw.sessionsPerHour === "number" || raw.sessionsPerHour === null) read.sessionsPerHour = raw.sessionsPerHour;
   return read;
 }
@@ -518,6 +615,7 @@ export function assembleConfig(answers: Answers): Config {
     agents[a.name] = {
       id: a.id,
       harness: "claude",
+      pollsWork: a.pollsWork,
       cwd: a.cwd,
       env: { harness: a.harnessVariable, connectionKey: a.connectionKeyVariable },
       bounds: a.bounds,
@@ -559,6 +657,21 @@ export function summaryLines(
     );
     lines.push(`    ${connectionKeyLine(keys[name], entry.env.connectionKey)}`);
     if (report.mcpPaths[name]) lines.push(`    workspace connection ${report.mcpPaths[name]}`);
+    // Said for both answers rather than only for the unusual one. The two
+    // entries are identical in the file but for one field, so a summary that
+    // marked only the identity-only ones would leave a reader checking the
+    // absence of a line to learn what the other agents do.
+    //
+    // **In `run`'s vocabulary — *asked for work* — rather than in the screen's
+    // *polls*.** This block is the one surface that must not acquire a sentence
+    // about polling: the interval stopped being a setting and the line saying so
+    // was taken out of here, and a summary that says *polls* again is how it
+    // comes back by a side door.
+    lines.push(
+      entry.pollsWork
+        ? "    asked for work by mdbrain run"
+        : "    identity only: mdbrain as starts a session as it, and mdbrain run never asks for its work",
+    );
   }
   for (const gone of disappeared) {
     if (config.agents[gone.name]) lines.push(`  ${gone.name} is ${gone.reason}, and will receive no work until that changes.`);
@@ -579,6 +692,13 @@ export function summaryLines(
       ? `Ceiling: the server's, ${SESSION_CAP_HARD_MAX} sessions an hour per agent.`
       : `Ceiling: ${config.sessionsPerHour} sessions an hour per agent.`,
   );
+  // A legal configuration, and one nobody should discover from `run` refusing to
+  // start. It is said here because this is the screen where it was decided, and
+  // `run`'s own refusal names the same fact from the other end.
+  if (Object.values(config.agents).every((entry) => !entry.pollsWork)) {
+    lines.push("");
+    lines.push("No agent here is asked for work, so mdbrain run has nobody to ask. This machine is configured for mdbrain as.");
+  }
   return lines;
 }
 

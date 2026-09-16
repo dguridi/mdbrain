@@ -147,6 +147,8 @@ export interface StartRow {
   configPath: string;
   asking: string[];
   held: Array<{ agent: string; reason: string }>;
+  /** The configured agents this run never asks for, because they poll for nothing. */
+  attended: string[];
   pollMs: number;
 }
 
@@ -164,7 +166,7 @@ export interface RefusedRow {
 export interface StopRow {
   kind: "stop";
   at: string;
-  /** `session-ended`, `signal`, `once`, `all-held`, or `finished`. */
+  /** `session-ended`, `signal`, `once`, `all-held`, `none-polling`, or `finished`. */
   reason: string;
   exitCode: number;
   /** How many sessions ran, so a row of stops reads as a history rather than a list. */

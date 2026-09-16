@@ -1,12 +1,12 @@
 {
   "name": "@markdown-den/agent-runner",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "description": "mdbrain — the runner you can log into",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "build": "bun build --compile src/main.ts --outfile dist/mdbrain"
+    "build": "bun build --compile --production src/main.ts --outfile dist/mdbrain"
   },
   "dependencies": {
     "@inkjs/ui": "^2.0.0",

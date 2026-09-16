@@ -350,3 +350,49 @@ describe("whoami when the session was ended somewhere else", () => {
     expect(io.err.join("\n")).not.toContain("mdbrain login");
   });
 });
+
+describe("the roster whoami asks for", () => {
+  const ORGANIZATIONS = [{ id: "o-mine", name: "mine" }, { id: "o-theirs", name: "theirs" }];
+  const AGENTS = [
+    { id: "a-1", org_id: "o-mine", display_name: "dev-bot", status: "active", bot_user_id: "u-dev-bot" },
+    { id: "a-2", org_id: "o-theirs", display_name: "their-bot", status: "active", bot_user_id: "u-their-bot" },
+  ];
+
+  const serve = (memberships: unknown[]) => (url: string) => {
+    if (url.includes("/auth/v1/user")) return json({ id: "u-1", email: "me@example.com" });
+    if (url.includes("/organization_members")) return json(memberships);
+    if (url.includes("/organizations")) return json(ORGANIZATIONS);
+    if (url.includes("/agents")) return json(AGENTS);
+    return json([]);
+  };
+
+  const runWhoami = (memberships: unknown[]) => {
+    const io = lines();
+    return withRuntime(LIVE, serve(memberships), async (calls) => ({
+      code: await whoami.run(io.io as never),
+      io,
+      calls,
+    }));
+  };
+
+  it("96-S60: names only the agents this account may run, and asks for its own roles to decide", async () => {
+    const { code, io, calls } = await runWhoami([{ org_id: "o-mine", role: "owner" }]);
+    expect(code).toBe(0);
+    const printed = io.out.join("\n");
+    expect(printed).toContain("dev-bot");
+    expect(printed).not.toContain("their-bot");
+    // Filtered by the account's own id, because the policy admits every member
+    // row of every organization it is in.
+    const roles = calls.find((c) => c.url.includes("/organization_members"));
+    expect(roles?.url).toContain("user_id=eq.u-1");
+  });
+
+  it("96-S61: an account that owns none of the organizations it is in is told so, and still exits 0", async () => {
+    const { code, io } = await runWhoami([{ org_id: "o-mine", role: "member" }]);
+    expect(code).toBe(0);
+    const printed = io.out.join("\n");
+    expect(printed).toContain("belong to an organization you own");
+    expect(printed).not.toContain("dev-bot");
+    expect(printed).toContain("not shown here");
+  });
+});

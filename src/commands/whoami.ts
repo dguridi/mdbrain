@@ -6,7 +6,7 @@
 // makes it the smallest thing that cannot pass by accident.
 
 import type { CommandSpec } from "../cli.ts";
-import { AuthError, currentUser, listAgents, listOrganizations } from "../auth/api.ts";
+import { AuthError, currentUser, listAgents, listMemberships, listOrganizations } from "../auth/api.ts";
 import { signInAgainMessage } from "../auth/session.ts";
 import { redactSecrets } from "../run/diagnosis.ts";
 import { groupRoster, renderRoster } from "./roster.ts";
@@ -14,7 +14,7 @@ import { readySession } from "./session.ts";
 
 export const whoami: CommandSpec = {
   name: "whoami",
-  summary: "print the signed-in account and the agents it can see",
+  summary: "print the signed-in account and the agents it may run",
   async run({ out, err }) {
     // Refuses before any request when there is no session — the point of 96-S7
     // is that a signed-out runner does not contact the database at all.
@@ -25,12 +25,21 @@ export const whoami: CommandSpec = {
     }
 
     try {
-      const [user, organizations, agents] = await Promise.all([
-        currentUser(outcome.accessToken),
+      // The account first, because the roles read is filtered by its own id:
+      // the SELECT policy admits every member row of every organization this
+      // account is in, so asking for its own is what makes the answer its own.
+      const user = await currentUser(outcome.accessToken);
+      if (!user.id) throw new Error("the server did not say which account this session belongs to");
+      const [organizations, agents, memberships] = await Promise.all([
         listOrganizations(outcome.accessToken),
         listAgents(outcome.accessToken),
+        listMemberships(outcome.accessToken, user.id),
       ]);
-      for (const line of renderRoster(user.email ?? user.id ?? "your account", groupRoster(organizations, agents))) {
+      // The roles are the third read and the reason there is one: an ordinary
+      // member reads agents it cannot run, and a list that named them would be
+      // read as the list `configure` offers and `run` polls for.
+      const roster = groupRoster(organizations, agents, memberships);
+      for (const line of renderRoster(user.email ?? user.id ?? "your account", roster)) {
         out(line);
       }
       return 0;

@@ -12,6 +12,14 @@
 // **The child is its own process group on POSIX**, so the tools a session starts
 // die with it. A harness that spawns a language server and is killed without its
 // group leaves the language server holding the terminal.
+//
+// **There are two spawns here and not one spawn with a mode on it.** An
+// unattended session captures its streams, is detached, and is bounded by a wall
+// clock; an attended one inherits all three streams, must not be detached, and
+// has no outer bound at all. They differ in every field that matters, so a single
+// function taking a boolean would read as one behaviour with a switch in it
+// rather than as two things that happen to share a spawn call. What they do share
+// is the rule in the paragraph above: both always resolve.
 
 import { spawn } from "node:child_process";
 import type { Spawnable } from "./harness.ts";
@@ -206,5 +214,125 @@ export function runSession(request: SessionRequest, deps: ExecuteDeps = defaultD
     // outcome and never a throw, for the reason in this file's header.
     child.on("error", (cause: Error) => settle(null, cause.message));
     child.on("close", (code) => settle(code, null));
+  });
+}
+
+/** What one attended session needs: something to spawn, and where. */
+export interface AttachedRequest {
+  spawnable: Spawnable;
+  cwd: string;
+}
+
+/**
+ * What an attended session needs beyond an unattended one: a way to give the
+ * terminal's input back before the child is handed it.
+ *
+ * It is a dependency rather than a call because the **order** is the whole of
+ * it, and an order nothing can observe is an order nothing can hold.
+ */
+export interface AttachedDeps extends ExecuteDeps {
+  releaseInput: () => void;
+}
+
+/**
+ * Give the terminal's input back to whoever reads it next.
+ *
+ * A screen drawn before an attended session puts the terminal in raw mode to
+ * read keys, and unmounting turns raw mode off again — but it does not stop
+ * this process *reading*. A parent still reading the console while a child
+ * reads the same console is **two readers for one keyboard**: each keystroke
+ * goes to whichever asks for it first, so the child's first prompt looks dead
+ * and the terminal looks hung. `pause()` is what stops the read, down to the
+ * handle; the raw-mode reset is for a screen that left it on and costs nothing
+ * when it did not.
+ *
+ * Each step is guarded on its own: neither is worth failing a session over, and
+ * a stdin that is not a terminal has no raw mode to reset.
+ */
+export function releaseTerminalInput(stdin: NodeJS.ReadStream = process.stdin): void {
+  try {
+    if (stdin.isTTY && typeof stdin.setRawMode === "function") stdin.setRawMode(false);
+  } catch {
+    // A stdin that refuses the mode change is one that was never in it.
+  }
+  try {
+    stdin.pause();
+  } catch {
+    // Likewise: a stream that cannot be paused is not one that is reading.
+  }
+}
+
+const defaultAttachedDeps: AttachedDeps = { ...defaultDeps, releaseInput: () => releaseTerminalInput() };
+
+/** How an attended session ended: the child's own code, or why it never started. */
+export interface AttachedEnding {
+  /** Null when a signal ended the child, which is what `signal` then names. */
+  exitCode: number | null;
+  /**
+   * The signal that ended the child, or null when it exited on its own.
+   *
+   * Kept rather than collapsed into the code, because *exited 0* and *was killed*
+   * are different answers and only one of them means the session finished. A
+   * caller that read a null code as success would report a harness that was
+   * killed as a clean run.
+   */
+  signal: NodeJS.Signals | null;
+  /** Set when the process never started at all. */
+  spawnProblem: string | null;
+}
+
+/**
+ * Hand the terminal to one harness session and wait for the person to finish.
+ *
+ * Three things `runSession` does are removed rather than configured away, and
+ * each is a separate reason the two cannot be one function:
+ *
+ * - **All three streams are inherited.** A harness whose stdout is a pipe has no
+ *   terminal to draw on, and one whose stdin is `ignore` has nothing to read.
+ * - **The child is not detached.** That is the one that would fail strangely
+ *   rather than obviously: a detached child is not the foreground process group,
+ *   so its first read from the terminal raises `SIGTTIN` and stops it. It also
+ *   means the terminal's own Ctrl-C reaches the child, which is what this
+ *   command wants and what `runSession` deliberately gives up.
+ * - **There is no wall clock and no stop registry.** An attended session has no
+ *   outer bound because the person ends it, and installing a `SIGINT` handler
+ *   here would race the harness for a key the harness owns — Claude Code already
+ *   has an opinion about what its own interrupt means, and it is *stop the turn*
+ *   rather than *end the session*.
+ *
+ * @returns the child's exit code, or the sentence saying it never started —
+ * never a rejection, for the reason this file's header gives
+ */
+export function runAttached(request: AttachedRequest, deps: AttachedDeps = defaultAttachedDeps): Promise<AttachedEnding> {
+  const { spawnable, cwd } = request;
+
+  // **Before the spawn rather than after it.** The child inherits these very
+  // streams, so anything this process is still doing with them competes with it
+  // from its first keystroke rather than from some later one.
+  deps.releaseInput();
+
+  return new Promise<AttachedEnding>((resolve) => {
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = deps.spawn(spawnable.command, spawnable.args, {
+        cwd,
+        env: spawnable.env,
+        detached: false,
+        stdio: "inherit",
+      });
+    } catch (cause) {
+      resolve({ exitCode: null, signal: null, spawnProblem: (cause as Error).message });
+      return;
+    }
+
+    let settled = false;
+    const settle = (exitCode: number | null, signal: NodeJS.Signals | null, spawnProblem: string | null) => {
+      if (settled) return;
+      settled = true;
+      resolve({ exitCode, signal, spawnProblem });
+    };
+
+    child.on("error", (cause: Error) => settle(null, null, cause.message));
+    child.on("close", (code, signal) => settle(code, signal, null));
   });
 }

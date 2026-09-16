@@ -77,7 +77,45 @@ const FRAME_COLOR = "cyan";
  */
 const NOTICE_COLOR = "yellow";
 
-const STATE_COLOR: Record<AgentRow["state"], string> = { idle: "gray", running: "green", held: "yellow" };
+/**
+ * **Green means the live link and nothing else on this screen.**
+ *
+ * The connection row is the one line here whose colour is worth a glance from
+ * across a desk, and it is the only one that can be read at a glance only while
+ * it is the only green thing. A screen with a running agent and a few successful
+ * runs on it was almost entirely green, so the row that mattered was the same
+ * colour as the furniture around it.
+ *
+ * What the other two greens meant is not what green is for here. **An agent
+ * working is activity**, which is worth its own colour and gets magenta: nothing
+ * else uses it, so a row that is doing something is the second thing the eye
+ * finds. **A run that finished is history**, which is worth no colour at all —
+ * the recent-runs block is the longest thing on screen, and a successful run is
+ * the case nobody needs to be told about, so it recedes and the red of a failure
+ * is left with nothing to compete against.
+ */
+export const LIVE_COLOR = "green";
+
+/** An agent with a session running: the one thing on screen that is happening now. */
+export const ACTIVE_COLOR = "magenta";
+
+/**
+ * A run that is over and went fine.
+ *
+ * Grey rather than dimmed, because the picked row is drawn bold and a terminal
+ * ends bold and dim with the same code — a row that was both would lose one of
+ * them, and which one it lost would be the terminal's choice rather than ours.
+ */
+export const SETTLED_COLOR = "gray";
+
+/** A run that did not finish, in the one colour nothing else on the screen uses. */
+export const FAILED_COLOR = "red";
+
+export const STATE_COLOR: Record<AgentRow["state"], string> = {
+  idle: "gray",
+  running: ACTIVE_COLOR,
+  held: "yellow",
+};
 
 /** The mark and the words of the one connection row, and the colour of the mark. */
 export interface ConnectionRow {
@@ -155,7 +193,7 @@ export function connectionRow(
         // already uses (`listeningText`). The number returns the moment it
         // means something: `partial` says how many of how many are held, and
         // `silent` says there are none.
-        return { color: "green", text: "listening for work" };
+        return { color: LIVE_COLOR, text: "listening for work" };
       case "partial":
         return { color: "yellow", text: `listening · ${held} of ${brains(total)}` };
       case "retrying":
@@ -257,7 +295,7 @@ function runDetail(run: RecentRun, now: number): ReactElement[] {
     h(Text, { key: "detail-heading", color: FRAME_COLOR }, "The run you picked"),
     h(
       Text,
-      { key: "detail-head", color: run.outcome === "done" ? "green" : "red" },
+      { key: "detail-head", color: run.outcome === "done" ? SETTLED_COLOR : FAILED_COLOR },
       `  ${run.agent}  ${run.outcome}  ${durationText(run.ms)}  ${costText(run.costUsd)}  claim ${shortClaim(run.claim)}`,
     ),
     // The date belongs here rather than on the row: this is the one place with
@@ -326,7 +364,7 @@ export function liveView(state: ViewState, frame: ScreenFrame): ReactElement {
           // Keyed on the claim rather than the position, for the same reason the
           // cursor is: the list grows from the top and a row is not the run it
           // was a moment ago.
-          { key: `recent-${run.claim}`, color: run.outcome === "done" ? "green" : "red", bold: picked },
+          { key: `recent-${run.claim}`, color: run.outcome === "done" ? SETTLED_COLOR : FAILED_COLOR, bold: picked },
           // The clock and the age together, which is the pair the question is
           // actually asked in: the clock alone cannot tell this morning from
           // yesterday morning, and the age alone gives a person nothing to match

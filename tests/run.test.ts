@@ -31,7 +31,18 @@ import {
   waitedText,
 } from "../src/run/view.ts";
 import { render } from "ink-testing-library";
-import { connectionRow, countdownText, liveScreenFor, liveView, type ScreenFrame } from "../src/run/screen.ts";
+import {
+  ACTIVE_COLOR,
+  connectionRow,
+  countdownText,
+  FAILED_COLOR,
+  LIVE_COLOR,
+  liveScreenFor,
+  liveView,
+  SETTLED_COLOR,
+  STATE_COLOR,
+  type ScreenFrame,
+} from "../src/run/screen.ts";
 import { KEY_BINDINGS, actionForKey, keyHints, type KeyModifiers, type ViewRequest } from "../src/run/keys.ts";
 
 const cwd = process.platform === "win32" ? "C:\\work\\checkout" : "/work/checkout";
@@ -74,6 +85,7 @@ beforeEach(() => {
 const entry = (over: Record<string, unknown> = {}) => ({
   id: "agent-1",
   harness: "claude" as const,
+  pollsWork: true,
   cwd,
   env: { harness: "ANTHROPIC_API_KEY" as string | null, connectionKey: "MDBRAIN_KEY_DEV_BOT_MDDEN" },
   bounds: { maxTurns: 50, maxBudgetUsd: 5, wallClock: "30m" },
@@ -99,7 +111,7 @@ const unit = (agent = "dev-bot-mdden", claim = "c1f0", seq = 8412, over: Partial
 
 const invocation = (over: Partial<Invocation> = {}): Invocation => ({
   prompt: "Triage what landed.",
-  claimId: "3f2a0000-0000-4000-8000-000000000000",
+  sessionId: "3f2a0000-0000-4000-8000-000000000000",
   mcpConfigPath: "/cfg/mcp/dev-bot-mdden.json",
   cwd,
   bounds: { maxTurns: 50, maxBudgetUsd: 5, wallClock: "30m" },
@@ -214,6 +226,54 @@ describe("run: startup", () => {
     expect(plan.asking).toEqual([]);
     const lines = summaryLines(plan, "/r", null);
     expect(lines).toContain("  Asking for nobody: every configured agent is held.");
+  });
+
+  it("125-S27: an identity-only agent is not asked for and is not held, whatever this machine would have held it for", () => {
+    const plan = planStartup(
+      config({ alice: entry(), bob: entry({ pollsWork: false }) }),
+      { ANTHROPIC_API_KEY: "x" },
+      () => true,
+      null,
+    );
+    expect(plan.asking).toEqual(["alice"]);
+    expect(plan.attended).toEqual(["bob"]);
+    expect(plan.held).toEqual([]);
+
+    // Every hold this process knows about at once — an unset variable, a
+    // directory that is gone, a name no roster holds — and none of them applies
+    // to an agent this process will never ask for.
+    const wouldHold = planStartup(
+      config({ bob: entry({ pollsWork: false, env: { harness: "B_KEY", connectionKey: "K_B" }, cwd: "/gone" }) }),
+      {},
+      () => false,
+      new Set(["somebody-else"]),
+    );
+    expect(wouldHold.held).toEqual([]);
+    expect(wouldHold.attended).toEqual(["bob"]);
+
+    // And one line for the lot of them, since there is no reason to read.
+    const lines = summaryLines(plan, "/r", null);
+    expect(lines).toContain("  Identity only, not asked for work: bob.");
+    expect(lines.join("\n")).not.toContain("Asking for nobody");
+  });
+
+  it("125-S28: a machine where nothing is asked for says that, rather than saying everything is held", () => {
+    const plan = planStartup(config({ bob: entry({ pollsWork: false }) }), { ANTHROPIC_API_KEY: "x" }, () => true, null);
+    expect(plan.asking).toEqual([]);
+    const lines = summaryLines(plan, "/r", null);
+    expect(lines).toContain("  Asking for nobody: every agent configured here is identity-only.");
+    expect(lines.join("\n")).not.toContain("every configured agent is held");
+
+    // A held agent beside them is a machine with something to fix, and the held
+    // sentence is the one that says so.
+    const mixed = planStartup(
+      config({ alice: entry({ env: { harness: "A_KEY", connectionKey: "K_A" } }), bob: entry({ pollsWork: false }) }),
+      {},
+      () => true,
+      null,
+    );
+    expect(mixed.asking).toEqual([]);
+    expect(summaryLines(mixed, "/r", null)).toContain("  Asking for nobody: every configured agent is held.");
   });
 });
 
@@ -775,6 +835,65 @@ describe("run: the command, driven end to end", () => {
     const held = await drive({ env: {}, roster: async () => [] });
     expect(held.code).toBe(1);
     expect(held.err.join("\n")).toBe(ALL_HELD_MESSAGE);
+  });
+
+  it("125-S29: a machine of identity-only agents refuses with its own sentence, and records its own reason", async () => {
+    const { ALL_HELD_MESSAGE, NOBODY_POLLS_MESSAGE } = await import("../src/commands/run.ts");
+    const count = vi.fn(async () => ({ waiting: 1, capped: false }));
+    const none = await drive({
+      loadConfiguration: async () => ({ kind: "config", config: config({ "dev-bot-mdden": entry({ pollsWork: false }) }) }),
+      count,
+    });
+    expect(none.code).toBe(1);
+    expect(none.err.join("\n")).toBe(NOBODY_POLLS_MESSAGE);
+    expect(none.err.join("\n")).not.toBe(ALL_HELD_MESSAGE);
+    // Nothing was asked of the server: the refusal is before the first tick.
+    expect(count).not.toHaveBeenCalled();
+
+    const stop = none.notes.find((row) => row.kind === "stop");
+    expect(stop && stop.kind === "stop" && stop.reason).toBe("none-polling");
+
+    const start = none.notes.find((row) => row.kind === "start");
+    expect(start && start.kind === "start" && start.attended).toEqual(["dev-bot-mdden"]);
+    expect(start && start.kind === "start" && start.asking).toEqual([]);
+
+    // One genuinely held agent beside them is a machine with something to fix,
+    // and the refusal has to be the held sentence there — the startup block
+    // saying so is not the same surface as the sentence the command exits on.
+    const mixed = await drive({
+      env: {},
+      loadConfiguration: async () => ({
+        kind: "config",
+        config: config({ "dev-bot-mdden": entry(), "spec-warden": entry({ id: "agent-2", pollsWork: false }) }),
+      }),
+    });
+    expect(mixed.code).toBe(1);
+    expect(mixed.err.join("\n")).toBe(ALL_HELD_MESSAGE);
+    const mixedStop = mixed.notes.find((row) => row.kind === "stop");
+    expect(mixedStop && mixedStop.kind === "stop" && mixedStop.reason).toBe("all-held");
+  });
+
+  it("125-S29: an identity-only agent gets no presence identity and no work-signal topic", async () => {
+    let listenedTo: string[] = [];
+    const driven = await drive({
+      loadConfiguration: async () => ({
+        kind: "config",
+        config: config({ "dev-bot-mdden": entry(), "spec-warden": entry({ id: "agent-2", pollsWork: false }) }),
+      }),
+      roster: async () => [
+        { id: "agent-1", org_id: "o", display_name: "dev-bot-mdden", status: "active", bot_user_id: "u-agent-1" },
+        { id: "agent-2", org_id: "o", display_name: "spec-warden", status: "active", bot_user_id: "u-agent-2" },
+      ],
+      listenTo: async (_token: string, agents: readonly string[]) => {
+        listenedTo = [...agents];
+        return ["brain-1"];
+      },
+    });
+    expect(driven.code).toBe(0);
+    expect(listenedTo).toEqual(["dev-bot-mdden"]);
+    // The identity exists on this machine; what it is not is a member of this
+    // run's roster, so nobody sees it come online for a session it never has.
+    expect([...(driven.presence.opened()?.identities.keys() ?? [])]).toEqual(["dev-bot-mdden"]);
   });
 
   it("105-S24: a counter that answers zero makes no claim that tick", async () => {
@@ -2591,6 +2710,7 @@ describe("run: the diagnosis log", () => {
       configPath: "/home/d/.config/mdbrain/config.json",
       asking: ["dev-bot-mdden"],
       held: [{ agent: "other", reason: "no key" }],
+      attended: [],
       pollMs: 30_000,
     });
     expect(start.at).toBe("2026-09-09T16:00:07.000Z");
@@ -2747,6 +2867,94 @@ describe("run: where the two connections stand, on both presenters", () => {
       expect(line).toContain(listeningText(state, 1, 2));
       expect(line).toContain("listening");
     }
+  });
+
+  it("121-S25: green is the live link, and nothing else the screen can draw uses it", () => {
+    expect(connectionRow({ state: "listening", held: 1, total: 1 }, "connected")?.color).toBe(LIVE_COLOR);
+    expect(LIVE_COLOR).toBe("green");
+    // Every other colour this screen can emit, gathered from the one place each
+    // is named: a green anywhere in here is the row that matters losing the only
+    // thing that made it findable at a glance.
+    expect([ACTIVE_COLOR, SETTLED_COLOR, FAILED_COLOR, ...Object.values(STATE_COLOR)]).not.toContain(LIVE_COLOR);
+    // The list above can only see the colours this module exports, and two of
+    // the ones it draws are private to it: the frame — every heading, the title
+    // and the countdown — and the version notice. Either turned green floods the
+    // screen with the colour this rule reserves, and neither is reachable from
+    // any name a test can import. So the claim in this case's title is held by a
+    // count over the source instead, with the comments taken out first, because
+    // the paragraph above LIVE_COLOR argues about green at length and a scan a
+    // comment can satisfy is not a scan.
+    const source = readFileSync(fileURLToPath(new URL("../src/run/screen.ts", import.meta.url)), "utf8");
+    const code = source.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/[^\n]*/g, " ");
+    // The strip is an instrument too, and a strip that quietly did nothing would
+    // make every count below pass for the wrong reason.
+    expect(source).toContain("Green means the live link");
+    expect(code).not.toContain("Green means the live link");
+    // Twice, and both of them declarations: the constant, and the connection
+    // row's own type, which is where green is made legal rather than used.
+    expect(code.match(/"green"/g) ?? []).toHaveLength(2);
+    expect(code).toContain('export const LIVE_COLOR = "green"');
+    expect(code).toContain('color: "green" | "yellow" | "red"');
+  });
+
+  it("121-S25: on a screen drawing every coloured thing at once, the only green is the connection row", () => {
+    // The case above reads the module's text, so it sees a green SPELLED
+    // anywhere in it — including the two colours no name exports. It cannot see
+    // a site drawn in the live colour by NAME, which spells nothing and is the
+    // same wrong screen. This asks the other question: of everything actually
+    // drawn, what came out green?
+    const colours = (node: unknown, found: { color: string; text: string }[] = []) => {
+      if (node === null || typeof node !== "object") return found;
+      if (Array.isArray(node)) {
+        for (const child of node) colours(child, found);
+        return found;
+      }
+      const props = (node as { props?: Record<string, unknown> }).props;
+      if (props === undefined) return found;
+      if (typeof props.color === "string") found.push({ color: props.color, text: String(props.children ?? "") });
+      colours(props.children, found);
+      return found;
+    };
+
+    const started = (agent: string, claim: string): RunEvent => ({
+      kind: "start", agent, claim, unitKind: "file-arrived", seq: 1, workspace: "w", file: null, brain: null,
+      recordedAt: AT.toISOString(),
+    });
+    const view = feed([
+      { kind: "configured", agent: "idle-one" },
+      { kind: "configured", agent: "working" },
+      { kind: "configured", agent: "ran-twice" },
+      { kind: "configured", agent: "stuck" },
+      { kind: "held", agent: "stuck", reason: "STUCK_KEY is not set." },
+      started("working", "c-live"),
+      started("ran-twice", "c-done"),
+      { kind: "done", agent: "ran-twice", claim: "c-done", ms: 5_000, costUsd: 0.4, turns: 3, message: "Done." },
+      started("ran-twice", "c-failed"),
+      { kind: "failed", agent: "ran-twice", claim: "c-failed", outcome: "failed", ms: 2_000, message: "It did not." },
+      { kind: "version", version: "0.9.9", how: "Run `mdbrain upgrade` to replace it." },
+      { kind: "connection", state: "connected" },
+      listening("listening", 2, 2),
+    ]);
+    // The picked run draws the detail block as well, so every site this state
+    // can reach is on the one screen being read.
+    const drawn = colours(liveView(view, frame({ selection: "c-done" })));
+
+    const greens = drawn.filter((node) => node.color === LIVE_COLOR);
+    expect(greens).toHaveLength(1);
+    expect(greens[0].text).toContain("listening for work");
+    // The control: a walk that reached nothing would satisfy the line above.
+    const seen = new Set(drawn.map((node) => node.color));
+    expect(seen).toContain(ACTIVE_COLOR);
+    expect(seen).toContain(SETTLED_COLOR);
+    expect(seen).toContain(FAILED_COLOR);
+  });
+
+  it("121-S25: an agent working and a run that finished are told apart by colour, not only by position", () => {
+    // They were one colour, so a screen with either on it read the same. Sharing
+    // one again would put activity and history back in the same bucket.
+    expect(STATE_COLOR.running).not.toBe(SETTLED_COLOR);
+    expect(STATE_COLOR.running).not.toBe(STATE_COLOR.idle);
+    expect(SETTLED_COLOR).not.toBe(FAILED_COLOR);
   });
 
   it("121-S7: presence connected and the socket listening draws one green row saying it is listening for work", () => {

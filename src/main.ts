@@ -5,6 +5,7 @@
 // unreachable one, and there is no second place to remember to update.
 
 import { pathToFileURL } from "node:url";
+import { as } from "./commands/as.ts";
 import { dispatch, type CommandSpec } from "./cli.ts";
 import { configure } from "./commands/configure.ts";
 import { login } from "./commands/login.ts";
@@ -22,7 +23,7 @@ import { VERSION } from "./version.ts";
 export { VERSION };
 
 /** Every command this binary has. */
-export const COMMANDS: CommandSpec[] = [login, whoami, logout, configure, runCommand, upgrade];
+export const COMMANDS: CommandSpec[] = [login, whoami, logout, configure, runCommand, as, upgrade];
 
 /**
  * Run one invocation.

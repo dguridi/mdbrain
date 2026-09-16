@@ -176,6 +176,39 @@ describe("the config file's schema", () => {
     expect(POLL_MS).toBe(45 * 60_000);
   });
 
+  it("125-S21: an entry with no pollsWork is asked for work, false is kept, and anything that is not a boolean is refused by name", () => {
+    const absent = parseConfig(JSON.stringify(good()));
+    expect(absent.kind === "config" && absent.config.agents["dev-bot-mdden"].pollsWork).toBe(true);
+
+    const off = parseConfig(JSON.stringify(agentWith({ pollsWork: false })));
+    expect(off.kind === "config" && off.config.agents["dev-bot-mdden"].pollsWork).toBe(false);
+
+    const on = parseConfig(JSON.stringify(agentWith({ pollsWork: true })));
+    expect(on.kind === "config" && on.config.agents["dev-bot-mdden"].pollsWork).toBe(true);
+
+    // The string is the one a person writes by hand, and reading it as truthy
+    // would enrol the agent by the exact keystrokes meant to keep it out.
+    for (const value of ["false", "no", 0, 1]) {
+      expect(refused(agentWith({ pollsWork: value }))).toContain("pollsWork");
+    }
+  });
+
+  it("125-S22: pollsWork is written only when it is false, and a round trip keeps both answers", () => {
+    const polling = parseConfig(JSON.stringify(good()));
+    if (polling.kind !== "config") throw new Error("not a config");
+    // The file of a machine that never wanted an identity-only agent is
+    // unchanged by the field existing — which is also what keeps 121-S2's
+    // "carries no poll field" honest rather than accidentally true.
+    expect(serializeConfig(polling.config)).not.toContain("pollsWork");
+
+    const identity = parseConfig(JSON.stringify(agentWith({ pollsWork: false })));
+    if (identity.kind !== "config") throw new Error("not a config");
+    const text = serializeConfig(identity.config);
+    expect(JSON.parse(text).agents["dev-bot-mdden"].pollsWork).toBe(false);
+    const again = parseConfig(text);
+    expect(again.kind === "config" && again.config).toEqual(identity.config);
+  });
+
   it("reads a duration with a unit and refuses one without", () => {
     expect(durationMs("5m")).toBe(300_000);
     expect(durationMs("90s")).toBe(90_000);

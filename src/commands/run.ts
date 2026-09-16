@@ -204,6 +204,17 @@ export const UNREADABLE_CONFIG_MESSAGE =
   "The configuration is there but could not be read. Check that it is readable, or run `mdbrain configure` again.";
 export const ALL_HELD_MESSAGE =
   "Every configured agent is held, so there is nobody to ask for work. The lines above say why for each.";
+/**
+ * The other way there is nobody to ask for, and it is not a fault.
+ *
+ * Kept as its own sentence rather than a clause on the one above, because a
+ * person who reads *held* goes looking for what is broken on this machine: an
+ * unset variable, a directory that moved, a name the roster lost. Nothing is
+ * broken here, the configuration is exactly what somebody asked for, and the
+ * sentence has to say so and then name the command that does work.
+ */
+export const NOBODY_POLLS_MESSAGE =
+  "Every agent configured here is identity-only, so there is nobody to ask for work. Run `mdbrain as <agent>` to drive one, or `mdbrain configure` to have one poll.";
 
 /** The default sleeper: a timer that can be cut short by a stop. */
 export function waitFor(ms: number, signal: { stopped: boolean; wake: (() => void) | null }): Promise<void> {
@@ -459,14 +470,19 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
       configPath: configPath(),
       asking: [...startup.asking],
       held: startup.held.map((h) => ({ agent: h.agent, reason: h.reason })),
+      attended: [...startup.attended],
       pollMs: POLL_MS,
     }),
   );
 
   if (startup.asking.length === 0) {
-    await record(stopRow(deps.now(), "all-held", 1, 0));
+    // Told apart by whether anything is actually held: a machine with one held
+    // agent and three identity-only ones has something to fix, and the held
+    // lines are what says what, so that case keeps the held sentence.
+    const nothingWrong = startup.held.length === 0 && startup.attended.length > 0;
+    await record(stopRow(deps.now(), nothingWrong ? "none-polling" : "all-held", 1, 0));
     await presenter.stop();
-    err(ALL_HELD_MESSAGE);
+    err(nothingWrong ? NOBODY_POLLS_MESSAGE : ALL_HELD_MESSAGE);
     return 1;
   }
 
@@ -1420,7 +1436,11 @@ async function oneSession(
 
   const spawnable = spec.build({
     prompt: rendered.prompt,
-    claimId: unit.instruction.claim,
+    // The claim id is what the session is named by, so a transcript on this
+    // machine and a row on the server share one name without a lookup table.
+    // The field is general because an attended session has no claim to name
+    // itself after; this is the call site where it is a claim id.
+    sessionId: unit.instruction.claim,
     mcpConfigPath: mcpConfigPath(agent),
     cwd: entry.cwd,
     bounds: entry.bounds,

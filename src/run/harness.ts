@@ -23,29 +23,52 @@
 // not supplied.
 //
 // **Everything the harness itself can do is decided by the permission mode, and
-// the mode is chosen for a room with nobody in it.** The two flags that do that
-// are `--permission-mode auto` and `--permission-prompts none`, each argued at
-// the line it appears on. The property they hold together is that a session
-// never ends its turn asking a person for something: either the action is
-// approved, or the session is told nobody can answer and carries on without it.
+// for an unattended session the mode is chosen for a room with nobody in it.**
+// The two flags that do that are `--permission-mode auto` and
+// `--permission-prompts none`, each argued at the line it appears on. The
+// property they hold together is that an unattended session never ends its turn
+// asking a person for something: either the action is approved, or the session
+// is told nobody can answer and carries on without it.
 //
-// Pure: `build` takes values and answers argv and an environment. Nothing here
-// spawns anything, which is what lets every flag be asserted without a process.
+// **Two kinds of session are built here, and they differ in exactly one thing.**
+// An identity — who a session is and what it may reach — is the same whether a
+// person is watching or not, so it is one function, `identityArgs`, that both
+// builders spread. What an unattended session adds on top is an instruction and
+// the bounds on it; an attended session adds nothing at all, because the bounds
+// are what having nobody watching is made of and a person ends their own session.
+// Keeping the shared half a function rather than a discipline is the whole point:
+// a flag can then only reach one mode by being added to that mode deliberately,
+// in a diff that says so.
+//
+// Pure: both builders take values and answer argv and an environment. Nothing
+// here spawns anything, which is what lets every flag be asserted without a
+// process.
 
 import { MCP_SERVER_NAME, MCP_URL } from "../auth/project.ts";
 import type { Bounds, HarnessId } from "../config/schema.ts";
 import { readOutcome, type Outcome, type SessionEnd } from "./outcome.ts";
 
-/** Everything one session needs to be built, gathered before anything is spawned. */
-export interface Invocation {
-  /** The instruction's prompt, byte for byte. Nothing is prepended or appended. */
-  prompt: string;
-  /** The claim id, which is also the harness's `--session-id`. */
-  claimId: string;
+/**
+ * Who a session is and what it may reach — the same in both modes.
+ *
+ * Every field here is settled before anyone decides whether a person is
+ * watching, which is what makes it the shared half rather than a subset that
+ * happens to overlap today.
+ */
+export interface Identity {
+  /**
+   * The harness's `--session-id`, which names the transcript on this machine.
+   *
+   * **Not called `claimId`, because an attended session has no claim.** A field
+   * naming a thing one of its two callers does not have is a name that has to be
+   * filled in with something, and what gets filled in is a lie the type signs
+   * off on. `run` passes its claim id, so a transcript here and a row on the
+   * server still share one name; `as` mints a UUID of its own.
+   */
+  sessionId: string;
   /** The per-agent MCP file, which names the connection key's variable. */
   mcpConfigPath: string;
   cwd: string;
-  bounds: Bounds;
   /**
    * The value for the harness's own credential, or null for the machine's own
    * signed-in account — in which case the variable is **removed** from the
@@ -57,6 +80,19 @@ export interface Invocation {
   connectionKey: string;
   /** The runner's own environment, which the child inherits but for the two below. */
   parentEnv: Record<string, string | undefined>;
+}
+
+/**
+ * An unattended session: an identity, an instruction, and the bounds on it.
+ *
+ * The two added fields are exactly what having nobody watching is made of — a
+ * session nobody asked for needs to be told what to do, and one nobody is
+ * watching needs an outer edge.
+ */
+export interface Invocation extends Identity {
+  /** The instruction's prompt, byte for byte. Nothing is prepended or appended. */
+  prompt: string;
+  bounds: Bounds;
 }
 
 /** What to spawn. */
@@ -80,7 +116,20 @@ export interface HarnessSpec {
    * would be a Claude assumption with a general name on it.
    */
   mcpConfigText(connectionKeyVariable: string): string;
+  /**
+   * The flags that say who a session is and what it may reach, in both modes.
+   *
+   * **The name covers the tool boundary as well as the identity**, and that is
+   * deliberate rather than loose: `--permission-mode` is in the set and is not
+   * an identity flag in the narrow sense. It is here because *what may this bot
+   * do* is as much the question an attended session exists to show as *who is
+   * it*, and because a flag that survived into one mode and not the other is
+   * precisely the drift this function exists to make impossible.
+   */
+  identityArgs(identity: Identity): string[];
   build(input: Invocation): Spawnable;
+  /** An attended session: the identity, and deliberately nothing else. */
+  buildInteractive(identity: Identity): Spawnable;
   readOutcome(end: SessionEnd): Outcome;
 }
 
@@ -94,7 +143,7 @@ export interface HarnessSpec {
  * otherwise silently stand in for the account that was chosen, and the session
  * would run as somebody else with nothing on screen to say so.
  */
-export function childEnvironment(input: Invocation, credentialVariable: string): Record<string, string> {
+export function childEnvironment(input: Identity, credentialVariable: string): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [name, value] of Object.entries(input.parentEnv)) {
     if (value !== undefined) env[name] = value;
@@ -165,6 +214,67 @@ export const claudeHarness: HarnessSpec = {
   credentialVariable: "ANTHROPIC_API_KEY",
   mcpConfigText: claudeMcpConfigText,
 
+  identityArgs(identity) {
+    return [
+      "--mcp-config",
+      identity.mcpConfigPath,
+      // Not tidiness. Without it the session also loads whatever MCP
+      // configuration the person has on this machine, which hands the agent a
+      // second workspace connection under a different identity.
+      //
+      // **It bounds configured servers and not the harness's own built-ins.** An
+      // attended session starts in-process servers of Claude Code's that this
+      // flag does not reach and no flag bounds on its own, so the tool surface a
+      // person sees in an attended session is wider than an unattended one's.
+      // The identity wall still holds — none of them is a second markdown-den
+      // connection — but *the bot can do exactly this much* is not a question an
+      // attended session answers on its own.
+      "--strict-mcp-config",
+      // The other half of handing a session an MCP server: a server it may
+      // not call is a server it does not have. Nothing in `-p` can ask a
+      // person to approve a tool, so an unattended session that needs one stops
+      // and says so, having spent real money and done nothing.
+      //
+      // **This grants exactly the server the line above supplied and nothing
+      // else** — the name is the key `store.ts` writes, and `--strict-mcp-config`
+      // means no other configured server is loaded to be caught by it. It is
+      // kept even though the mode below would send these calls to a classifier
+      // that would very likely approve them: an allow rule is decided before the
+      // classifier is consulted, so this is one fewer round trip per call and
+      // one fewer judgement to be surprised by.
+      "--allowedTools",
+      `mcp__${MCP_SERVER_NAME}`,
+      // **`auto` rather than `acceptEdits`, because the runner's whole purpose
+      // is work nobody is watching.** `acceptEdits` auto-approves reads, edits
+      // in the working directory and a handful of filesystem commands; every
+      // other shell command needs a rule, so a session asked to run the tests
+      // or open a pull request stops at its first command. `auto` sends what
+      // is left to the classifier, which approves ordinary development and
+      // refuses a defined dangerous set — force pushes, destructive git,
+      // production deploys, sending secrets outward, downloading and executing
+      // code. That is a real boundary rather than none, which is why this is
+      // not `bypassPermissions`: nothing here is an isolated container, it is
+      // somebody's own checkout.
+      //
+      // Two prices, stated because neither is visible from the flag: the
+      // classifier is a round trip before some calls run, and on API-key
+      // accounts its calls count towards the same budget `--max-budget-usd`
+      // bounds.
+      //
+      // **It is shared rather than per-mode because the mode is the answer to
+      // what this bot may do**, which is the question both callers are asking.
+      // What differs is only who is there to be asked when the classifier
+      // declines, and that is the flag below this set rather than this one.
+      "--permission-mode",
+      "auto",
+      // The transcript's name. `run` passes its claim id, so a transcript here
+      // and a row on the server share one name without a lookup table; an
+      // attended session passes a UUID minted for it.
+      "--session-id",
+      identity.sessionId,
+    ];
+  },
+
   build(input) {
     return {
       command: "claude",
@@ -173,47 +283,10 @@ export const claudeHarness: HarnessSpec = {
         // what the session is told. Nothing before it and nothing after it.
         "-p",
         input.prompt,
-        "--mcp-config",
-        input.mcpConfigPath,
-        // Not tidiness. Without it the session also loads whatever MCP
-        // configuration the person has on this machine, which hands the agent a
-        // second workspace connection under a different identity.
-        "--strict-mcp-config",
-        // The other half of handing a session an MCP server: a server it may
-        // not call is a server it does not have. Nothing in `-p` can ask a
-        // person to approve a tool, so a session that needs one stops and says
-        // so, having spent real money and done nothing.
-        //
-        // **This grants exactly the server the line above supplied and nothing
-        // else** — the name is the key `store.ts` writes, and `--strict-mcp-config`
-        // means no other server is loaded to be caught by it. It is kept even
-        // though the mode below would send these calls to a classifier that
-        // would very likely approve them: an allow rule is decided before the
-        // classifier is consulted, so this is one fewer round trip per call and
-        // one fewer judgement to be surprised by.
-        "--allowedTools",
-        `mcp__${MCP_SERVER_NAME}`,
-        // **`auto` rather than `acceptEdits`, because the runner's whole purpose
-        // is work nobody is watching.** `acceptEdits` auto-approves reads, edits
-        // in the working directory and a handful of filesystem commands; every
-        // other shell command needs a rule, so a session asked to run the tests
-        // or open a pull request stops at its first command. `auto` sends what
-        // is left to the classifier, which approves ordinary development and
-        // refuses a defined dangerous set — force pushes, destructive git,
-        // production deploys, sending secrets outward, downloading and executing
-        // code. That is a real boundary rather than none, which is why this is
-        // not `bypassPermissions`: nothing here is an isolated container, it is
-        // somebody's own checkout.
-        //
-        // Two prices, stated because neither is visible from the flag: the
-        // classifier is a round trip before some calls run, and on API-key
-        // accounts its calls count towards the same budget `--max-budget-usd`
-        // bounds.
-        "--permission-mode",
-        "auto",
-        // **What a session does when it is refused anyway.** Without this a
-        // refusal is still a refusal, but the session is not told why, and it
-        // ends its turn asking a person to approve something — which is how
+        ...claudeHarness.identityArgs(input),
+        // **What an unattended session does when it is refused anyway.** Without
+        // this a refusal is still a refusal, but the session is not told why, and
+        // it ends its turn asking a person to approve something — which is how
         // sessions came to cost money and do nothing. With it the session is
         // told that nobody can answer and not to retry, `AskUserQuestion` is
         // removed from it entirely, and it carries on with what it can do.
@@ -221,6 +294,10 @@ export const claudeHarness: HarnessSpec = {
         // It is why this program needs Claude Code 2.1.259 or newer: an older
         // one refuses the flag by name, and every session fails at spawn rather
         // than quietly reverting to asking.
+        //
+        // **It is in this builder and not the shared set because it answers a
+        // question only an empty room asks.** An attended session has somebody
+        // to put the refusal to, which is the whole difference between the two.
         "--permission-prompts",
         "none",
         // `json` and not `stream-json`: one result object at the end. The live
@@ -232,12 +309,23 @@ export const claudeHarness: HarnessSpec = {
         String(input.bounds.maxTurns),
         "--max-budget-usd",
         String(input.bounds.maxBudgetUsd),
-        // The claim id, so a transcript on this machine and a row on the server
-        // share one name without a lookup table.
-        "--session-id",
-        input.claimId,
       ],
       env: childEnvironment(input, claudeHarness.credentialVariable),
+    };
+  },
+
+  buildInteractive(identity) {
+    return {
+      command: "claude",
+      // **The identity and nothing else**, which is the whole of what an
+      // attended session is. No `-p`, so the harness draws its own screen and
+      // reads its own keys; no `--output-format`, because there is no result
+      // object to parse; and none of the three bounds, because every one of them
+      // is either print-gated at the harness or enforced by the runner's own
+      // wall clock, and an attended session has neither. It is not bounded here:
+      // the person ends it.
+      args: claudeHarness.identityArgs(identity),
+      env: childEnvironment(identity, claudeHarness.credentialVariable),
     };
   },
 

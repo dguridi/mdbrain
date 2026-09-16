@@ -16,9 +16,11 @@ import {
   judgeSelection,
   judgeVariable,
   mcpFileNameFor,
+  NOTHING_TO_MANAGE,
   organizationsWithoutAgents,
   ownedOrganizations,
   parseDraft,
+  pollingChoices,
   rosterAgents,
   summaryLines,
   withheldAgentsLine,
@@ -27,7 +29,7 @@ import {
   type RosterAgent,
 } from "../src/configure/questions.ts";
 import { configureScreen, type ScreenPlan } from "../src/configure/screen.ts";
-import { configure, noTerminalMessage, NOTHING_TO_CONFIGURE, runConfigure, type ConfigureDeps } from "../src/commands/configure.ts";
+import { configure, noTerminalMessage, runConfigure, type ConfigureDeps } from "../src/commands/configure.ts";
 import { login } from "../src/commands/login.ts";
 import { parseConfig, serializeConfig, type Config } from "../src/config/schema.ts";
 import { configPath } from "../src/config/paths.ts";
@@ -51,6 +53,7 @@ const existing = (): Config => ({
     "dev-bot-mdden": {
       id: "a-1",
       harness: "claude",
+      pollsWork: true,
       cwd,
       env: { harness: "ANTHROPIC_API_KEY", connectionKey: "MDBRAIN_KEY_DEV_BOT_MDDEN" },
       bounds: { maxTurns: 40, maxBudgetUsd: 3, wallClock: "20m" },
@@ -66,6 +69,7 @@ const answersFor = (names: Array<[string, string]>): Answers => ({
     harnessVariable: "ANTHROPIC_API_KEY",
     connectionKeyVariable: connectionKeyVariableFor(name),
     bounds: { maxTurns: 50, maxBudgetUsd: 5, wallClock: "30m" },
+    pollsWork: true,
   })),
   sessionsPerHour: null,
   dropped: [],
@@ -136,9 +140,9 @@ describe("the roster as the screen offers it", () => {
     const offered = rosterAgents(owned, all);
     expect(offered.map((a) => a.name)).toEqual(["mine-bot"]);
     expect(organizationsWithoutAgents(owned, all)).toEqual([]);
-    expect(withheldAgentsLine(all.length, offered.length)).toMatch(/^2 more agents are not offered/);
-    expect(withheldAgentsLine(2, 1)).toMatch(/^One more agent is not offered/);
-    expect(withheldAgentsLine(1, 1)).toBeNull();
+    expect(withheldAgentsLine(all.length - offered.length)).toMatch(/^2 agents are not shown/);
+    expect(withheldAgentsLine(1)).toMatch(/^One agent is not shown/);
+    expect(withheldAgentsLine(0)).toBeNull();
   });
 
   it("pre-selects what is configured already", () => {
@@ -237,6 +241,7 @@ describe("the defaults and the judgements", () => {
       harnessVariable: "ANTHROPIC_API_KEY",
       connectionKeyVariable: "MDBRAIN_KEY_DEV_BOT_MDDEN",
       bounds: { maxTurns: 40, maxBudgetUsd: 3, wallClock: "20m" },
+      pollsWork: true,
     });
     expect(agentDefaults("spec-warden", null, "/elsewhere").cwd).toBe("/elsewhere");
     expect(connectionKeyVariableFor("spec-warden")).toBe("MDBRAIN_KEY_SPEC_WARDEN");
@@ -369,6 +374,61 @@ describe("the defaults and the judgements", () => {
     for (const line of [...serversOwn, ...chosen]) expect(line).not.toMatch(/Poll/i);
   });
 
+  it("125-S23: the work question is offered from the chosen set, marked from the draft, then the config, then everybody", () => {
+    const options = agentChoices(roster, null).options;
+
+    const fresh = pollingChoices(["a-1", "a-2"], options, null, null);
+    expect(fresh.options.map((o) => o.value)).toEqual(["a-1", "a-2"]);
+    expect(fresh.preselected).toEqual(["a-1", "a-2"]);
+
+    const config = existing();
+    config.agents["dev-bot-mdden"].pollsWork = false;
+    expect(pollingChoices(["a-1", "a-2"], options, config, null).preselected).toEqual(["a-2"]);
+
+    const draft: ConfigureDraft = { version: DRAFT_VERSION, chosen: ["a-1", "a-2"], pollers: ["a-2"], agents: {}, dropped: [] };
+    expect(pollingChoices(["a-1", "a-2"], options, null, draft).preselected).toEqual(["a-2"]);
+
+    // An empty answer is an answer: a draft that says nobody must not be read as
+    // a draft that never reached the question, which would re-mark everybody.
+    const nobody: ConfigureDraft = { ...draft, pollers: [] };
+    expect(pollingChoices(["a-1", "a-2"], options, null, nobody).preselected).toEqual([]);
+
+    // But it answers only for the agents it was asked about. An agent marked for
+    // the first time this run was never put to the previous one, and taking its
+    // absence from `pollers` as a no would write `pollsWork: false` for an agent
+    // nobody unmarked.
+    const partial: ConfigureDraft = { version: DRAFT_VERSION, chosen: ["a-1"], pollers: [], agents: {}, dropped: [] };
+    expect(pollingChoices(["a-1", "a-2"], options, null, partial).preselected).toEqual(["a-2"]);
+    const unanswered: ConfigureDraft = { version: DRAFT_VERSION, chosen: ["a-1", "a-2"], agents: {}, dropped: [] };
+    expect(pollingChoices(["a-1", "a-2"], options, null, unanswered).preselected).toEqual(["a-1", "a-2"]);
+
+    // Nothing outside the first answer is offered, whatever the roster holds.
+    expect(pollingChoices(["a-2"], options, null, null).options.map((o) => o.value)).toEqual(["a-2"]);
+  });
+
+  it("125-S25: an identity-only entry is written as one, and the summary says which of the two each agent is", () => {
+    const answers = answersFor([["dev-bot-mdden", "a-1"], ["spec-warden", "a-2"]]);
+    answers.agents[1].pollsWork = false;
+    const config = assembleConfig(answers);
+    expect(config.agents["dev-bot-mdden"].pollsWork).toBe(true);
+    expect(config.agents["spec-warden"].pollsWork).toBe(false);
+    // The identity is written for both: what false withholds is the poll and
+    // nothing else.
+    expect(config.agents["spec-warden"].cwd).toBe(cwd);
+    expect(config.agents["spec-warden"].env.connectionKey).toBe("MDBRAIN_KEY_SPEC_WARDEN");
+
+    const lines = summaryLines(config, { path: "/c/config.json", mcpPaths: {}, removed: [] }, [], []);
+    expect(lines).toContain("    asked for work by mdbrain run");
+    expect(lines).toContain("    identity only: mdbrain as starts a session as it, and mdbrain run never asks for its work");
+    expect(lines.some((l) => l.includes("nobody to ask"))).toBe(false);
+
+    // And when nothing is asked for, the summary says so where it was decided.
+    const none = assembleConfig({ ...answers, agents: answers.agents.map((a) => ({ ...a, pollsWork: false })) });
+    expect(summaryLines(none, { path: "/c/config.json", mcpPaths: {}, removed: [] }, [], []).at(-1)).toBe(
+      "No agent here is asked for work, so mdbrain run has nobody to ask. This machine is configured for mdbrain as.",
+    );
+  });
+
   it("says nothing about a dropped rename the person then marked anyway, since it is in the file", () => {
     const config = assembleConfig(answersFor([["helper-bot", "a-7"]]));
     const lines = summaryLines(config, { path: "/c/config.json", mcpPaths: {}, removed: [] }, [], [
@@ -452,17 +512,20 @@ describe("the screen", () => {
   it("121-S3: draws the roster as an arrow-key list, asks the per-agent questions in order, and ends on the ceiling", async () => {
     let done: Answers | null = null;
     const { lastFrame, stdin } = render(
-      configureScreen(plan({ emptyOrganizations: ["quiet org"], withheld: "One more agent is not offered here." }), (a) => { done = a; }),
+      configureScreen(plan({ emptyOrganizations: ["quiet org"], withheld: "One agent is not shown here." }), (a) => { done = a; }),
     );
     await tick();
     expect(lastFrame()).toContain("Which agents does this machine run?");
     expect(lastFrame()).toContain("markdownbrain.ai / dev-bot-mdden");
     expect(lastFrame()).toContain("old-bot (disabled)");
     expect(lastFrame()).toContain("No agents yet in: quiet org.");
-    expect(lastFrame()).toContain("One more agent is not offered here.");
+    expect(lastFrame()).toContain("One agent is not shown here.");
     // Space marks the first row, Enter confirms the selection.
     stdin.write(" ");
     await tick();
+    stdin.write("\r");
+    await tick();
+    expect(lastFrame()).toContain("Which of them poll for work?");
     stdin.write("\r");
     await tick();
     expect(lastFrame()).toContain("dev-bot-mdden (1 of 1)");
@@ -491,6 +554,104 @@ describe("the screen", () => {
     expect(serializeConfig(assembleConfig(answers))).not.toContain("poll");
   });
 
+  it("125-S24: the work question follows the list, and an unmarked agent is asked no bounds", async () => {
+    let done: Answers | null = null;
+    const { lastFrame, stdin } = render(configureScreen(plan(), (a) => { done = a; }));
+    await tick();
+    // Mark both agents on the first list.
+    stdin.write(" ");
+    await tick();
+    stdin.write(DOWN);
+    await tick();
+    stdin.write(" ");
+    await tick();
+    stdin.write("\r");
+    await tick();
+
+    expect(lastFrame()).toContain("Which of them poll for work?");
+    expect(lastFrame()).toContain("mdbrain as <agent> starts a session as it");
+    // Only the two just chosen, never the third agent on the roster.
+    expect(lastFrame()).toContain("dev-bot-mdden");
+    expect(lastFrame()).toContain("spec-warden");
+    expect(lastFrame()).not.toContain("old-bot");
+
+    // Unmark the second, so one is asked for work and one is an identity.
+    stdin.write(DOWN);
+    await tick();
+    stdin.write(" ");
+    await tick();
+    stdin.write("\r");
+    await tick();
+
+    // The first is asked all six questions.
+    expect(lastFrame()).toContain("dev-bot-mdden (1 of 2)");
+    for (const _question of ["cwd", "pays-for", "variable", "turns", "budget", "wall"]) {
+      stdin.write("\r");
+      await tick();
+    }
+    expect(lastFrame()).toContain("spec-warden (2 of 2)");
+    // The second is asked the two that reach an attended session and none of the
+    // three that only bound a triggered one.
+    stdin.write("\r"); // cwd
+    await tick();
+    expect(lastFrame()).toContain("What pays for spec-warden's thinking?");
+    stdin.write("\r");
+    await tick();
+    stdin.write("\r"); // the variable
+    await tick();
+    expect(lastFrame()).not.toContain("Most turns a session of spec-warden may take.");
+    expect(lastFrame()).toContain("Most sessions an hour");
+    stdin.write("\r");
+    await tick();
+
+    const answers = done as unknown as Answers;
+    expect(answers.agents.map((a) => [a.name, a.pollsWork])).toEqual([["dev-bot-mdden", true], ["spec-warden", false]]);
+    // Defaulted rather than asked, so marking it later has something to offer.
+    expect(answers.agents[1].bounds).toEqual({ maxTurns: 50, maxBudgetUsd: 5, wallClock: "30m" });
+    expect(answers.agents[1].cwd).toBe(cwd);
+  });
+
+  it("125-S26: the work answer is recorded in the draft, and an unanswered one is not invented", async () => {
+    const drafts: ConfigureDraft[] = [];
+    const { stdin } = render(configureScreen(plan({ record: (d) => drafts.push(d) }), () => {}));
+    await tick();
+    stdin.write(" ");
+    await tick();
+    stdin.write("\r"); // the selection: recorded before the work question is answered
+    await tick();
+    expect(drafts.at(-1)?.chosen).toEqual(["a-1"]);
+    expect(drafts.at(-1)).not.toHaveProperty("pollers");
+
+    stdin.write(" "); // unmark it: this machine holds its identity and asks for no work
+    await tick();
+    stdin.write("\r");
+    await tick();
+    expect(drafts.at(-1)?.pollers).toEqual([]);
+    // Read back as text, since a draft only reaches a later run as a file.
+    expect(parseDraft(JSON.stringify(drafts.at(-1)))?.pollers).toEqual([]);
+
+    // And a run that widens the list records no answer rather than the earlier
+    // one: `chosen` is the only record of which agents an answer was given
+    // about, so keeping it beside a wider list would tell the next run that a
+    // newly marked agent had been asked and had said no.
+    const resumed: ConfigureDraft[] = [];
+    const later = render(
+      configureScreen(plan({ draft: drafts.at(-1) as ConfigureDraft, record: (d) => resumed.push(d) }), () => {}),
+    );
+    await tick();
+    later.stdin.write(DOWN);
+    await tick();
+    later.stdin.write(" ");
+    await tick();
+    later.stdin.write("\r");
+    await tick();
+    expect(resumed.at(-1)?.chosen).toEqual(["a-1", "a-2"]);
+    expect(resumed.at(-1)).not.toHaveProperty("pollers");
+    expect(
+      pollingChoices(["a-1", "a-2"], agentChoices(roster, null).options, null, resumed.at(-1) as ConfigureDraft).preselected,
+    ).toEqual(["a-1", "a-2"]);
+  });
+
   it("never asks for a connection key: it is the server's to mint and this machine's to keep", async () => {
     const { lastFrame, stdin } = render(configureScreen(plan(), () => {}));
     await tick();
@@ -512,6 +673,8 @@ describe("the screen", () => {
     stdin.write(" ");
     await tick();
     stdin.write("\r");
+    await tick();
+    stdin.write("\r"); // every marked agent is asked for work by default
     await tick();
     stdin.write("\r"); // cwd
     await tick();
@@ -539,6 +702,8 @@ describe("the screen", () => {
     await tick();
     stdin.write("\r");
     await tick();
+    stdin.write("\r"); // every marked agent is asked for work by default
+    await tick();
     // The cwd offered is the current directory, which the plan says exists.
     // Backspace through it and type one that does not.
     stdin.write(backspaces(cwd.length));
@@ -556,6 +721,8 @@ describe("the screen", () => {
     stdin.write(" ");
     await tick();
     stdin.write("\r");
+    await tick();
+    stdin.write("\r"); // every marked agent is asked for work by default
     await tick();
     stdin.write(backspaces(cwd.length));
     await tick();
@@ -576,6 +743,8 @@ describe("the screen", () => {
     stdin.write(" ");
     await tick();
     stdin.write("\r");
+    await tick();
+    stdin.write("\r"); // every marked agent is asked for work by default
     await tick();
     stdin.write(backspaces(cwd.length));
     await tick();
@@ -598,11 +767,14 @@ describe("the screen", () => {
     await tick();
     stdin.write("\r"); // the selection
     await tick();
+    stdin.write("\r"); // the agents asked for work: every one of them
+    await tick();
     stdin.write("\r"); // cwd
     await tick();
     expect(drafts.length).toBeGreaterThanOrEqual(2);
     const latest = drafts[drafts.length - 1];
     expect(latest.chosen).toEqual(["a-1"]);
+    expect(latest.pollers).toEqual(["a-1"]);
     expect(latest.agents["a-1"].cwd).toBe(cwd);
   });
 
@@ -622,6 +794,8 @@ describe("the screen", () => {
     await tick();
     // The draft marked spec-warden, not the config's dev-bot-mdden.
     stdin.write("\r");
+    await tick();
+    stdin.write("\r"); // the agents asked for work: the one the draft marked
     await tick();
     expect(lastFrame()).toContain("spec-warden (1 of 1)");
     // Five per-agent questions rather than six: the draft says the machine's own
@@ -645,6 +819,8 @@ describe("the screen", () => {
     await tick();
     stdin.write("\r"); // the pre-selected entry, confirmed as is
     await tick();
+    stdin.write("\r"); // and it keeps being asked for work
+    await tick();
     for (let i = 0; i < 6; i++) { stdin.write("\r"); await tick(); }
     stdin.write("\r"); // ceiling: Enter keeps 4
     await tick();
@@ -667,7 +843,9 @@ describe("the screen", () => {
     kept.stdin.write("\r");
     await tick();
     expect(kept.lastFrame()).toContain("Which agents does this machine run?");
-    kept.stdin.write("\r"); // still marked, so it goes straight to its questions
+    kept.stdin.write("\r"); // still marked, so it goes on to the work question
+    await tick();
+    kept.stdin.write("\r"); // and it is still asked for work
     await tick();
     expect(kept.lastFrame()).toContain("dev-bot-mdden (1 of 1)");
 
@@ -906,7 +1084,7 @@ describe("the command", () => {
       () => runConfigure(deps(), context),
     );
     expect(code).toBe(1);
-    expect(err).toEqual([NOTHING_TO_CONFIGURE]);
+    expect(err).toEqual([NOTHING_TO_MANAGE]);
     expect(existsSync(configPath())).toBe(false);
   });
 
@@ -931,7 +1109,7 @@ describe("the command", () => {
     );
     const seenPlan = seen as unknown as ScreenPlan;
     expect(seenPlan.choices.options.map((o) => o.name)).toEqual(["dev-bot-mdden"]);
-    expect(seenPlan.withheld).toMatch(/One more agent is not offered/);
+    expect(seenPlan.withheld).toMatch(/One agent is not shown/);
   });
 
   it("105-S49: the draft is offered on the way in and forgotten once the file is written", async () => {

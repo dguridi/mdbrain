@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { dispatch, parseArgv, renderHelp } from "../src/cli.ts";
 import { COMMANDS, VERSION } from "../src/main.ts";
 import { groupRoster, renderRoster } from "../src/commands/roster.ts";
+import { ownedOrganizations, rosterAgents } from "../src/configure/questions.ts";
 
 function capture() {
   const out: string[] = [];
@@ -29,7 +30,7 @@ describe("the command line", () => {
     expect(await dispatch(["--help"], COMMANDS, VERSION, io)).toBe(0);
     const help = out.join("\n");
     for (const command of COMMANDS) expect(help).toContain(command.name);
-    expect(COMMANDS.map((c) => c.name)).toEqual(["login", "whoami", "logout", "configure", "run", "upgrade"]);
+    expect(COMMANDS.map((c) => c.name)).toEqual(["login", "whoami", "logout", "configure", "run", "as", "upgrade"]);
   });
 
   it("96-S22a: every command carries a summary, so help cannot go stale silently", () => {
@@ -175,38 +176,123 @@ describe("how the process ends", () => {
 });
 
 describe("the roster whoami prints", () => {
+  // Every organization in these fixtures is owned unless a case says otherwise,
+  // since ownership is what decides whether an agent is listed at all.
+  const owns = (...ids: string[]) => ids.map((org_id) => ({ org_id, role: "owner" }));
+
   // 96-S6's shape, decided without a network.
   it("96-S6a: groups each agent under its organization", () => {
-    const groups = groupRoster(
+    const roster = groupRoster(
       [org("o1", "markdownbrain.ai"), org("o2", "Another Org")],
       [agent("a1", "o1", "dev-bot"), agent("a2", "o2", "critic"), agent("a3", "o1", "warden")],
+      owns("o1", "o2"),
     );
-    expect(groups).toEqual([
-      { organization: "markdownbrain.ai", agents: ["dev-bot", "warden"] },
+    expect(roster.groups).toEqual([
       { organization: "Another Org", agents: ["critic"] },
+      { organization: "markdownbrain.ai", agents: ["dev-bot", "warden"] },
     ]);
+    expect(roster.withheld).toBe(0);
   });
 
   // Dropping it would make an empty roster look like not being a member.
   it("96-S6b: an organization with no agents is kept", () => {
-    expect(groupRoster([org("o1", "Empty")], [])).toEqual([{ organization: "Empty", agents: [] }]);
-    expect(renderRoster("me@example.com", groupRoster([org("o1", "Empty")], []))).toContain("  (no agents)");
+    const roster = groupRoster([org("o1", "Empty")], [], owns("o1"));
+    expect(roster.groups).toEqual([{ organization: "Empty", agents: [] }]);
+    expect(renderRoster("me@example.com", roster)).toContain("  (no agents)");
   });
 
   // Two reads can disagree; silently dropping rows would hide that.
   it("96-S6c: an agent whose organization is not in the list is kept and labelled", () => {
-    const groups = groupRoster([org("o1", "Mine")], [agent("a1", "o-missing", "stray")]);
-    expect(groups).toHaveLength(2);
-    expect(groups[1].agents).toEqual(["stray"]);
-    expect(groups[1].organization).toContain("cannot read");
+    const roster = groupRoster([org("o1", "Mine")], [agent("a1", "o-missing", "stray")], owns("o1"));
+    expect(roster.groups).toHaveLength(2);
+    expect(roster.groups[1].agents).toEqual(["stray"]);
+    expect(roster.groups[1].organization).toContain("cannot read");
   });
 
   it("96-S6d: a disabled agent says so rather than looking active", () => {
-    const groups = groupRoster([org("o1", "Mine")], [agent("a1", "o1", "old-bot", "disabled")]);
-    expect(groups[0].agents).toEqual(["old-bot (disabled)"]);
+    const roster = groupRoster([org("o1", "Mine")], [agent("a1", "o1", "old-bot", "disabled")], owns("o1"));
+    expect(roster.groups[0].agents).toEqual(["old-bot (disabled)"]);
   });
 
   it("96-S6e: an account in no organization is told so, not shown nothing", () => {
-    expect(renderRoster("me@example.com", []).join("\n")).toContain("No organizations");
+    expect(renderRoster("me@example.com", groupRoster([], [], [])).join("\n")).toContain("No organizations");
+  });
+
+  it("96-S55: an agent in an organization this account does not own is not listed", () => {
+    const roster = groupRoster(
+      [org("o1", "Mine"), org("o2", "Someone else's")],
+      [agent("a1", "o1", "dev-bot"), agent("a2", "o2", "their-bot"), agent("a3", "o2", "their-other-bot")],
+      owns("o1"),
+    );
+    expect(roster.groups).toEqual([{ organization: "Mine", agents: ["dev-bot"] }]);
+    const printed = renderRoster("me@example.com", roster).join("\n");
+    expect(printed).not.toContain("their-bot");
+    expect(printed).not.toContain("Someone else's");
+  });
+
+  // A filter that is a silence reads as an agent that does not exist.
+  it("96-S56: the agents left out are counted out loud", () => {
+    const roster = groupRoster(
+      [org("o1", "Mine"), org("o2", "Theirs")],
+      [agent("a1", "o1", "dev-bot"), agent("a2", "o2", "their-bot"), agent("a3", "o2", "their-other-bot")],
+      owns("o1"),
+    );
+    expect(roster.withheld).toBe(2);
+    expect(renderRoster("me@example.com", roster).join("\n")).toContain("2 agents are not shown here");
+  });
+
+  // An expected omission and a disagreement between two reads must not share a
+  // number: folding the orphan in would hide it behind one that looks routine.
+  it("96-S57: a withheld agent and an orphan are counted apart", () => {
+    const roster = groupRoster(
+      [org("o1", "Mine"), org("o2", "Theirs")],
+      [agent("a1", "o2", "their-bot"), agent("a2", "o-missing", "stray")],
+      owns("o1"),
+    );
+    expect(roster.withheld).toBe(1);
+    expect(roster.groups[1].agents).toEqual(["stray"]);
+    const printed = renderRoster("me@example.com", roster).join("\n");
+    expect(printed).toContain("stray");
+    expect(printed).toContain("One agent is not shown here");
+  });
+
+  // Being in organizations and owning none is a different fact from being in
+  // none at all, and it has a different remedy.
+  it("96-S58: an account that owns nothing is told that, not shown an empty list", () => {
+    const roster = groupRoster([org("o1", "Theirs")], [agent("a1", "o1", "their-bot")], [{ org_id: "o1", role: "member" }]);
+    expect(roster.groups).toEqual([]);
+    expect(roster.manageable).toBe(0);
+    const printed = renderRoster("me@example.com", roster).join("\n");
+    expect(printed).not.toContain("No organizations are visible");
+    expect(printed).toContain("belong to an organization you own");
+    expect(printed).toContain("One agent is not shown here");
+  });
+
+  // An orphan is a group, so a test that only owns nothing and reads cleanly
+  // cannot tell whether the sentence is said on the count or on an empty list.
+  it("96-S58: and is told it even when an unreadable row leaves something to print", () => {
+    const roster = groupRoster([org("o1", "Theirs")], [agent("a1", "o-missing", "stray")], [{ org_id: "o1", role: "member" }]);
+    expect(roster.groups).toHaveLength(1);
+    const printed = renderRoster("me@example.com", roster).join("\n");
+    expect(printed).toContain("belong to an organization you own");
+    expect(printed).toContain("stray");
+  });
+
+  // The picker and this list are filtered by one function on purpose: an agent
+  // named here that configure will not offer is the defect either would hide.
+  it("96-S59: the list is exactly what configure would offer, in the same order", () => {
+    // Names chosen so the server's collation and this program's ordering
+    // disagree: 10 sorts before 2 as text, and after it as a number.
+    const organizations = [org("o2", "team 10"), org("o1", "team 2"), org("o3", "Theirs")];
+    const agents = [
+      agent("a1", "o2", "bot-10"),
+      agent("a2", "o1", "bot-2"),
+      agent("a3", "o2", "bot-2"),
+      agent("a4", "o3", "their-bot"),
+    ];
+    const memberships = owns("o1", "o2");
+    const listed = groupRoster(organizations, agents, memberships).groups.flatMap((g) => g.agents);
+    const offered = rosterAgents(ownedOrganizations(organizations, memberships), agents).map((a) => a.name);
+    expect(listed).toEqual(offered);
   });
 });

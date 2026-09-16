@@ -40,6 +40,7 @@ import {
   judgeSelection,
   judgeTurns,
   judgeVariable,
+  pollingChoices,
   type AgentChoices,
   type AgentDefaults,
   type Answers,
@@ -140,12 +141,20 @@ const AGENT_QUESTIONS: AgentQuestion[] = [
     write: (c, v) => ({ ...c, harnessVariable: v as string }),
     skip: (c) => c.harnessVariable === null,
   },
+  // The three bounds are not asked of an agent that polls for nothing, for the
+  // reason the harness-variable question is not asked of an account: all three
+  // bound a triggered session and an attended one has none of them — the turns
+  // and the budget are print-gated at the harness, and the wall clock is the
+  // runner's own. A question whose answer cannot reach anything is one nobody
+  // should be made to answer, and the defaults are written so that marking the
+  // agent as a poller later asks all three with something to offer.
   {
     kind: "text",
     prompt: (name) => `Most turns a session of ${name} may take.`,
     judge: (raw) => judgeTurns(raw),
     read: (c) => String(c.bounds.maxTurns),
     write: (c, v) => ({ ...c, bounds: { ...c.bounds, maxTurns: v as number } }),
+    skip: (c) => !c.pollsWork,
   },
   {
     kind: "text",
@@ -153,6 +162,7 @@ const AGENT_QUESTIONS: AgentQuestion[] = [
     judge: (raw) => judgeBudget(raw),
     read: (c) => String(c.bounds.maxBudgetUsd),
     write: (c, v) => ({ ...c, bounds: { ...c.bounds, maxBudgetUsd: v as number } }),
+    skip: (c) => !c.pollsWork,
   },
   {
     kind: "text",
@@ -160,6 +170,7 @@ const AGENT_QUESTIONS: AgentQuestion[] = [
     judge: (raw) => judgeDuration(raw),
     read: (c) => c.bounds.wallClock,
     write: (c, v) => ({ ...c, bounds: { ...c.bounds, wallClock: v as string } }),
+    skip: (c) => !c.pollsWork,
   },
 ];
 
@@ -185,8 +196,21 @@ interface AgentAnswer extends AgentDefaults {
 type Phase =
   | { kind: "rename"; index: number }
   | { kind: "agents" }
+  /** Which of the agents just marked are asked for work, offered from that answer. */
+  | { kind: "pollers" }
   | { kind: "agent"; index: number; question: number }
   | { kind: "ceiling" };
+
+/**
+ * Whether two id lists are the same selection, order disregarded.
+ *
+ * Order is the list's own and not an answer, so two spellings of one selection
+ * must not read as a change: what this decides is whether an answer given about
+ * the first list still covers the second.
+ */
+function sameIds(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && [...a].sort().join(",") === [...b].sort().join(",");
+}
 
 /** A Tab cycle in progress: what it was computed from, the matches, and where in them we are. */
 interface Completion {
@@ -199,6 +223,12 @@ interface State {
   /** Renamed entries the person chose NOT to keep — dropped, and reported as such. */
   dropped: RenamedEntry[];
   chosen: string[];
+  /**
+   * The chosen agents that will be asked for work — **null until that question
+   * has been answered**, since marking nobody is an answer to it and an empty
+   * list must not read as *not yet*.
+   */
+  pollers: string[] | null;
   agents: AgentAnswer[];
   /** The agent being asked about, built up question by question. */
   current: AgentDefaults | null;
@@ -231,6 +261,7 @@ function ConfigureScreen({ plan, onDone }: { plan: ScreenPlan; onDone: (answers:
     phase: plan.choices.renamed.length > 0 ? { kind: "rename", index: 0 } : { kind: "agents" },
     dropped: [],
     chosen: [],
+    pollers: null,
     agents: [],
     current: null,
     sessionsPerHour: plan.draft?.sessionsPerHour ?? plan.existing?.sessionsPerHour ?? null,
@@ -267,7 +298,11 @@ function ConfigureScreen({ plan, onDone }: { plan: ScreenPlan; onDone: (answers:
   });
 
   const startAgent = (s: State, index: number): State => {
-    const defaults = defaultsFor(s.chosen[index]);
+    // The list's answer overwrites the entry's own starting value, because the
+    // list is where it was just decided: an agent that was a poller last time
+    // and was unmarked a moment ago must be asked this run's questions, not last
+    // run's.
+    const defaults = { ...defaultsFor(s.chosen[index]), pollsWork: (s.pollers ?? s.chosen).includes(s.chosen[index]) };
     const first = AGENT_QUESTIONS[0].skip?.(defaults) ? nextQuestion(defaults, 0) : 0;
     // Every question is skippable in principle; a per-agent block with none left
     // would be a table nobody could answer, so it is treated as done rather than
@@ -344,13 +379,29 @@ function ConfigureScreen({ plan, onDone }: { plan: ScreenPlan; onDone: (answers:
       const id = s.chosen[s.phase.index];
       agents[id] = { id, cwd: s.current.cwd, harnessVariable: s.current.harnessVariable, bounds: s.current.bounds };
     }
-    return {
+    const draft: ConfigureDraft = {
       version: DRAFT_VERSION,
       chosen: s.chosen.length > 0 ? s.chosen : (plan.draft?.chosen ?? []),
       agents,
       dropped: s.dropped.map((d) => d.id),
       sessionsPerHour: s.sessionsPerHour,
     };
+    // Laid over the earlier draft the same way the agents are: this run has no
+    // answer to the question until it has been asked, and writing one it does
+    // not have would erase the answer a previous run left.
+    //
+    // **Only while the selection it answered is still the selection**, because
+    // `chosen` is the only record of which agents the answer was given about. A
+    // widened list recorded beside an older answer tells the next run that agent
+    // was asked and said no, and it would be written `pollsWork: false` with
+    // nobody having unmarked it — the outcome this question must not produce in
+    // silence. Where the list has changed and this run has not reached the
+    // question, there is no answer to record: the next run marks from the config
+    // and then from everybody, which is the direction that cannot withhold work.
+    const carried = sameIds(draft.chosen, plan.draft?.chosen ?? []) ? plan.draft?.pollers : undefined;
+    const pollers = s.pollers ?? carried;
+    if (pollers) draft.pollers = pollers;
+    return draft;
   };
 
   const { phase } = state;
@@ -437,8 +488,28 @@ function ConfigureScreen({ plan, onDone }: { plan: ScreenPlan; onDone: (answers:
         onSubmit: (values: string[]) => {
           const judged = judgeSelection(values, plan.choices.options);
           if (!judged.ok) setState({ ...state, problem: judged.problem });
-          else advance(startAgent({ ...state, chosen: judged.value, problem: null }, 0));
+          else advance({ ...state, chosen: judged.value, phase: { kind: "pollers" }, problem: null });
         },
+      }),
+    );
+  } else if (phase.kind === "pollers") {
+    const polling = pollingChoices(state.chosen, plan.choices.options, plan.existing, plan.draft);
+    question = h(
+      Box,
+      { flexDirection: "column" },
+      h(Text, null, "Which of them poll for work? Space unmarks one to keep its identity here without mdbrain run ever asking for its work."),
+      h(Text, { dimColor: true }, "An unmarked agent is still configured: mdbrain as <agent> starts a session as it."),
+      h(MultiSelect, {
+        // Keyed by the selection it was offered from, so going back to the list
+        // and marking a different set remounts the component rather than leaving
+        // it showing the previous answer's rows.
+        key: `pollers-${state.chosen.join(",")}`,
+        options: polling.options,
+        defaultValue: polling.preselected,
+        visibleOptionCount: Math.min(12, Math.max(1, polling.options.length)),
+        // Marking nobody is a legal answer and is not judged here: `run` says
+        // what it means, once, where it is the thing that cannot happen.
+        onSubmit: (values: string[]) => advance(startAgent({ ...state, pollers: values, problem: null }, 0)),
       }),
     );
   } else if (phase.kind === "agent") {

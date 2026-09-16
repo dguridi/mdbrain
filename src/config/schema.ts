@@ -51,6 +51,25 @@ export interface AgentEntry {
   /** The agent's row id at configure time — what tells *renamed* from *gone*. */
   id: string;
   harness: HarnessId;
+  /**
+   * Whether `run` asks for this agent's work.
+   *
+   * **False is an identity and not a lesser entry.** Everything that makes an
+   * agent runnable here — its key, its per-agent MCP file, its checkout, its
+   * harness credential — is written for it either way; what false withholds is
+   * only the poll, so `mdbrain as <agent>` starts a session as it and `mdbrain
+   * run` never names it in a claim. That is the difference between an agent this
+   * machine *can be* and an agent this machine *works as*, and it is one a
+   * person has to be able to say out loud: before it existed, holding a bot's
+   * identity meant enrolling it in the queue.
+   *
+   * **Absent is true**, which is what every file written before this field
+   * existed meant. The consequence worth knowing is the downgrade: a build older
+   * than this field reads past `pollsWork: false` and asks for that agent's
+   * work, so the field bounds a runner rather than an agent, and revoking the
+   * key is what bounds an agent.
+   */
+  pollsWork: boolean;
   /** The directory the harness is started in. Absolute. */
   cwd: string;
   env: {
@@ -206,7 +225,16 @@ function readAgent(name: string, v: unknown): AgentEntry | string {
   const bounds = readBounds(v.bounds, at);
   if (typeof bounds === "string") return bounds;
   if ("command" in v) return `${at}.command is not a field: the harness's command line is this program's, not the file's.`;
-  return { id: v.id, harness: v.harness as HarnessId, cwd: v.cwd, env: { harness, connectionKey }, bounds };
+  // Absent is true, so a file written before the field existed keeps meaning
+  // what it meant. A value that is not a boolean is refused rather than read as
+  // truthy: `"false"` is the answer a person is most likely to write by hand for
+  // this field, and taking it as *yes* would enrol an agent in the queue by the
+  // exact keystrokes meant to keep it out.
+  if (v.pollsWork !== undefined && typeof v.pollsWork !== "boolean") {
+    return `${at}.pollsWork must be true or false: true asks for this agent's work, false keeps its identity for \`mdbrain as\` and never polls it.`;
+  }
+  const pollsWork = v.pollsWork === undefined ? true : v.pollsWork;
+  return { id: v.id, harness: v.harness as HarnessId, pollsWork, cwd: v.cwd, env: { harness, connectionKey }, bounds };
 }
 
 /**
@@ -283,6 +311,12 @@ export function serializeConfig(config: Config): string {
     agents[name] = {
       id: entry.id,
       harness: entry.harness,
+      // Written only when it is false, for the same reason `env.harness` is
+      // written only when there is one: absent already means *polls*, so the
+      // file of a machine that never wanted an identity-only agent is unchanged
+      // by this field existing, and the field appears exactly where somebody
+      // decided something.
+      ...(entry.pollsWork ? {} : { pollsWork: false }),
       cwd: entry.cwd,
       env,
       bounds: { maxTurns: entry.bounds.maxTurns, maxBudgetUsd: entry.bounds.maxBudgetUsd, wallClock: entry.bounds.wallClock },
