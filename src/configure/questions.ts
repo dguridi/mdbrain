@@ -123,15 +123,20 @@ export function organizationsWithoutAgents(organizations: Organization[], agents
  * The sentence naming agents the account can see but not manage, or null when
  * there are none.
  *
- * The filter above is a silence otherwise, and a silence is the one thing a
- * list of agents must not answer with: an agent missing because it belongs to
- * somebody else's organization looks exactly like an agent that does not exist.
+ * The filter above is a silence otherwise, and in a list somebody is choosing
+ * from that is the one thing it must not be: an agent missing because it
+ * belongs to somebody else's organization looks exactly like an agent that does
+ * not exist, and the person is here precisely to find it.
+ *
+ * **The picker is the only caller, and `whoami` deliberately is not.** The same
+ * filter runs there, but that command answers which agents this machine may
+ * run, and a count of the ones it may not is an answer to a question nobody
+ * asked. Two surfaces over one filter are allowed to say different amounts
+ * about it; what they may not do is list different agents.
  *
  * It takes the count already worked out rather than the two totals to subtract,
- * because its callers reach the same number from different sides — the picker
- * from what it read against what it offered, `whoami` from what it read against
- * what it listed — and a shared subtraction only one of them means is how a
- * sentence starts being true in one place and wrong in the other.
+ * so the subtraction stays with the caller that knows which two numbers it
+ * means.
  */
 export function withheldAgentsLine(withheld: number): string | null {
   if (withheld < 1) return null;
@@ -706,8 +711,12 @@ export function summaryLines(
  * What to say about one agent's connection key.
  *
  * A failure is said in place rather than aborting the write: the configuration
- * is still correct and the person can mint a key in the app and set the variable
- * by hand, which is exactly what the sentence names.
+ * is still correct, and the agent it belongs to is the only one affected.
+ *
+ * **The remedy it names is `configure` itself**, because that is the one that works:
+ * `run` takes the key from this machine's key store and refuses the agent's work
+ * when the store has none, so a key pasted into the variable by hand would never
+ * be reached.
  */
 function connectionKeyLine(outcome: KeyOutcome | undefined, variable: string): string {
   switch (outcome?.kind) {
@@ -717,8 +726,12 @@ function connectionKeyLine(outcome: KeyOutcome | undefined, variable: string): s
       return "a fresh connection key requested from markdown-den and stored on this machine, replacing the one that was here (the old one stays live until it is revoked in the app)";
     case "held":
       return "connection key already stored on this machine, and kept (mdbrain configure --new-keys mints another)";
-    case "failed":
-      return `no connection key: ${outcome.problem}. Mint one in markdown-den's agent dialog and set ${variable} before mdbrain run.`;
+    case "failed": {
+      // Punctuated here rather than at each throw site, so that a message which
+      // ends in a full stop and one which does not read the same in the summary.
+      const problem = outcome.problem.endsWith(".") ? outcome.problem : `${outcome.problem}.`;
+      return `no connection key: ${problem} mdbrain run will refuse this agent's work until mdbrain configure stores one.`;
+    }
     default:
       return `connection key expected in ${variable}`;
   }

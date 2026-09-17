@@ -103,6 +103,13 @@ export function nothingYetMessage(organizations: string[]): string {
  * directory should not quietly leave one behind. A failure is recorded against
  * the agent it belongs to and does not stop the rest — the configuration is
  * still correct without it, and the summary says what to do.
+ *
+ * **A key that is written is read back before it is called stored**, because a
+ * store that accepts a write is not necessarily one that returns it: a macOS
+ * keychain item left by an earlier copy of this binary takes the value and
+ * refuses the read. Reading it back is what makes *stored on this machine* a
+ * checked claim, and it is checked here, where somebody is standing in front of
+ * the answer, rather than hours later in `run`.
  */
 async function ensureConnectionKeys(
   store: ConnectionKeyStore,
@@ -121,6 +128,9 @@ async function ensureConnectionKeys(
       // the key already here intact, since it may be the working one.
       const key = await mintAgentKey(accessToken, agent.id);
       await store.set(agent.id, key);
+      if ((await store.get(agent.id)) !== key) {
+        throw new Error("the key was stored, but reading it back did not return it, so this machine cannot use it");
+      }
       outcomes[agent.name] = { kind: renew ? "renewed" : "minted" };
     } catch (cause) {
       outcomes[agent.name] = { kind: "failed", problem: (cause as Error).message };

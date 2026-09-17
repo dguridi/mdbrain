@@ -393,6 +393,6 @@ describe("the roster whoami asks for", () => {
     const printed = io.out.join("\n");
     expect(printed).toContain("belong to an organization you own");
     expect(printed).not.toContain("dev-bot");
-    expect(printed).toContain("not shown here");
+    expect(printed).not.toContain("not shown here");
   });
 });

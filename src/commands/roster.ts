@@ -16,7 +16,7 @@
 // person checks when one of those fails.
 
 import type { Agent, Membership, Organization } from "../auth/api.ts";
-import { NOTHING_TO_MANAGE, compareNames, ownedOrganizations, withheldAgentsLine } from "../configure/questions.ts";
+import { NOTHING_TO_MANAGE, compareNames, ownedOrganizations } from "../configure/questions.ts";
 
 /** One organization and the agents listed under it. */
 export interface RosterGroup {
@@ -25,18 +25,20 @@ export interface RosterGroup {
 }
 
 /**
- * The roster as `whoami` prints it: what is shown, and what was left out.
+ * The roster as `whoami` prints it: the agents this account may run, grouped.
  *
  * The counts are carried rather than recomputed by the renderer because they
  * answer questions the groups cannot: an empty list means one thing to an
  * account in no organization and another to one that is in several and owns
  * none, and those are different sentences with different remedies.
+ *
+ * **Agents read but not listed are not among them, and their absence here is
+ * the point.** They belong to somebody else, this command is not asked about
+ * them, and a count carried on the roster is one line away from being printed.
  */
 export interface Roster {
   /** One per organization whose agents this account may manage, plus at most one for rows whose organization it cannot read. */
   groups: RosterGroup[];
-  /** Agents read but not listed, because their organization is not this account's to manage. */
-  withheld: number;
   /** Organizations this account can read at all, owned or not. */
   visible: number;
   /** How many of those it may manage agents in. */
@@ -58,13 +60,13 @@ const UNREADABLE_ORGANIZATION = "(an organization this account cannot read)";
  * organization and it has no agents" is an answer, and dropping it would make an
  * empty roster indistinguishable from not being a member.
  *
- * The two ways an agent goes unlisted are counted separately and must not be
+ * The two ways an agent goes unlisted are still told apart, and must not be
  * merged. An agent in an organization that was *read* but is not owned is
- * **withheld** — expected, and reported as a count. An agent whose `org_id`
- * matches no organization at all is an **orphan**, kept under a heading that
- * says so: it means the two reads disagreed, which is possible since they are
- * two requests, and folding it into the withheld count would hide it behind a
- * number that looks routine.
+ * **withheld**: expected, somebody else's, and dropped without a trace. An
+ * agent whose `org_id` matches no organization at all is an **orphan**, kept
+ * under a heading that says so: it means the two reads disagreed, which is
+ * possible since they are two requests, and dropping it alongside the withheld
+ * would lose a disagreement in the same silence as a routine omission.
  *
  * **Ordered by `compareNames`, not by the order the rows arrived in**, and for
  * the same reason the picker is: the two lists are supposed to be the same list,
@@ -80,15 +82,16 @@ export function groupRoster(organizations: Organization[], agents: Agent[], memb
   const readable = new Set(organizations.map((o) => o.id));
 
   const orphans: string[] = [];
-  let withheld = 0;
   // Sorted on the display name rather than the label, so a disabled agent keeps
   // its place in the list instead of being ordered by its parenthesis.
   for (const agent of [...agents].sort((a, b) => compareNames(a.display_name, b.display_name))) {
     const label = agent.status === "active" ? agent.display_name : `${agent.display_name} (${agent.status})`;
     const bucket = byOrg.get(agent.org_id);
+    // The middle case is the withheld one: an agent whose organization was read
+    // and is not owned goes nowhere at all, which is why there is no branch for
+    // it to go into.
     if (bucket) bucket.push(label);
-    else if (readable.has(agent.org_id)) withheld += 1;
-    else orphans.push(label);
+    else if (!readable.has(agent.org_id)) orphans.push(label);
   }
 
   const groups = owned
@@ -98,13 +101,20 @@ export function groupRoster(organizations: Organization[], agents: Agent[], memb
     }))
     .sort((a, b) => compareNames(a.organization, b.organization));
   if (orphans.length > 0) groups.push({ organization: UNREADABLE_ORGANIZATION, agents: orphans });
-  return { groups, withheld, visible: organizations.length, manageable: owned.length };
+  return { groups, visible: organizations.length, manageable: owned.length };
 }
 
 /** The sentence for an account that belongs to no organization at all. */
 const NO_ORGANIZATIONS = "No organizations are visible to this account.";
 
-/** Render the roster as the lines `whoami` prints. */
+/**
+ * Render the roster as the lines `whoami` prints.
+ *
+ * **It ends on the last group**, and the agents this account may not run are
+ * not mentioned on the way there. The question the command answers is which
+ * agents this machine may run; how many belong to organizations it does not own
+ * answers a different one, and the person reading can do nothing with it.
+ */
 export function renderRoster(account: string, roster: Roster): string[] {
   const lines = [`Signed in as ${account}.`, ""];
   // Said on the count rather than on an empty list, because an orphan group is
@@ -122,7 +132,5 @@ export function renderRoster(account: string, roster: Roster): string[] {
     if (group.agents.length === 0) lines.push("  (no agents)");
     else for (const agent of group.agents) lines.push(`  ${agent}`);
   }
-  const withheld = withheldAgentsLine(roster.withheld);
-  if (withheld) lines.push("", withheld);
   return lines;
 }

@@ -1389,6 +1389,21 @@ describe("run: the command, driven end to end", () => {
     expect(noKey.rows[0]).toMatchObject({ outcome: "spawn-failed" });
   });
 
+  it("a key store that refuses the read is an outcome carrying the refusal, and not a crash", async () => {
+    const refused = await drive({
+      openKeyStore: async () => ({
+        backend: { kind: "keychain", where: "the operating system's keychain" },
+        get: async () => {
+          throw new Error("this machine's keychain will not let this copy of mdbrain read a key an earlier copy stored");
+        },
+        set: async () => {},
+        forget: async () => {},
+      }),
+    });
+    expect(refused.out.join("\n")).toContain("will not let this copy of mdbrain read");
+    expect(refused.rows[0]).toMatchObject({ outcome: "spawn-failed" });
+  });
+
   it("what is spawned is what the harness built, with the connection key in the child", async () => {
     const spawned = await drive();
     expect(spawned.spawned[0].command).toBe("claude");

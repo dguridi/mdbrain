@@ -25,11 +25,23 @@ import {
   syncMcpConfigs,
   writeMcpConfig,
 } from "../src/config/store.ts";
-import { keyStorageLine, openConnectionKeyStore, secretsPath } from "../src/config/secrets.ts";
+import { keychainStore, keyStorageLine, openConnectionKeyStore, secretsPath, type BunSecrets } from "../src/config/secrets.ts";
 import { DRAFT_VERSION } from "../src/configure/questions.ts";
 import { configPath } from "../src/config/paths.ts";
 
 const cwd = process.platform === "win32" ? "C:\\work\\checkout" : "/work/checkout";
+
+const keychain = (over: Partial<BunSecrets> = {}): BunSecrets => ({
+  get: async () => null,
+  set: async () => {},
+  delete: async () => true,
+  ...over,
+});
+
+// errSecAuthFailed as macOS raises it: the code, and its own sentence about a
+// password that nobody typed.
+const refusal = () =>
+  Object.assign(new Error("The user name or passphrase you entered is not correct."), { code: -25293 });
 
 const good = (over: Record<string, unknown> = {}) => ({
   version: 1,
@@ -477,5 +489,122 @@ describe("the connection key store", () => {
     await store.set("a-1", "kept");
     expect(await store.get("a-1")).toBe("kept");
     expect(existsSync(secretsPath())).toBe(false);
+  });
+
+  it("105-S51: a keychain that gives back what it took is written once, and no item is deleted", async () => {
+    const calls: string[] = [];
+    const held = new Map([["a-1", "put-here-by-an-older-copy"]]);
+    const store = keychainStore(
+      keychain({
+        async get({ name }) {
+          calls.push(`get ${name}`);
+          return held.get(name) ?? null;
+        },
+        async set({ name, value }) {
+          calls.push(`set ${name}`);
+          held.set(name, value);
+        },
+        async delete({ name }) {
+          calls.push(`delete ${name}`);
+          return held.delete(name);
+        },
+      }),
+    );
+
+    await store.set("a-1", "fresh");
+    expect(calls).toEqual(["set a-1", "get a-1"]);
+    expect(held.get("a-1")).toBe("fresh");
+  });
+
+  it("105-S51: a keychain that takes the write and refuses the read has the item deleted and written again", async () => {
+    const calls: string[] = [];
+    const held = new Map([["a-1", "put-here-by-an-older-copy"]]);
+    // The item belongs to a copy of the binary that no longer exists: this one
+    // may write it and may not read it, until it is created afresh.
+    let ownedByAnEarlierCopy = true;
+    const store = keychainStore(
+      keychain({
+        async get({ name }) {
+          calls.push(`get ${name}`);
+          if (ownedByAnEarlierCopy) throw refusal();
+          return held.get(name) ?? null;
+        },
+        async set({ name, value }) {
+          calls.push(`set ${name}`);
+          held.set(name, value);
+        },
+        async delete({ name }) {
+          calls.push(`delete ${name}`);
+          ownedByAnEarlierCopy = false;
+          return held.delete(name);
+        },
+      }),
+    );
+
+    await store.set("a-1", "fresh");
+    expect(calls).toEqual(["set a-1", "get a-1", "delete a-1", "set a-1"]);
+    expect(await store.get("a-1")).toBe("fresh");
+  });
+
+  it("105-S51: a refused write leaves the key that was already there, and names the write rather than the read", async () => {
+    const held = new Map([["a-1", "the-key-that-still-works"]]);
+    const store = keychainStore(
+      keychain({
+        get: async ({ name }) => held.get(name) ?? null,
+        set: async () => {
+          throw refusal();
+        },
+        delete: async () => {
+          throw new Error("the delete must not be reached: it would cost the key that still works");
+        },
+      }),
+    );
+
+    const problem = await store.set("a-1", "fresh").then(
+      () => null,
+      (cause: Error) => cause.message,
+    );
+    expect(problem).toMatch(/will not let this copy of mdbrain store a key under a-1/);
+    expect(problem).toMatch(/security delete-generic-password -s mdbrain -a a-1/);
+    expect(problem).not.toMatch(/passphrase/);
+    expect(held.get("a-1")).toBe("the-key-that-still-works");
+  });
+
+  it("105-S51: a keychain that refuses a read says which copy of mdbrain it refused, not that a password was wrong", async () => {
+    const byCode = keychainStore(
+      keychain({
+        get: async () => {
+          throw refusal();
+        },
+      }),
+    );
+    const byMessage = keychainStore(
+      keychain({
+        get: async () => {
+          throw new Error("The user name or passphrase you entered is not correct. (code: -25293)");
+        },
+      }),
+    );
+
+    for (const store of [byCode, byMessage]) {
+      const problem = await store.get("a-1").then(
+        () => null,
+        (cause: Error) => cause.message,
+      );
+      expect(problem).toMatch(/will not let this copy of mdbrain read a key an earlier copy stored/);
+      expect(problem).toMatch(/mdbrain configure --new-keys/);
+      expect(problem).not.toMatch(/passphrase/);
+    }
+  });
+
+  it("105-S51: any other keychain failure is passed on as it came", async () => {
+    const store = keychainStore(
+      keychain({
+        get: async () => {
+          throw new Error("the keyring daemon is not running");
+        },
+      }),
+    );
+    await expect(store.get("a-1")).rejects.toThrow("the keyring daemon is not running");
   });
 });

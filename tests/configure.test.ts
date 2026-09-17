@@ -326,7 +326,7 @@ describe("the defaults and the judgements", () => {
     expect(reading.kind === "config" && reading.config).toEqual(config);
   });
 
-  it("says what happened to each connection key, and names the manual route when one could not be had", () => {
+  it("says what happened to each connection key, and names the route that works when one could not be had", () => {
     const answers = answersFor([["dev-bot-mdden", "a-1"], ["spec-warden", "a-2"]]);
     answers.agents[0].harnessVariable = null;
     const config = assembleConfig(answers);
@@ -338,7 +338,10 @@ describe("the defaults and the judgements", () => {
     expect(lines.some((l) => l.includes("already stored on this machine, and kept"))).toBe(true);
     const failed = lines.find((l) => l.includes("no connection key"));
     expect(failed).toMatch(/Only the organization owner can manage agents/);
-    expect(failed).toMatch(/MDBRAIN_KEY_SPEC_WARDEN/);
+    expect(failed).toMatch(/mdbrain configure stores one/);
+    // `run` takes the key from this machine's key store and never from the
+    // variable, so naming the variable here would be a remedy that cannot work.
+    expect(failed).not.toMatch(/MDBRAIN_KEY_SPEC_WARDEN/);
   });
 
   it("the summary names each agent, its directory, its credentials, the gone ones, the dropped ones and the removed files", () => {
@@ -1058,6 +1061,53 @@ describe("the command", () => {
     expect(code).toBe(0);
     expect(store.held.get("a-1")).toBe("smd_agent_abcdef01_minted");
     expect(out.some((l) => l.includes("a fresh connection key requested"))).toBe(true);
+  });
+
+  it("105-S50: a key the store takes and will not give back is reported against its agent, not called stored", async () => {
+    validSession();
+    let written = false;
+    const refusing: ConnectionKeyStore = {
+      backend: { kind: "keychain", where: "the operating system's keychain" },
+      async get() {
+        if (!written) return null;
+        throw new Error("this machine's keychain will not let this copy of mdbrain read a key an earlier copy stored");
+      },
+      async set() {
+        written = true;
+      },
+      async forget() {},
+    };
+    const { out, context } = io();
+    const code = await withFetch(rosterReply, () => runConfigure(deps({ openKeyStore: async () => refusing }), context));
+    expect(code).toBe(0);
+    expect(existsSync(configPath())).toBe(true);
+    expect(out.some((l) => l.includes("no connection key") && l.includes("will not let this copy of mdbrain"))).toBe(true);
+    expect(out.some((l) => l.includes("stored on this machine"))).toBe(false);
+  });
+
+  // Both halves of *did not return it*: a store that answers nothing after the
+  // write, and one that answers a value which is not the key just written. Only
+  // the second tells the read-back's comparison against the key apart from a
+  // bare check for null. Each answers nothing *before* the write, because a
+  // store already holding something for the agent is `held` and never written.
+  it.each([
+    ["answers nothing", null],
+    ["answers a different value", "a-key-this-machine-never-asked-for"],
+  ])("105-S50: a key the store %s for is not a key stored on this machine", async (_name, answer) => {
+    validSession();
+    let written = false;
+    const forgetful: ConnectionKeyStore = {
+      backend: { kind: "keychain", where: "the operating system's keychain" },
+      get: async () => (written ? answer : null),
+      set: async () => {
+        written = true;
+      },
+      forget: async () => {},
+    };
+    const { out, context } = io();
+    const code = await withFetch(rosterReply, () => runConfigure(deps({ openKeyStore: async () => forgetful }), context));
+    expect(code).toBe(0);
+    expect(out.some((l) => l.includes("no connection key") && l.includes("did not return it"))).toBe(true);
   });
 
   it("105-S43: an owner whose organizations hold no agent yet is told to create one, not told about ownership", async () => {

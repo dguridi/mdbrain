@@ -191,7 +191,6 @@ describe("the roster whoami prints", () => {
       { organization: "Another Org", agents: ["critic"] },
       { organization: "markdownbrain.ai", agents: ["dev-bot", "warden"] },
     ]);
-    expect(roster.withheld).toBe(0);
   });
 
   // Dropping it would make an empty roster look like not being a member.
@@ -230,30 +229,32 @@ describe("the roster whoami prints", () => {
     expect(printed).not.toContain("Someone else's");
   });
 
-  // A filter that is a silence reads as an agent that does not exist.
-  it("96-S56: the agents left out are counted out loud", () => {
+  it("96-S56: the agents left out are not mentioned at all", () => {
     const roster = groupRoster(
       [org("o1", "Mine"), org("o2", "Theirs")],
       [agent("a1", "o1", "dev-bot"), agent("a2", "o2", "their-bot"), agent("a3", "o2", "their-other-bot")],
       owns("o1"),
     );
-    expect(roster.withheld).toBe(2);
-    expect(renderRoster("me@example.com", roster).join("\n")).toContain("2 agents are not shown here");
+    const printed = renderRoster("me@example.com", roster);
+    expect(printed.join("\n")).not.toContain("not shown here");
+    // The last line is an agent, so a blank line left holding the place of the
+    // sentence fails this as surely as the sentence itself would.
+    expect(printed.at(-1)).toBe("  dev-bot");
   });
 
   // An expected omission and a disagreement between two reads must not share a
-  // number: folding the orphan in would hide it behind one that looks routine.
-  it("96-S57: a withheld agent and an orphan are counted apart", () => {
+  // fate: dropping the orphan into the same silence would lose it.
+  it("96-S57: a withheld agent is silent and an orphan is still listed", () => {
     const roster = groupRoster(
       [org("o1", "Mine"), org("o2", "Theirs")],
       [agent("a1", "o2", "their-bot"), agent("a2", "o-missing", "stray")],
       owns("o1"),
     );
-    expect(roster.withheld).toBe(1);
     expect(roster.groups[1].agents).toEqual(["stray"]);
     const printed = renderRoster("me@example.com", roster).join("\n");
     expect(printed).toContain("stray");
-    expect(printed).toContain("One agent is not shown here");
+    expect(printed).not.toContain("their-bot");
+    expect(printed).not.toContain("not shown here");
   });
 
   // Being in organizations and owning none is a different fact from being in
@@ -262,10 +263,15 @@ describe("the roster whoami prints", () => {
     const roster = groupRoster([org("o1", "Theirs")], [agent("a1", "o1", "their-bot")], [{ org_id: "o1", role: "member" }]);
     expect(roster.groups).toEqual([]);
     expect(roster.manageable).toBe(0);
-    const printed = renderRoster("me@example.com", roster).join("\n");
+    const lines = renderRoster("me@example.com", roster);
+    const printed = lines.join("\n");
     expect(printed).not.toContain("No organizations are visible");
     expect(printed).toContain("belong to an organization you own");
-    expect(printed).toContain("One agent is not shown here");
+    expect(printed).not.toContain("not shown here");
+    // There is no group for the sentence to be separated from, so nothing may
+    // follow it: a blank line pushed whether or not there is a group ends the
+    // output on one, which reads as a list that was cut off.
+    expect(lines.at(-1)).toContain("belong to an organization you own");
   });
 
   // An orphan is a group, so a test that only owns nothing and reads cleanly
@@ -273,9 +279,14 @@ describe("the roster whoami prints", () => {
   it("96-S58: and is told it even when an unreadable row leaves something to print", () => {
     const roster = groupRoster([org("o1", "Theirs")], [agent("a1", "o-missing", "stray")], [{ org_id: "o1", role: "member" }]);
     expect(roster.groups).toHaveLength(1);
-    const printed = renderRoster("me@example.com", roster).join("\n");
+    const lines = renderRoster("me@example.com", roster);
+    const printed = lines.join("\n");
     expect(printed).toContain("belong to an organization you own");
     expect(printed).toContain("stray");
+    // And here there is something to separate it from, so the blank line is
+    // owed: the sentence and the heading are two facts, not one paragraph.
+    const heading = lines.findIndex((line) => line.includes("cannot read"));
+    expect(lines[heading - 1]).toBe("");
   });
 
   // The picker and this list are filtered by one function on purpose: an agent

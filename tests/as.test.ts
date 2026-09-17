@@ -263,6 +263,22 @@ describe("as: startup and the refusals", () => {
     expect(broken.captured.errors[0]).not.toContain("mdbrain configure");
   });
 
+  it("a key store that refuses the read is a sentence and exit 1, and not a crash", async () => {
+    const refusing = harness({
+      openKeyStore: () =>
+        Promise.resolve({
+          get: () =>
+            Promise.reject(
+              new Error("this machine's keychain will not let this copy of mdbrain read a key an earlier copy stored"),
+            ),
+        } as unknown as Awaited<ReturnType<AsDeps["openKeyStore"]>>),
+    });
+    expect(await runAs(refusing.deps, refusing.context)).toBe(1);
+    expect(refusing.captured.errors[0]).toContain("The connection key could not be read");
+    expect(refusing.captured.errors[0]).toContain("will not let this copy of mdbrain read");
+    expect(refusing.captured.started).toEqual([]);
+  });
+
   it("125-S12: a connection key named ANTHROPIC_API_KEY is the collision refusal", async () => {
     const { deps, context, captured } = harness({
       loadConfiguration: () =>
