@@ -100,8 +100,13 @@ export function refusedMessage(sentence: string, call: RefusedCall, status: numb
  *
  * The one function both the printed line and the written row go through, so the
  * screen and the file can never hold different versions of the same refusal.
+ *
+ * **Exported because the refusal to start does not share a code path with the
+ * refused poll**: it is composed in one module and recorded in another, and two
+ * normalisations of one server's words is exactly the divergence this exists to
+ * prevent. Applying it twice changes nothing, so either side may.
  */
-function serverWords(detail: string): string {
+export function serverWords(detail: string): string {
   return redactSecrets(detail).replace(/\s+/g, " ").trim().slice(0, SAID_LIMIT).trim();
 }
 
@@ -162,6 +167,33 @@ export interface RefusedRow {
   said: string;
 }
 
+/**
+ * One `run` refused for being too old, which is the ending this file exists for.
+ *
+ * **Its own kind rather than a `refused` row**, and the distinction is the whole
+ * point of having it: `refused` means the session went, and a version floor is
+ * not a session problem. A reader who cannot tell the two apart is sent to
+ * re-authenticate over a binary that needs replacing.
+ */
+export interface TooOldRow {
+  kind: "too-old";
+  at: string;
+  /** The version this build sent, so the row names what was refused. */
+  version: string;
+  /**
+   * The version the **server** says it received, or null when it received none.
+   *
+   * Beside `version` rather than instead of it, because the two differ exactly
+   * when something between the runner and the server removed the header — and a
+   * row naming a version above its own floor is unreadable without that fact.
+   */
+  received: string | null;
+  /** The floor the server named, or null when its answer did not carry one. */
+  minimum: string | null;
+  /** The server's own words, redacted and capped exactly as a refusal's are. */
+  said: string;
+}
+
 /** One `run` ending, and why — the fact no file has ever held. */
 export interface StopRow {
   kind: "stop";
@@ -173,7 +205,7 @@ export interface StopRow {
   sessions: number;
 }
 
-export type DiagnosisRow = StartRow | RefusedRow | StopRow;
+export type DiagnosisRow = StartRow | RefusedRow | TooOldRow | StopRow;
 
 /** What a starting `run` is recorded as. */
 export function startRow(at: Date, facts: Omit<StartRow, "kind" | "at">): StartRow {
@@ -188,6 +220,17 @@ export function startRow(at: Date, facts: Omit<StartRow, "kind" | "at">): StartR
  */
 export function refusedRow(at: Date, call: RefusedCall, status: number, detail: string): RefusedRow {
   return { kind: "refused", at: at.toISOString(), call, status, said: serverWords(detail) };
+}
+
+/**
+ * What a refused start is recorded as.
+ *
+ * @param facts what this build is, what the server saw, the floor it named, and
+ *   its **own** words — not the sentence shown to the person, which carries a
+ *   remedy only this program could compose
+ */
+export function tooOldRow(at: Date, facts: Omit<TooOldRow, "kind" | "at">): TooOldRow {
+  return { kind: "too-old", at: at.toISOString(), ...facts, said: serverWords(facts.said) };
 }
 
 /** What a stopping `run` is recorded as. */

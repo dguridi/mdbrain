@@ -20,6 +20,8 @@
 
 import { ANON_KEY, APP_URL, PROJECT_URL } from "./project.ts";
 import type { StoredSession } from "./session.ts";
+import { STARTUP_ASK_TIMEOUT_MS, versionHeader } from "../upgrade/floor.ts";
+import { VERSION } from "../version.ts";
 
 /** What the token endpoint hands back, reduced to the three fields kept. */
 interface TokenResponse {
@@ -62,9 +64,18 @@ function headers(accessToken?: string): Record<string, string> {
  * No `apikey`: these are Next.js routes rather than PostgREST, and the bearer is
  * the whole of what authorises them — the same human session `mdbrain login`
  * obtained, judged by row-level security once it reaches the database.
+ *
+ * **Every one of them names this build's version**, which is what lets a server
+ * tell an old runner from a new one — it could not before, and a floor it cannot
+ * see is a floor it cannot set. It is one header carrying one fact: the channel,
+ * the target and the engine are known here too and are deliberately not sent.
  */
 function appHeaders(accessToken: string): Record<string, string> {
-  return { "content-type": "application/json", authorization: `Bearer ${accessToken}` };
+  return {
+    "content-type": "application/json",
+    authorization: `Bearer ${accessToken}`,
+    ...versionHeader(VERSION),
+  };
 }
 
 /**
@@ -77,11 +88,21 @@ function appHeaders(accessToken: string): Record<string, string> {
  * `www.`. Naming it costs one branch and saves the next person the hour it cost
  * to find, so the redirect is reported with the address it wanted to go to.
  */
-async function postToApp(path: string, accessToken: string, body: unknown): Promise<Response> {
+async function callApp(
+  method: "GET" | "POST",
+  path: string,
+  accessToken: string,
+  body?: unknown,
+  signal?: AbortSignal,
+): Promise<Response> {
+  // The body is spread in rather than set to undefined: a `body` key holding
+  // undefined is not the same as no body to a type that says what a request may
+  // carry, and the question the floor asks carries none.
   const res = await fetch(`${APP_URL}${path}`, {
-    method: "POST",
+    method,
     headers: appHeaders(accessToken),
-    body: JSON.stringify(body),
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    ...(signal === undefined ? {} : { signal }),
     redirect: "manual",
   });
   if (res.status >= 300 && res.status < 400) {
@@ -92,6 +113,11 @@ async function postToApp(path: string, accessToken: string, body: unknown): Prom
     );
   }
   return res;
+}
+
+/** POST to one of the app's own routes. The verb every call but the floor's takes. */
+function postToApp(path: string, accessToken: string, body: unknown): Promise<Response> {
+  return callApp("POST", path, accessToken, body);
 }
 
 /** Read a token response into a session, or say why it is not one. */
@@ -361,6 +387,64 @@ export async function listWorkspaceNames(
   return names;
 }
 
+/** Where the startup question is asked, which the two work calls deliberately do not share. */
+const RUNNER_START_PATH = "/api/runner/start";
+
+/** What the server answered when asked whether this build may start. */
+export interface StartupAnswer {
+  status: number;
+  /** The server's own words when it refused, or "" when it did not. */
+  said: string;
+  /** The floor it named, when its answer carried one. */
+  minimum: string | null;
+  /** The version it says it received, which is null when the header did not reach it. */
+  sent: string | null;
+}
+
+/**
+ * Ask whether a runner of this version may start.
+ *
+ * Asked once, before the first poll, by a command that takes work — and on a
+ * route the count and the claim do not share, so that *a run already going is
+ * never refused for being old* is a property of where the question lives rather
+ * than of how a condition happens to be written.
+ *
+ * **A failure is the caller's to read as permission.** This throws what `fetch`
+ * throws and reports what the server said; it does not decide, and the decision
+ * — that only a refusal refuses, and silence never does — is `upgrade/floor.ts`'s.
+ *
+ * **Bounded, because it is asked in front of everything else.** A host that
+ * accepts a connection and never answers would otherwise hold the command at a
+ * blank terminal for `fetch`'s own timeout, and an abandoned question is a start
+ * rather than a refusal.
+ *
+ * @returns the status, the server's sentence, the floor it named, and the version
+ *   it says arrived
+ */
+export async function askToStart(accessToken: string): Promise<StartupAnswer> {
+  const res = await callApp("GET", RUNNER_START_PATH, accessToken, undefined, AbortSignal.timeout(STARTUP_ASK_TIMEOUT_MS));
+  if (res.ok) return { status: res.status, said: "", minimum: null, sent: null };
+  // Read once and read here, rather than through `readError`: the floor travels
+  // as a field beside the sentence, and a body can only be consumed once — so a
+  // second reader would get the words and lose the number.
+  const text = await res.text().catch(() => "");
+  let said = text;
+  let minimum: string | null = null;
+  let sent: string | null = null;
+  try {
+    const body: unknown = JSON.parse(text);
+    if (typeof body === "object" && body !== null) {
+      const record = body as Record<string, unknown>;
+      if (typeof record.error === "string") said = record.error;
+      if (typeof record.minimum === "string") minimum = record.minimum;
+      if (typeof record.sent === "string") sent = record.sent;
+    }
+  } catch {
+    // Not JSON at all, which is what a proxy or an error page answers with. The
+    // words are whatever came back, and the caller caps and redacts them.
+  }
+  return { status: res.status, said: said.trim(), minimum, sent };
+}
 /**
  * How much work is waiting for these agents, without taking any of it.
  *

@@ -7,7 +7,8 @@
 // **The roster is drawn even when every row is idle**, which is what it will
 // spend most of its life doing. A long-running mostly-silent process that draws
 // almost nothing is exactly the shape that gets mistaken for a shell that was
-// handed back, so the frame, the command's name and the countdown stay on screen.
+// handed back, so the frame, the program's name and build, and the countdown
+// stay on screen.
 //
 // **The clock lives here, and it only subtracts.** The runner says when the next
 // poll is due; this counts the seconds down to it. A redraw a second is
@@ -27,7 +28,7 @@
 import { createElement as h, useEffect, useState, type ReactElement } from "react";
 import { Box, Text, render, useInput, useStdin } from "ink";
 import { Spinner } from "@inkjs/ui";
-import { agoText, clockText, costText, dayText, durationText, plainLine, shortClaim, type Presenter, type RunEvent } from "./present.ts";
+import { agoText, clockText, costText, dayText, durationText, plainLine, RUN_TITLE, shortClaim, type Presenter, type RunEvent } from "./present.ts";
 import { actionForKey, keyHints, type ViewRequest } from "./keys.ts";
 import { OUTCOME_KINDS } from "./outcome.ts";
 import {
@@ -338,7 +339,7 @@ export function liveView(state: ViewState, frame: ScreenFrame): ReactElement {
   // can hold an agent the roster does not — an event about an agent the view was
   // never told about is still drawn, which is the point of that rule.
   const width = Math.max(1, ...state.agents.map((a) => a.agent.length), ...state.recent.map((r) => r.agent.length));
-  const children: ReactElement[] = [h(Text, { key: "title", color: FRAME_COLOR, bold: true }, "mdbrain run")];
+  const children: ReactElement[] = [h(Text, { key: "title", color: FRAME_COLOR, bold: true }, RUN_TITLE)];
   for (const line of state.summary.slice(1)) {
     children.push(h(Text, { key: `summary-${line}`, dimColor: true }, line));
   }

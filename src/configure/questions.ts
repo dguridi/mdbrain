@@ -35,6 +35,7 @@
 
 import { basename, dirname, isAbsolute, join, resolve as resolvePath, sep } from "node:path";
 import type { Agent, Membership, Organization } from "../auth/api.ts";
+import type { SecretBackend } from "../config/secrets.ts";
 import {
   CONFIG_VERSION,
   DEFAULT_BOUNDS,
@@ -50,6 +51,40 @@ import {
 
 /** The variable the one harness reads its own credential from. */
 export const HARNESS_CREDENTIAL_VARIABLE = "ANTHROPIC_API_KEY";
+
+/**
+ * What to say before the keys are asked for, when something may ask back.
+ *
+ * **macOS is the only place a keychain asks whether *this program* may use an
+ * item**, and the dialog it raises offers three answers that are not
+ * equivalent: *Always Allow* adds this binary to the item's access list, while
+ * *Allow* grants exactly one read — a grant spent before this command has
+ * finished reading the key back, and gone by the next time anything needs it.
+ * The dialog is the platform's and cannot be reworded; this is the line beside
+ * it, and it is the cheapest thing that can be done about a person choosing the
+ * middle button because it is the one that sounds like yes.
+ *
+ * **Printed before the keys are asked for rather than in the summary**, which
+ * is the whole of why it is a line of its own: a summary is read after the
+ * dialog has already been answered, and advice about a choice already made is
+ * not advice.
+ *
+ * Null everywhere else — on the file fallback, and on Windows and Linux, whose
+ * stores protect an item by the user account and never ask an application to
+ * identify itself. This is a fact about what a person is about to see, not a
+ * branch in how a key is stored: which store is used is decided once, honestly,
+ * in `secrets.ts`, and nothing here changes it.
+ *
+ * @param backend where keys are about to be kept
+ * @param platform the value of `process.platform`, handed in so this stays pure
+ */
+export function keychainGrantLine(backend: SecretBackend, platform: string): string | null {
+  if (platform !== "darwin" || backend.kind !== "keychain") return null;
+  return (
+    "macOS may ask whether mdbrain can use the key it keeps in your keychain. Choose Always Allow: " +
+    "Allow grants a single read, so you will be asked for your password again every time mdbrain needs it."
+  );
+}
 
 /** One agent as the roster describes it, with its organization named. */
 export interface RosterAgent {

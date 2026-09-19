@@ -14,9 +14,11 @@ import {
 } from "../src/run/loop.ts";
 import { childEnvironment, claudeHarness, harnessFor, type Invocation } from "../src/run/harness.ts";
 import { OUTCOME_KINDS, UNREADABLE_OUTCOME_MESSAGE, readOutcome, resultObject, type OutcomeKind, type SessionEnd } from "../src/run/outcome.ts";
+import { holdConnectionKeys } from "../src/run/connection-keys.ts";
 import { logRow, rowText } from "../src/run/log.ts";
 import { SIGNAL_DEBOUNCE_MS, SIGNAL_MIN_GAP_MS } from "../src/run/signal.ts";
-import { agoText, clockText, costText, dayLine, durationText, plainLine, plainPresenter, shortClaim, type RunEvent } from "../src/run/present.ts";
+import { agoText, clockText, costText, dayLine, durationText, plainLine, plainPresenter, RUN_TITLE, shortClaim, type RunEvent } from "../src/run/present.ts";
+import { VERSION } from "../src/version.ts";
 import { POLL_MS, type Config } from "../src/config/schema.ts";
 
 import type { WorkUnit } from "../src/work/instruction.ts";
@@ -194,7 +196,7 @@ describe("run: startup", () => {
     expect(text).toContain("Connection keys are held in a file.");
   });
 
-  it("121-S17: a healthy runner with a working keychain says its name and where the log is, and nothing else", () => {
+  it("121-S17: a healthy runner with a working keychain says its name and build and where the log is, and nothing else", () => {
     const plan = planStartup(
       config({ alice: entry(), bob: entry() }),
       { ANTHROPIC_API_KEY: "x" },
@@ -205,7 +207,7 @@ describe("run: startup", () => {
     // Two lines rather than six, and the live view draws one of them: the block
     // sat above a roster that already names every agent, and a countdown that
     // already says when the next poll is.
-    expect(summaryLines(plan, "/state/runs.jsonl", null)).toEqual(["mdbrain run", "  Run log: /state/runs.jsonl"]);
+    expect(summaryLines(plan, "/state/runs.jsonl", null)).toEqual([RUN_TITLE, "  Run log: /state/runs.jsonl"]);
   });
 
   it("121-S18: a held agent keeps its line and its reason, which is the fact nothing else on screen carries", () => {
@@ -749,6 +751,7 @@ async function drive(over: Partial<import("../src/commands/run.ts").RunDeps> = {
     roster: async () => [{ id: "agent-1", org_id: "o", display_name: "dev-bot-mdden", status: "active", bot_user_id: "u-agent-1" }],
     count: async () => ({ waiting: 1, capped: false }),
     claim: async () => ({ work: [unit()], refused: [] }),
+    askToStart: async () => ({ status: 200, said: "", minimum: null, sent: "0.1.0" }),
     startSession: async (request) => {
       spawned.push(request.spawnable);
       return { stdout: good(), stderr: "", exitCode: 0, timedOut: false, stopped: false, signal: null, spawnProblem: null };
@@ -1428,6 +1431,27 @@ describe("run: the live view", () => {
   const frame = (over: Partial<ScreenFrame> = {}): ScreenFrame => ({ now: NOW, keysActive: true, selection: null, ...over });
   const feed = (events: RunEvent[]) => events.reduce((state, event) => applyEvent(state, event, AT), emptyView);
 
+  it("105-S101: the title names the product and this build, and the summary's first line is that same string", () => {
+    expect(RUN_TITLE).toBe(`markdownbrain.ai agent runner v${VERSION}`);
+
+    const drawn = render(liveView(feed([{ kind: "configured", agent: "dev-bot-mdden" }]), frame())).lastFrame() ?? "";
+    expect(drawn).toContain(RUN_TITLE);
+    // At the TOP, which is the whole of what the banner is for: it is drawn in
+    // place of the line the summary keeps back, and a frame is read downwards.
+    // Containment alone is satisfied by a banner drawn last, below the
+    // countdown and the key hints.
+    expect(drawn.split("\n")[0]).toContain(RUN_TITLE);
+
+    // Drawn once: the view renders the title and then the summary from its
+    // second line on, so a banner that appeared twice would mean the two had
+    // come apart rather than that a line was repeated.
+    const withSummary = feed([{ kind: "summary", lines: [RUN_TITLE, "  Run log: /state/runs.jsonl"] }]);
+    const frameText = render(liveView(withSummary, frame())).lastFrame() ?? "";
+    expect(frameText.split("\n").filter((l) => l.includes(RUN_TITLE))).toHaveLength(1);
+    expect(frameText.split("\n")[0]).toContain(RUN_TITLE);
+    expect(frameText).toContain("Run log: /state/runs.jsonl");
+  });
+
   it("105-S54: an agent idle, then running, then idle again reflects each transition", () => {
     const idle = feed([{ kind: "configured", agent: "dev-bot-mdden" }]);
     expect(idle.agents).toEqual([{ agent: "dev-bot-mdden", state: "idle", note: null, queued: 0 }]);
@@ -1519,7 +1543,7 @@ describe("run: the live view", () => {
   it("105-S57: without a TTY the output is the plain lines and no view is constructed", async () => {
     const plain = await drive({ isTTY: false });
     // Every line is a plain line: stamped, single-line, and with a known label.
-    for (const line of plain.out.filter((l) => !l.startsWith("mdbrain run") && !l.startsWith("  "))) {
+    for (const line of plain.out.filter((l) => !l.startsWith(RUN_TITLE) && !l.startsWith("  "))) {
       expect(line).toMatch(/^\d\d:\d\d:\d\d [a-z]+ {2,}/);
     }
     const source = readFileSync(fileURLToPath(new URL("../src/commands/run.ts", import.meta.url)), "utf8");
@@ -2847,6 +2871,140 @@ describe("run: the diagnosis log", () => {
   });
 });
 
+describe("run: a runner the server will not let start", () => {
+  // `sent` is deliberately not this build's own version: the two differ exactly
+  // when something in transit removed the header, and a fixture where they agree
+  // cannot tell a row that records the server's account from one that re-derives
+  // it here — which is the whole reason the row carries both.
+  const refusing = { status: 426, sent: "0.2.0", said: "This mdbrain is too old for this server. It reported 0.2.0, and the oldest this server accepts is 0.4.0.", minimum: "0.4.0" };
+
+  it("128-S1: the refusal names both versions, the remedy for this install, and the restart caveat", async () => {
+    const { RUNNING_RUN_NOTICE } = await import("../src/upgrade/plan.ts");
+    const refused = await drive({
+      askToStart: async () => refusing,
+      build: { version: "0.3.0", channel: "direct", isCompiled: true },
+    });
+    const said = refused.err.join("\n");
+    expect(said).toContain("too old");
+    expect(said).toContain("0.2.0");
+    expect(said).toContain("0.4.0");
+    expect(said).toContain("mdbrain upgrade");
+    expect(said).toContain(RUNNING_RUN_NOTICE);
+    // Nothing was asked for and nothing was started: the refusal is the
+    // process boundary, not a tick that happened to fail.
+    expect(refused.spawned).toEqual([]);
+  });
+
+  it("128-S2: it is never reported as a session problem", async () => {
+    const refused = await drive({
+      askToStart: async () => refusing,
+      build: { version: "0.3.0", channel: "direct", isCompiled: true },
+    });
+    const said = refused.err.join("\n").toLowerCase();
+    // Asserted before the absences, so a refusal that never happened cannot
+    // pass this by leaving the stream empty.
+    expect(said).toContain("too old");
+    expect(said).not.toContain("login");
+    expect(said).not.toContain("sign in");
+    expect(said).not.toContain("session");
+  });
+
+  it("128-S7: a packaged install is told its own packager's command", async () => {
+    const packaged = await drive({
+      askToStart: async () => refusing,
+      build: { version: "0.3.0", channel: "homebrew", isCompiled: true },
+    });
+    expect(packaged.err.join("\n")).toContain("brew upgrade");
+    expect(packaged.err.join("\n")).not.toContain("Run \`mdbrain upgrade\`");
+  });
+
+  it("128-S8: a row of its own kind holds the floor and the version sent, and the exit is non-zero", async () => {
+    const refused = await drive({
+      askToStart: async () => refusing,
+      build: { version: "0.3.0", channel: "direct", isCompiled: true },
+    });
+    expect(refused.code).toBe(1);
+    // The socket is given up on the way out: a refused start is an ending, and
+    // this process drains the event loop rather than calling `process.exit`.
+    expect(refused.presence.closes()).toBe(1);
+    const rows = refused.notes as unknown as Array<Record<string, unknown>>;
+    const row = rows.find((note) => note.kind === "too-old");
+    // `received` is the server's account of what arrived and `version` is this
+    // build's own; the fixture keeps them apart so neither can stand in for the
+    // other, which is the case the row exists to make readable.
+    expect(row).toMatchObject({ kind: "too-old", version: "0.3.0", received: "0.2.0", minimum: "0.4.0", said: "This mdbrain is too old for this server. It reported 0.2.0, and the oldest this server accepts is 0.4.0." });
+    // The start row is still written first — the refusal is an ending, and an
+    // ending with nothing before it is the one shape this file exists to avoid.
+    expect(rows[0]).toMatchObject({ kind: "start" });
+    // `refused` means the session went. This is not that, and a reader who
+    // could not tell them apart would be sent to re-authenticate.
+    expect(rows.some((note) => note.kind === "refused")).toBe(false);
+    expect(rows.some((note) => note.kind === "stop")).toBe(false);
+  });
+
+  it("128-S4: a gate that cannot be asked starts the run", async () => {
+    for (const askToStart of [
+      async () => {
+        throw new Error("fetch failed");
+      },
+      async () => ({ status: 500, said: "Upstream error", minimum: null, sent: null }),
+      async () => ({ status: 404, said: "Not Found", minimum: null, sent: null }),
+    ]) {
+      const started = await drive({ askToStart });
+      expect(started.code).toBe(0);
+      expect(started.spawned).toHaveLength(1);
+      expect((started.notes as unknown as Array<Record<string, unknown>>).some((note) => note.kind === "too-old")).toBe(false);
+    }
+  });
+
+  it("128-S4: and the run that was let through is not told anything about it", async () => {
+    const quiet = await drive({
+      askToStart: async () => {
+        throw new Error("fetch failed");
+      },
+    });
+    // Silence on a failed lookup, exactly as the version notice is silent: a
+    // check nobody asked for must not become a permanent complaint on screen.
+    expect(quiet.out.join("\n")).not.toContain("fetch failed");
+    expect(quiet.err.join("\n")).not.toContain("fetch failed");
+  });
+
+  it("128-S5: a server with no floor set refuses nobody", async () => {
+    const started = await drive({ askToStart: async () => ({ status: 200, said: "", minimum: null, sent: "0.1.0" }) });
+    expect(started.code).toBe(0);
+    expect(started.spawned).toHaveLength(1);
+  });
+
+  it("128-S3: the question is asked once, before the first poll, and never per tick", async () => {
+    const asks: string[] = [];
+    let reads = 0;
+    // Several ticks rather than one. Under `--once` a question asked at startup
+    // and a question asked every tick both come to exactly one call, so the
+    // count cannot tell the two apart — which is the difference the floor rests
+    // on. The run is ended by the session read the loop already takes.
+    await drive(
+      {
+        session: async () => {
+          reads += 1;
+          return reads < 5
+            ? { kind: "ready" as const, accessToken: `token-${reads}` }
+            : { kind: "stop" as const, reason: "sign-in", message: "Sign in with `mdbrain login`." };
+        },
+        askToStart: async (token: string) => {
+          asks.push(token);
+          return { status: 200, said: "", minimum: null, sent: "0.1.0" };
+        },
+      },
+      { once: false },
+    );
+    // The loop really did come round again: without this the case below is
+    // satisfied by a run that never reached a second tick.
+    expect(reads).toBeGreaterThan(2);
+    // One call, and it carries the token the startup read handed over.
+    expect(asks).toEqual(["token-1"]);
+  });
+});
+
 describe("run: where the two connections stand, on both presenters", () => {
   const NOW = new Date(2026, 8, 4, 12, 4, 1).getTime();
   const frame = (over: Partial<ScreenFrame> = {}): ScreenFrame => ({ now: NOW, keysActive: true, selection: null, ...over });
@@ -3809,5 +3967,245 @@ describe("run: how long a unit waited before it was started", () => {
     // Clocks that disagree, and a stamp that is not one: neither invents a wait.
     expect(waitedText(-5_000)).toBeNull();
     expect(waitedText(Number.NaN)).toBeNull();
+  });
+});
+
+describe("run: the connection key is read once for the run, not once for the unit", () => {
+  // A store whose reads are counted and whose answer can change between them, so
+  // a case can say both how many times it was asked and which value a session
+  // was handed. The last value stands for every read past the list.
+  const countingStore = (...values: (string | null)[]) => {
+    const gets: string[] = [];
+    return {
+      gets,
+      openKeyStore: async () => ({
+        backend: { kind: "keychain" as const, where: "the keychain" },
+        get: async (agentId: string) => {
+          const value = values[Math.min(gets.length, values.length - 1)];
+          gets.push(agentId);
+          return value;
+        },
+        set: async () => {},
+        forget: async () => {},
+      }),
+    };
+  };
+
+  /** A session that reached the workspace server the key opens and was not let in. */
+  const refusedTheWorkspace = () =>
+    good({ is_error: true, result: "no", permission_denials: [{ tool_name: "mcp__markdown-den__read_file" }] });
+
+  /** The key each session was actually handed, read off the child's environment. */
+  const handed = (spawned: Array<{ env: Record<string, string> }>) =>
+    spawned.map((s) => s.env.MDBRAIN_KEY_DEV_BOT_MDDEN);
+
+  it("two units for one agent cost one read of the key store, not one each", async () => {
+    // The property the whole change exists to create. On macOS a read is what
+    // raises the password dialog, so a read per unit is a dialog per unit —
+    // hours after the person who could answer it went away.
+    const store = countingStore("smd_agent_deadbeef_secret");
+    const driven = await drive({
+      openKeyStore: store.openKeyStore,
+      claim: async () => ({ work: [unit("dev-bot-mdden", "c1", 1), unit("dev-bot-mdden", "c2", 2)], refused: [] }),
+    });
+    expect(driven.code).toBe(0);
+    expect(driven.rows).toHaveLength(2);
+    expect(store.gets).toEqual(["agent-1"]);
+  }, 20_000);
+
+  it("a failed session reads once more, and every unit behind it uses what that read returned", async () => {
+    // The staleness the held value costs: `configure --new-keys` against a live
+    // run used to be picked up by the next session, because the next session
+    // re-read. A failure is the one signal the run gets that its key may be the
+    // wrong one, so it drops what it holds and reads again — once.
+    const store = countingStore("first-key", "second-key", "third-key");
+    const sessions: Array<{ env: Record<string, string> }> = [];
+    const driven = await drive({
+      openKeyStore: store.openKeyStore,
+      claim: async () => ({
+        work: [unit("dev-bot-mdden", "c1", 1), unit("dev-bot-mdden", "c2", 2), unit("dev-bot-mdden", "c3", 3)],
+        refused: [],
+      }),
+      startSession: async (request) => {
+        sessions.push(request.spawnable);
+        return {
+          stdout: sessions.length === 1 ? refusedTheWorkspace() : good(),
+          stderr: "",
+          exitCode: 0,
+          timedOut: false,
+          stopped: false,
+          signal: null,
+          spawnProblem: null,
+        };
+      },
+    });
+    expect(driven.rows).toHaveLength(3);
+    expect(store.gets).toHaveLength(2);
+    // The third unit rides on the re-read rather than asking for one of its own.
+    expect(handed(sessions)).toEqual(["first-key", "second-key", "second-key"]);
+  }, 20_000);
+
+  it("the re-read happens at most once per agent, so a run of failures is not a dialog per failure", async () => {
+    // Without the bound the remedy becomes the problem: a machine whose sessions
+    // fail for some reason that has nothing to do with the key would be back to
+    // one read — and so one dialog — per unit, which is the failure being fixed.
+    const store = countingStore("k1", "k2", "k3", "k4");
+    const sessions: Array<{ env: Record<string, string> }> = [];
+    const driven = await drive({
+      openKeyStore: store.openKeyStore,
+      claim: async () => ({
+        work: [unit("dev-bot-mdden", "c1", 1), unit("dev-bot-mdden", "c2", 2), unit("dev-bot-mdden", "c3", 3)],
+        refused: [],
+      }),
+      startSession: async (request) => {
+        sessions.push(request.spawnable);
+        return {
+          stdout: refusedTheWorkspace(),
+          stderr: "",
+          exitCode: 0,
+          timedOut: false,
+          stopped: false,
+          signal: null,
+          spawnProblem: null,
+        };
+      },
+    });
+    expect(driven.code).toBe(1);
+    expect(driven.rows).toHaveLength(3);
+    expect(store.gets).toHaveLength(2);
+    expect(handed(sessions)).toEqual(["k1", "k2", "k2"]);
+  }, 20_000);
+
+  it("a failure the key had no part in does not spend the one re-read", async () => {
+    // There is one re-read for each agent in a run. A session that would not
+    // spawn says nothing about the key, so burning it here would leave a key
+    // renewed later in the same run unreachable for the rest of it — and would
+    // raise the unattended dialog this whole change exists to stop.
+    const store = countingStore("first-key", "second-key");
+    const sessions: Array<{ env: Record<string, string> }> = [];
+    const driven = await drive({
+      openKeyStore: store.openKeyStore,
+      claim: async () => ({ work: [unit("dev-bot-mdden", "c1", 1), unit("dev-bot-mdden", "c2", 2)], refused: [] }),
+      startSession: async (request) => {
+        sessions.push(request.spawnable);
+        return {
+          stdout: "",
+          stderr: "",
+          exitCode: null,
+          timedOut: false,
+          stopped: false,
+          signal: null,
+          spawnProblem: sessions.length === 1 ? "the harness could not be started" : null,
+        };
+      },
+    });
+    expect(driven.rows[0]).toMatchObject({ outcome: "spawn-failed" });
+    expect(store.gets).toHaveLength(1);
+    expect(handed(sessions)).toEqual(["first-key", "first-key"]);
+  }, 20_000);
+
+  it("two agents failing at once read one at a time, so neither waits behind two dialogs", async () => {
+    // Sessions for different agents run in parallel, so two of them reaching the
+    // re-read together is ordinary. Concurrent keychain reads are two windows
+    // stacked on each other with a session blocked behind each.
+    let reading = 0;
+    let most = 0;
+    const gets: string[] = [];
+    const driven = await drive({
+      loadConfiguration: async () => ({
+        kind: "config",
+        config: config({ "dev-bot-mdden": entry(), "second-dev-bot-mdden": entry({ id: "agent-2" }) }),
+      }),
+      roster: async () => [
+        { id: "agent-1", org_id: "o", display_name: "dev-bot-mdden", status: "active", bot_user_id: "u-1" },
+        { id: "agent-2", org_id: "o", display_name: "second-dev-bot-mdden", status: "active", bot_user_id: "u-2" },
+      ],
+      claim: async () => ({ work: [unit("dev-bot-mdden", "c1", 1), unit("second-dev-bot-mdden", "c2", 2)], refused: [] }),
+      openKeyStore: async () => ({
+        backend: { kind: "keychain" as const, where: "the keychain" },
+        get: async (agentId: string) => {
+          reading += 1;
+          most = Math.max(most, reading);
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          reading -= 1;
+          gets.push(agentId);
+          return "smd_agent_deadbeef_secret";
+        },
+        set: async () => {},
+        forget: async () => {},
+      }),
+      startSession: async () => ({
+        stdout: refusedTheWorkspace(),
+        stderr: "",
+        exitCode: 0,
+        timedOut: false,
+        stopped: false,
+        signal: null,
+        spawnProblem: null,
+      }),
+    });
+    expect(driven.rows).toHaveLength(2);
+    // Two agents read at startup and each re-reads once after its refusal.
+    expect(gets).toHaveLength(4);
+    expect(most).toBe(1);
+  }, 20_000);
+
+  it("a key that was not there when the run started is still found by the unit after the failure", async () => {
+    // Holding a value must not turn a transient answer into a permanent one. A
+    // key minted after the run began used to be picked up by the next session
+    // for free; the re-read is what keeps that true.
+    const store = countingStore(null, "smd_agent_deadbeef_secret");
+    const driven = await drive({
+      openKeyStore: store.openKeyStore,
+      claim: async () => ({ work: [unit("dev-bot-mdden", "c1", 1), unit("dev-bot-mdden", "c2", 2)], refused: [] }),
+    });
+    expect(driven.rows).toHaveLength(2);
+    expect(driven.rows[0]).toMatchObject({ outcome: "spawn-failed" });
+    expect(driven.rows[1]).toMatchObject({ outcome: "done" });
+    expect(store.gets).toHaveLength(2);
+  }, 20_000);
+
+  it("a read that throws at startup does not end the run: it is the unit's own outcome, as it always was", async () => {
+    // The read moved; what a person sees when it fails did not. It is still one
+    // failed unit naming the refusal, rather than a runner that would not start.
+    const gets: string[] = [];
+    const driven = await drive({
+      openKeyStore: async () => ({
+        backend: { kind: "keychain" as const, where: "the operating system's keychain" },
+        get: async (agentId: string) => {
+          gets.push(agentId);
+          throw new Error("this machine's keychain will not let this copy of mdbrain read a key an earlier copy stored");
+        },
+        set: async () => {},
+        forget: async () => {},
+      }),
+    });
+    expect(driven.code).toBe(1);
+    expect(driven.rows).toHaveLength(1);
+    expect(driven.rows[0]).toMatchObject({ outcome: "spawn-failed" });
+    expect(driven.out.join("\n")).toContain("will not let this copy of mdbrain read a key");
+  }, 20_000);
+
+  it("two configured names pointing at one agent cost one read between them", async () => {
+    // `config.agents` is keyed by name and carries the id separately, nothing
+    // refuses two names bearing one id, and `holdReason` gates on the name — so
+    // both reach `asking` and the ids handed here repeat. A second read of one
+    // item is a second dialog for it, which is the quantity this whole module
+    // exists to reduce.
+    const gets: string[] = [];
+    const store = {
+      backend: { kind: "keychain" as const, where: "the keychain" },
+      get: async (agentId: string) => {
+        gets.push(agentId);
+        return "smd_agent_deadbeef_secret";
+      },
+      set: async () => {},
+      forget: async () => {},
+    };
+
+    const keys = await holdConnectionKeys(store, ["agent-1", "agent-2", "agent-1"]);
+
+    expect(gets).toEqual(["agent-1", "agent-2"]);
+    expect(keys.held("agent-1")).toEqual({ kind: "key", key: "smd_agent_deadbeef_secret" });
   });
 });

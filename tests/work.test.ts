@@ -23,6 +23,18 @@ const refusal = (over: Record<string, unknown> = {}) => ({
 });
 
 describe("reading the claim's answer", () => {
+  it("128-S10: an answer carrying fields this build has never heard of is ordinary work", () => {
+    const reading = readWork({
+      work: [unit({ somethingNewer: true }, { alsoNewer: { minimum: "0.9.0" } })],
+      refused: [],
+      serverSaysSomethingElse: "later",
+    });
+    expect(reading.kind).toBe("work");
+    if (reading.kind !== "work") return;
+    expect(reading.work).toHaveLength(1);
+    expect(reading.work[0].instruction.claim).toBe("c1f0");
+  });
+
   it("80-S26: the prompt is read off the instruction, and the module opens no file to get it", () => {
     const reading = readWork({ work: [unit()], refused: [] });
     expect(reading.kind).toBe("work");

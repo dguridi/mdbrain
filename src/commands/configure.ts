@@ -46,6 +46,7 @@ import { keyStorageLine, openConnectionKeyStore, type ConnectionKeyStore } from 
 import {
   agentChoices,
   assembleConfig,
+  keychainGrantLine,
   NOTHING_TO_MANAGE,
   organizationsWithoutAgents,
   ownedOrganizations,
@@ -74,6 +75,11 @@ export interface ConfigureDeps {
   listDirectory: (path: string) => string[];
   /** Where a received connection key is kept. */
   openKeyStore: () => Promise<ConnectionKeyStore>;
+  /**
+   * What `process.platform` says, which decides only whether the keychain is
+   * one that will ask a person before it hands a key over.
+   */
+  platform: string;
 }
 
 /** The sentence for a `configure` with nobody at the terminal. */
@@ -247,6 +253,14 @@ export async function runConfigure(deps: ConfigureDeps, context: CommandContext)
   }
 
   const store = await deps.openKeyStore();
+  // Said before the first key is touched, because this is about a dialog that is
+  // raised by the reads and writes on the next line and answered before anything
+  // below it is printed.
+  const grant = keychainGrantLine(store.backend, deps.platform);
+  if (grant !== null) {
+    out(grant);
+    out("");
+  }
   const keys = await ensureConnectionKeys(store, session.accessToken, answers.agents, context.flags[NEW_KEYS_FLAG] === true);
 
   const config = assembleConfig(answers);
@@ -323,6 +337,7 @@ export const configure: CommandSpec = {
         isDirectory,
         listDirectory,
         openKeyStore: () => openConnectionKeyStore(),
+        platform: process.platform,
       },
       context,
     );

@@ -41,6 +41,16 @@ export interface Outcome {
   exitCode: number | null;
   /** For `timed-out`: whether SIGTERM sufficed, or SIGKILL was needed. */
   signal: "term" | "kill" | null;
+  /**
+   * The session was refused a tool the runner itself supplied.
+   *
+   * Carried as a field rather than left in the message because a reader acts on
+   * it: the workspace server is the one thing a session reaches with the
+   * connection key, so a session refused it is the one outcome that points at
+   * the key rather than at the work. Matching the prose to find that out would
+   * tie a decision to a sentence written to be read by a person.
+   */
+  workspaceToolsRefused: boolean;
 }
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -220,6 +230,8 @@ export function readOutcome(end: SessionEnd): Outcome {
     durationMs: object ? numberOrNull(object.duration_ms) : null,
     exitCode: end.exitCode,
     signal: end.signal,
+    // False for every branch but the one that sets it, below.
+    workspaceToolsRefused: false,
   };
 
   // A session the runner stopped is neither a failure nor a timeout: the work
@@ -280,6 +292,7 @@ export function readOutcome(end: SessionEnd): Outcome {
       return {
         ...base,
         kind: "failed",
+        workspaceToolsRefused: true,
         message: `${permissionRefusedMessage(supplied.map(({ tool }) => tool))}${alsoFailed}${alsoDeclined}`,
       };
     }

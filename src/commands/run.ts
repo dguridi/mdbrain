@@ -30,12 +30,13 @@
 
 import { existsSync } from "node:fs";
 import type { CommandContext, CommandSpec } from "../cli.ts";
-import { askForCount, AuthError, claimWork, listAgents, listWorkspaceNames, signalBrains } from "../auth/api.ts";
+import { askForCount, askToStart, AuthError, claimWork, listAgents, listWorkspaceNames, signalBrains } from "../auth/api.ts";
 import { signInAgainMessage } from "../auth/session.ts";
 import { durationMs, POLL_MS, type AgentEntry, type Config } from "../config/schema.ts";
 import { loadConfig, mcpConfigPath } from "../config/store.ts";
 import { configPath } from "../config/paths.ts";
 import { keyStorageLine, openConnectionKeyStore, type ConnectionKeyStore } from "../config/secrets.ts";
+import { holdConnectionKeys, type HeldKey } from "../run/connection-keys.ts";
 import { readWork, type WorkUnit } from "../work/instruction.ts";
 import { answerPollNow, CLAIM_LIMIT, placeWork, planStartup, renamedAgents, summaryLines, tickPlan } from "../run/loop.ts";
 import { credentialsCollide, harnessFor } from "../run/harness.ts";
@@ -51,6 +52,7 @@ import {
   runtimeFacts,
   startRow,
   stopRow,
+  tooOldRow,
   type RefusedCall,
   type RefusedRow,
 } from "../run/diagnosis.ts";
@@ -67,6 +69,7 @@ import { readySession } from "./session.ts";
 import { latestVersion } from "../upgrade/latest.ts";
 import { isCompiledExecPath, type Channel } from "../upgrade/plan.ts";
 import { VERSION_CHECK_TIMEOUT_MS, versionCheckDue, versionNoticeFor } from "../upgrade/notice.ts";
+import { startupVerdict, type StartupAnswer } from "../upgrade/floor.ts";
 import { CHANNEL, VERSION } from "../version.ts";
 
 /**
@@ -126,6 +129,14 @@ export interface RunDeps {
   roster: typeof listAgents;
   count: typeof askForCount;
   claim: typeof claimWork;
+  /**
+   * The startup question: may a runner of this version take work at all.
+   *
+   * An edge of its own rather than a third polled call, because it is asked
+   * once and the two beside it are asked every tick — which is the difference
+   * the floor rests on.
+   */
+  askToStart: typeof askToStart;
   /** Starts one harness session and answers what it left behind. */
   startSession: typeof runSession;
   /** Appends one row to the run log. */
@@ -246,6 +257,7 @@ const defaultDeps: RunDeps = {
   roster: listAgents,
   count: askForCount,
   claim: claimWork,
+  askToStart,
   startSession: runSession,
   recordRun: appendRun,
   recordDiagnosis: appendDiagnosis,
@@ -355,6 +367,25 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
     err(`Could not open the connection key store: ${(cause as Error).message}`);
     return 1;
   }
+
+  // Read now, once, rather than when each session starts. macOS is the only
+  // backend that puts a permission dialog in front of a read, and a dialog per
+  // unit is a runner that cannot be left alone — which is the one thing this
+  // program is for. Raised here it meets the person who has just typed the
+  // command; raised from a session it meets an empty chair.
+  //
+  // **Only the agents this process will ask for work**, which is also every
+  // agent that can reach a session: a held or identity-only agent gets no queue,
+  // so a key read for it would be a dialog raised for work that cannot happen.
+  //
+  // A failure is kept rather than raised. It is reported as the unit's own
+  // outcome when one arrives, exactly as a failed read from inside the session
+  // was, so nothing about how a missing or unreadable key reads on screen moves
+  // with the read itself.
+  const keys = await holdConnectionKeys(
+    keyStore,
+    startup.asking.map((agent) => config.agents[agent].id),
+  );
 
   const presenter: Presenter = deps.isTTY ? livePresenter(out, deps.now) : plainPresenter(out, deps.now);
   // Every event is stamped once, here, and the same stamp is what the log prints
@@ -474,6 +505,41 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
       pollMs: POLL_MS,
     }),
   );
+
+  // **Asked once, here, and never again.** A run already in flight is never
+  // refused for being old — not mid-tick, not at all — so the question belongs
+  // to starting rather than to polling, and the two polled calls carry no floor
+  // at all. The lag that buys is accepted in exchange for never stopping work
+  // that is already going.
+  //
+  // **Silence is not a verdict.** A route that is unreachable, a server that
+  // errors, a network that is down: the run starts, exactly as the version
+  // notice says nothing when its own lookup fails. A runner that refused to
+  // start because a request timed out would turn one outage into a fleet-wide
+  // stop.
+  let answer: StartupAnswer;
+  try {
+    answer = { kind: "answered", ...(await deps.askToStart(session.accessToken)) };
+  } catch (cause) {
+    answer = { kind: "unasked", detail: (cause as Error).message };
+  }
+  const verdict = startupVerdict(answer, deps.build.channel, deps.build.isCompiled);
+  if (verdict.kind === "too-old") {
+    // Its own row rather than a `refused` one, and no stop row after it: this
+    // *is* the ending, and a stop row would record a run that never started.
+    await record(
+      tooOldRow(deps.now(), {
+        version: deps.build.version,
+        received: verdict.sent,
+        minimum: verdict.minimum,
+        said: verdict.said,
+      }),
+    );
+    presence.close();
+    await presenter.stop();
+    err(verdict.message);
+    return 1;
+  }
 
   if (startup.asking.length === 0) {
     // Told apart by whether anything is actually held: a machine with one held
@@ -629,9 +695,12 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
     // ends the run instead, with a stop row reading `threw` that names no unit.
     // Under `--once` it is the second. An outcome is the only shape that says
     // which unit failed and why.
+    // Read before the session rather than inside the reporting below, because
+    // it is also what decides whether the failure that follows was about the key.
+    const heldKey = keys.held(entry.id);
     let outcome: Outcome;
     try {
-      outcome = await oneSession(deps, keyStore, entry, unit, onSessionStop);
+      outcome = await oneSession(deps, heldKey, entry, unit, onSessionStop);
     } catch (cause) {
       outcome = spawnFailed(`the session could not be run: ${(cause as Error).message}`);
     }
@@ -659,6 +728,31 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
     } else {
       anyFailed = true;
       say({ kind: "failed", agent, claim: unit.instruction.claim, outcome: outcome.kind, ms: elapsed, message: outcome.message });
+    }
+
+    // **The two failures the connection key could explain, and no others.**
+    // There is one re-read for each agent in a run, so spending it is a decision
+    // rather than a reflex: a session that would not spawn, a prompt that would
+    // not render or a harness credential that went away all end as
+    // `spawn-failed` and none of them says anything about the key, while the two
+    // below say nothing else.
+    //
+    // *No key to hand it* is this run's own held value, which may simply be
+    // older than a `mdbrain configure` that has since minted one. *Refused the
+    // workspace tools* is the session reaching the one server the key opens and
+    // not getting in, which is what a key renewed under a running runner looks
+    // like from here.
+    //
+    // **It cannot see every stale key**, and that is worth knowing rather than
+    // assuming away: a workspace server that never connects at all may leave a
+    // session reporting success with nothing done, and no field on the outcome
+    // tells that from a quiet run. Restarting the runner is what picks that up.
+    //
+    // **After the outcome has been said and before the queue advances**: the
+    // screen shows what failed before a dialog can appear over it, and the unit
+    // waiting behind this one is started with whatever the re-read returned.
+    if (heldKey.kind !== "key" || outcome.workspaceToolsRefused) {
+      await keys.rereadAfterFailure(entry.id);
     }
 
     state.running = false;
@@ -1383,14 +1477,21 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
 /**
  * One session, from the invocation to the outcome.
  *
- * Split out so the whole of what a session *is* reads in one place: fetch the
- * key, build the argv, spawn it, read what came back. Every failure on the way
- * is an outcome rather than a throw, for the reason `execute.ts` gives — an agent
- * left in the running set is one that is never asked for work again.
+ * Split out so the whole of what a session *is* reads in one place: build the
+ * argv, spawn it, read what came back. Every failure on the way is an outcome
+ * rather than a throw, for the reason `execute.ts` gives — an agent left in the
+ * running set is one that is never asked for work again.
+ *
+ * **It is handed the connection key rather than the store that holds it**, so
+ * starting a session reads nothing: the key was read once when the run began,
+ * and on macOS a read is a password dialog. The two ways there can be no key are
+ * still the two outcomes they always were, said in the same words.
+ *
+ * @param heldKey what the run read for this agent when it started
  */
 async function oneSession(
   deps: RunDeps,
-  keyStore: ConnectionKeyStore,
+  heldKey: HeldKey,
   entry: AgentEntry,
   unit: WorkUnit,
   onStop: StopRegistry,
@@ -1407,17 +1508,15 @@ async function oneSession(
     );
   }
 
-  let connectionKey: string | null;
-  try {
-    connectionKey = await keyStore.get(entry.id);
-  } catch (cause) {
-    return spawnFailed(`the connection key could not be read: ${(cause as Error).message}`);
+  if (heldKey.kind === "unreadable") {
+    return spawnFailed(`the connection key could not be read: ${heldKey.problem}`);
   }
-  if (connectionKey === null) {
+  if (heldKey.kind === "absent") {
     return spawnFailed(
       `there is no connection key for ${agent} on this machine. Run \`mdbrain configure\` to ask the server for one.`,
     );
   }
+  const connectionKey = heldKey.key;
 
   const harnessCredential = entry.env.harness === null ? null : (deps.env[entry.env.harness] ?? null);
   if (entry.env.harness !== null && harnessCredential === null) {
@@ -1480,6 +1579,10 @@ function spawnFailed(message: string): Outcome {
     durationMs: null,
     exitCode: null,
     signal: null,
+    // Nothing was spawned, so no session reached the workspace server to be
+    // refused by it. The two the key explains are told apart by what the run
+    // held, not by this.
+    workspaceToolsRefused: false,
   };
 }
 

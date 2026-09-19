@@ -936,7 +936,42 @@ describe("the command", () => {
     isDirectory: (p) => p === cwd,
     listDirectory: () => [],
     openKeyStore: async () => memoryKeyStore(),
+    platform: "win32",
     ...over,
+  });
+
+  /** A store that keeps keys where macOS would ask a person about them. */
+  const keychainStore = (): ConnectionKeyStore => ({ ...memoryKeyStore(), backend: { kind: "keychain", where: "the keychain" } });
+
+  it("on macOS it says which button to choose before the keychain can ask, and says it once", async () => {
+    validSession();
+    const { out, context } = io();
+    const code = await withFetch(rosterReply, () =>
+      runConfigure(deps({ platform: "darwin", openKeyStore: async () => keychainStore() }), context),
+    );
+    expect(code).toBe(0);
+    const said = out.filter((line) => line.includes("Always Allow"));
+    expect(said).toHaveLength(1);
+    expect(said[0]).toContain("Allow grants a single read");
+    // Ahead of the summary, because a summary is read once the dialog has
+    // already been answered and the choice it is about has been made.
+    expect(out.indexOf(said[0])).toBeLessThan(out.findIndex((line) => line.startsWith("Configuration written to")));
+  });
+
+  it("no other platform is told about a dialog it will never see, and neither is the file fallback", async () => {
+    validSession();
+    const { out: onWindows, context: windows } = io();
+    await withFetch(rosterReply, () => runConfigure(deps({ platform: "win32", openKeyStore: async () => keychainStore() }), windows));
+    expect(onWindows.join("\n")).not.toContain("Always Allow");
+
+    const { out: onLinux, context: linux } = io();
+    await withFetch(rosterReply, () => runConfigure(deps({ platform: "linux", openKeyStore: async () => keychainStore() }), linux));
+    expect(onLinux.join("\n")).not.toContain("Always Allow");
+
+    // A key going into a file is nobody's permission to grant.
+    const { out: onFile, context: file } = io();
+    await withFetch(rosterReply, () => runConfigure(deps({ platform: "darwin" }), file));
+    expect(onFile.join("\n")).not.toContain("Always Allow");
   });
 
   it("105-S18: with no terminal it refuses in one sentence naming the file, and exits 1", async () => {

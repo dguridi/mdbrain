@@ -40,6 +40,25 @@ import type { OutcomeKind } from "./outcome.ts";
 import type { ViewRequest } from "./keys.ts";
 import { connectionText, listeningText, type ConnectionState, type ListeningState } from "./channel.ts";
 import { versionNoticeText } from "../upgrade/notice.ts";
+import { VERSION } from "../version.ts";
+
+/**
+ * What `run` calls itself at the top of both surfaces.
+ *
+ * **The product and the build, rather than the command.** Whoever is reading
+ * this line typed the command a moment ago; what they cannot see anywhere else
+ * is which `mdbrain` answered — and this is a program that replaces its own
+ * binary, is left running for days across an upgrade, and can be refused by the
+ * server for being too old. The number is `version.ts`'s, the same constant
+ * `--version` prints, so the banner cannot come to disagree with the build
+ * behind it.
+ *
+ * It sits with the events because both presenters draw it — the live view's
+ * title and the first line of the plain summary are this one string — and two
+ * literals a few modules apart is exactly how one surface comes to name a
+ * version the other does not.
+ */
+export const RUN_TITLE = `markdownbrain.ai agent runner v${VERSION}`;
 
 /**
  * Where the runner is, between one poll and the next.

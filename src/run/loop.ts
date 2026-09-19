@@ -15,6 +15,7 @@
 
 import { agentsToAsk, type HeldAgent, type WorkUnit } from "../work/instruction.ts";
 import type { Config } from "../config/schema.ts";
+import { RUN_TITLE } from "./present.ts";
 
 /** The `limit` every claim carries, for the reason in this file's header. */
 export const CLAIM_LIMIT = 1;
@@ -145,6 +146,12 @@ export function renamedAgents(config: Config, roster: ReadonlyMap<string, string
  * held agent and its reason, which is the one fact nothing else on screen
  * carries, and where the run log is.
  *
+ * **The first line is the banner and not the command's name.** It is the one
+ * line here a person did not already know: they typed the command, and what
+ * they cannot see is which build answered. The live view draws it as its title
+ * and skips it in this block, which is why it is one exported string rather
+ * than a literal at each end.
+ *
  * **The empty branch of the asking line stays, and what it is worth is smaller
  * than it looks.** `planStartup` empties `asking` only when every configured
  * agent is held or every one of them is identity-only, so this line never
@@ -160,7 +167,7 @@ export function renamedAgents(config: Config, roster: ReadonlyMap<string, string
  *   keychain, so the notice lands where it is news.
  */
 export function summaryLines(startup: Startup, runLogPath: string, keyStorage: string | null): string[] {
-  const lines: string[] = ["mdbrain run"];
+  const lines: string[] = [RUN_TITLE];
   if (startup.asking.length === 0) {
     lines.push(
       startup.held.length === 0
