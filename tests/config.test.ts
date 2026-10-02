@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { claudeHarness, HARNESSES } from "../src/run/harness.ts";
@@ -301,9 +301,56 @@ describe("the config store", () => {
     expect(path.startsWith(join(root, "config"))).toBe(true);
     const text = readFileSync(path, "utf8");
     const parsed = JSON.parse(text) as { mcpServers: Record<string, { type: string; url: string; headers: Record<string, string> }> };
-    expect(parsed.mcpServers["markdown-den"].type).toBe("http");
-    expect(parsed.mcpServers["markdown-den"].headers.Authorization).toBe("Bearer ${MDBRAIN_KEY_DEV_BOT_MDDEN}");
+    expect(parsed.mcpServers["markdownbrain"].type).toBe("http");
+    expect(parsed.mcpServers["markdownbrain"].headers.Authorization).toBe("Bearer ${MDBRAIN_KEY_DEV_BOT_MDDEN}");
     expect(text).not.toMatch(/smd_agent_/);
+  });
+
+  it("replaces a stale MCP file whole, and leaves no temporary file beside it", async () => {
+    const path = mcpConfigPath("dev-bot-mdden");
+    mkdirSync(join(root, "config", "mcp"), { recursive: true });
+    writeFileSync(path, JSON.stringify({ mcpServers: { "old-name": { type: "http", url: "https://mcp.example.invalid/mcp" } } }));
+    await writeMcpConfig("dev-bot-mdden", "MDBRAIN_KEY_DEV_BOT_MDDEN", claudeHarness);
+    expect(readFileSync(path, "utf8")).toBe(claudeHarness.mcpConfigText("MDBRAIN_KEY_DEV_BOT_MDDEN"));
+    expect(readdirSync(join(root, "config", "mcp"))).toEqual(["agent-dev-bot-mdden.json"]);
+  });
+
+  it("leaves an MCP file that already says exactly this untouched", async () => {
+    // Not an optimisation being pinned: `run` writes every agent's file at
+    // startup, and a write that changes nothing is still a moment when a
+    // harness another process started could find the file mid-replacement.
+    const path = await writeMcpConfig("dev-bot-mdden", "MDBRAIN_KEY_DEV_BOT_MDDEN", claudeHarness);
+    const past = new Date(2020, 0, 1);
+    utimesSync(path, past, past);
+    await writeMcpConfig("dev-bot-mdden", "MDBRAIN_KEY_DEV_BOT_MDDEN", claudeHarness);
+    expect(statSync(path).mtimeMs).toBe(past.getTime());
+  });
+
+  // Windows only, because only Windows refuses to rename over a file another
+  // handle holds open; elsewhere the first rename lands and neither case says anything.
+  it.skipIf(process.platform !== "win32")("replaces an MCP file a reader holds open for a moment, once the reader lets go", async () => {
+    const path = mcpConfigPath("dev-bot-mdden");
+    mkdirSync(join(root, "config", "mcp"), { recursive: true });
+    writeFileSync(path, "stale");
+    const reader = openSync(path, "r");
+    setTimeout(() => closeSync(reader), 60);
+    await writeMcpConfig("dev-bot-mdden", "MDBRAIN_KEY_DEV_BOT_MDDEN", claudeHarness);
+    expect(readFileSync(path, "utf8")).toBe(claudeHarness.mcpConfigText("MDBRAIN_KEY_DEV_BOT_MDDEN"));
+    expect(readdirSync(join(root, "config", "mcp"))).toEqual(["agent-dev-bot-mdden.json"]);
+  });
+
+  it.skipIf(process.platform !== "win32")("an MCP file held open throughout is refused, and leaves no temporary file beside it", async () => {
+    const path = mcpConfigPath("dev-bot-mdden");
+    mkdirSync(join(root, "config", "mcp"), { recursive: true });
+    writeFileSync(path, "stale");
+    const reader = openSync(path, "r");
+    try {
+      await expect(writeMcpConfig("dev-bot-mdden", "MDBRAIN_KEY_DEV_BOT_MDDEN", claudeHarness)).rejects.toMatchObject({ code: "EPERM" });
+    } finally {
+      closeSync(reader);
+    }
+    expect(readFileSync(path, "utf8")).toBe("stale");
+    expect(readdirSync(join(root, "config", "mcp"))).toEqual(["agent-dev-bot-mdden.json"]);
   });
 
   it("folds an agent name into a safe, prefixed, case-folded file name", () => {

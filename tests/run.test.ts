@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { MCP_SERVER_NAME, MCP_URL } from "../src/auth/project.ts";
+import { mcpConfigPath, writeMcpConfig } from "../src/config/store.ts";
 import {
   POLL_NOW_MIN_GAP_MS,
   answerPollNow,
@@ -327,17 +331,17 @@ describe("run: the session's invocation", () => {
     const built = claudeHarness.build(invocation());
     const at = built.args.indexOf("--allowedTools");
     expect(at).toBeGreaterThan(-1);
-    expect(built.args[at + 1]).toBe("mcp__markdown-den");
+    expect(built.args[at + 1]).toBe("mcp__markdownbrain");
 
     const declared = Object.keys((JSON.parse(claudeHarness.mcpConfigText("MDBRAIN_KEY_DEV_BOT_MDDEN")) as { mcpServers: Record<string, unknown> }).mcpServers);
-    expect(declared).toEqual(["markdown-den"]);
+    expect(declared).toEqual(["markdownbrain"]);
     expect(built.args[at + 1]).toBe(`mcp__${declared[0]}`);
   });
 
   it("105-S88: the allowance is that one server and nothing else", () => {
     const built = claudeHarness.build(invocation());
     const allowed = built.args.filter((_, i) => built.args[i - 1] === "--allowedTools");
-    expect(allowed).toEqual(["mcp__markdown-den"]);
+    expect(allowed).toEqual(["mcp__markdownbrain"]);
     expect(built.args).not.toContain("--dangerously-skip-permissions");
     expect(built.args).not.toContain("bypassPermissions");
   });
@@ -403,9 +407,9 @@ describe("run: a session that was refused a tool", () => {
   const denied = (denials: unknown) => readOutcome(ending({ exitCode: 0, stdout: good({ permission_denials: denials }) }));
 
   it("105-S82: a tool the runner supplied is a failure, though is_error, subtype and terminal_reason all say it succeeded", () => {
-    const out = denied([{ tool_name: "mcp__markdown-den__whoami" }]);
+    const out = denied([{ tool_name: "mcp__markdownbrain__whoami" }]);
     expect(out.kind).toBe("failed");
-    expect(out.message).toContain("mcp__markdown-den__whoami");
+    expect(out.message).toContain("mcp__markdownbrain__whoami");
     expect(out.message).toContain("the runner handed it");
     // The estimate is still recorded: the money was spent and saying otherwise
     // would hide the thing that makes this worth catching.
@@ -420,7 +424,7 @@ describe("run: a session that was refused a tool", () => {
   it("105-S84: a denial it cannot read counts as one of the runner's own", () => {
     // The alternative is reporting a blocked session as a success on the
     // strength of not recognising a field, which is this whole case again.
-    for (const shape of [[{}], ["mcp__markdown-den__whoami"], [7], [{ tool: null }]]) {
+    for (const shape of [[{}], ["mcp__markdownbrain__whoami"], [7], [{ tool: null }]]) {
       expect(denied(shape).kind, JSON.stringify(shape)).toBe("failed");
     }
   });
@@ -464,15 +468,15 @@ describe("run: a session that was refused a tool", () => {
   });
 
   it("105-S92: refused both kinds, the runner's own is the verdict", () => {
-    const out = denied([{ tool_name: "Bash" }, { tool_name: "mcp__markdown-den__whoami" }]);
+    const out = denied([{ tool_name: "Bash" }, { tool_name: "mcp__markdownbrain__whoami" }]);
     expect(out.kind).toBe("failed");
-    expect(out.message).toContain("mcp__markdown-den__whoami");
+    expect(out.message).toContain("mcp__markdownbrain__whoami");
   });
 
   it("105-S93: refused both kinds, the harness's own are still counted beside the verdict", () => {
-    const out = denied([{ tool_name: "Bash" }, { tool_name: "Bash" }, { tool_name: "mcp__markdown-den__whoami" }]);
+    const out = denied([{ tool_name: "Bash" }, { tool_name: "Bash" }, { tool_name: "mcp__markdownbrain__whoami" }]);
     expect(out.kind).toBe("failed");
-    expect(out.message).toContain("mcp__markdown-den__whoami");
+    expect(out.message).toContain("mcp__markdownbrain__whoami");
     expect(out.message).toContain("2 Bash calls");
     expect(out.message).toContain("declined along the way");
     // And the counts stay in that note. The verdict names the supplied tool
@@ -480,7 +484,7 @@ describe("run: a session that was refused a tool", () => {
     // workspace server ends the session as surely as twenty. Asserted against
     // the literal, since threading a count through the verdict leaves every
     // other case here green.
-    expect(out.message).toContain("It needed mcp__markdown-den__whoami, and it was refused");
+    expect(out.message).toContain("It needed mcp__markdownbrain__whoami, and it was refused");
   });
 });
 
@@ -669,6 +673,31 @@ describe("run: spawning", () => {
     expect(ended.signal).not.toBeNull();
   }, 20_000);
 
+  it("105-S102: a session is spawned on a console of its own, so nothing it starts can write under the live view", async () => {
+    const { runSession } = await import("../src/run/execute.ts");
+    const { spawn } = await import("node:child_process");
+    const options: Record<string, unknown>[] = [];
+    const ended = await runSession(
+      {
+        spawnable: { command: process.execPath, args: ["-e", "process.stdout.write('piped')"], env: { PATH: process.env.PATH ?? "" } },
+        cwd: process.cwd(),
+        wallClockMs: 10_000,
+      },
+      {
+        spawn: ((command: string, args: string[], opts: Record<string, unknown>) => {
+          options.push(opts);
+          return spawn(command, args, opts);
+        }) as typeof spawn,
+        isWindows: process.platform === "win32",
+      },
+    );
+    expect(options).toHaveLength(1);
+    expect(options[0].windowsHide).toBe(true);
+    expect(options[0].stdio).toEqual(["ignore", "pipe", "pipe"]);
+    // The hidden console must not cost the pipes, which are where the result is read.
+    expect(ended.stdout).toBe("piped");
+  }, 20_000);
+
   it("stdout is captured whole, since the result object is one object at the end of it", async () => {
     const { runSession } = await import("../src/run/execute.ts");
     const { spawn } = await import("node:child_process");
@@ -738,6 +767,7 @@ async function drive(over: Partial<import("../src/commands/run.ts").RunDeps> = {
   let fire: ((dueInMs: number) => void) | null = null;
   const deps: import("../src/commands/run.ts").RunDeps = {
     isTTY: false,
+    isWindows: false,
     env: { ANTHROPIC_API_KEY: "sk-live" },
     directoryExists: () => true,
     openKeyStore: async () => ({
@@ -752,6 +782,7 @@ async function drive(over: Partial<import("../src/commands/run.ts").RunDeps> = {
     count: async () => ({ waiting: 1, capped: false }),
     claim: async () => ({ work: [unit()], refused: [] }),
     askToStart: async () => ({ status: 200, said: "", minimum: null, sent: "0.1.0" }),
+    writeMcpFile: async (agent) => mcpConfigPath(agent),
     startSession: async (request) => {
       spawned.push(request.spawnable);
       return { stdout: good(), stderr: "", exitCode: 0, timedOut: false, stopped: false, signal: null, spawnProblem: null };
@@ -1778,13 +1809,25 @@ describe("run: what the review found", () => {
 });
 
 describe("run: the origin the app is reached at", () => {
-  it("APP_URL carries `www.`, because the apex redirects and a redirect drops the credential", async () => {
+  it("APP_URL is the bare host, because `www.` redirects and a redirect drops the credential", async () => {
     const { APP_URL } = await import("../src/auth/project.ts");
-    // Measured against production: https://markdown-den.com/api/events/count
-    // answers 308 to https://www.markdown-den.com/api/events/count, and fetch
-    // strips Authorization across that hop — so the route sees no bearer and
-    // refuses a perfectly good token as though the person were signed out.
-    expect(APP_URL).toBe("https://www.markdown-den.com");
+    // Measured against production: https://www.markdownbrain.ai/api/agents
+    // answers 308 to https://markdownbrain.ai/api/agents, and fetch strips
+    // Authorization across that hop — so the route sees no bearer and refuses a
+    // perfectly good token as though the person were signed out.
+    expect(APP_URL).toBe("https://markdownbrain.ai");
+  });
+
+  it("MCP_URL is the server every connector grant is bound to, and the repository's own .mcp.json says the same", async () => {
+    const { MCP_URL } = await import("../src/auth/project.ts");
+    // The web app's NEXT_PUBLIC_MCP_URL and the server's MCP_PUBLIC_URL are set in
+    // deployments, out of reach here; the checked-in .mcp.json is the copy that is not.
+    // Only its own entry is compared, so a second, unrelated server there is no failure.
+    expect(MCP_URL).toBe("https://mcp.markdownbrain.ai/mcp");
+    const checkedIn = JSON.parse(readFileSync(fileURLToPath(new URL("../../../.mcp.json", import.meta.url)), "utf8")) as {
+      mcpServers: Record<string, { url: string }>;
+    };
+    expect(checkedIn.mcpServers["markdown-den"]?.url).toBe(MCP_URL);
   });
 
   it("a redirect on an app call is reported as a wrong address, never as a refused session", async () => {
@@ -3993,7 +4036,7 @@ describe("run: the connection key is read once for the run, not once for the uni
 
   /** A session that reached the workspace server the key opens and was not let in. */
   const refusedTheWorkspace = () =>
-    good({ is_error: true, result: "no", permission_denials: [{ tool_name: "mcp__markdown-den__read_file" }] });
+    good({ is_error: true, result: "no", permission_denials: [{ tool_name: "mcp__markdownbrain__read_file" }] });
 
   /** The key each session was actually handed, read off the child's environment. */
   const handed = (spawned: Array<{ env: Record<string, string> }>) =>
@@ -4207,5 +4250,149 @@ describe("run: the connection key is read once for the run, not once for the uni
 
     expect(gets).toEqual(["agent-1", "agent-2"]);
     expect(keys.held("agent-1")).toEqual({ kind: "key", key: "smd_agent_deadbeef_secret" });
+  });
+});
+
+describe("run: the console window closing", () => {
+  const stoppedEnding = (): import("../src/run/execute.ts").SessionEnding => ({
+    stdout: "",
+    stderr: "",
+    exitCode: null,
+    timedOut: false,
+    stopped: true,
+    signal: "kill",
+    spawnProblem: null,
+  });
+
+  it("105-S103: on Windows the window closing stops every running session the way Ctrl-C does, and leaves no handler behind", async () => {
+    const before = process.listenerCount("SIGHUP");
+    let askedToStop = false;
+    const result = await drive({
+      isWindows: true,
+      startSession: async (request) =>
+        new Promise((resolve) => {
+          request.onStop?.(() => {
+            askedToStop = true;
+            resolve(stoppedEnding());
+          });
+          // The window closes while the session is running. On Windows Node
+          // raises SIGHUP for that; emitting it is the same delivery without a
+          // window to close. The session only ends once the stopper asks it to,
+          // which is what makes the assertion below mean something.
+          queueMicrotask(() => process.emit("SIGHUP", "SIGHUP"));
+        }),
+    });
+    expect(askedToStop).toBe(true);
+    expect(result.code).toBe(0);
+    expect(result.rows.map((row) => (row as { outcome: string }).outcome)).toEqual(["stopped"]);
+    // Removed with the other two when the run ends, so a later `run` in the same
+    // process registers its own rather than stacking on this one.
+    expect(process.listenerCount("SIGHUP")).toBe(before);
+  });
+
+  it("105-S103: a window closing after a stop has begun leaves that stop to finish, where a second Ctrl-C would get out", async () => {
+    // The escape re-raises SIGINT at this very process, which would end the
+    // worker rather than fail the case; stubbed so the choice is observable.
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+    try {
+      let stopsAsked = 0;
+      let killsAfterHangup = -1;
+      let killsAfterSecondInterrupt = -1;
+      const result = await drive({
+        isWindows: true,
+        startSession: async (request) =>
+          new Promise((resolve) => {
+            request.onStop?.(() => {
+              stopsAsked += 1;
+            });
+            queueMicrotask(() => {
+              process.emit("SIGINT", "SIGINT");
+              process.emit("SIGHUP", "SIGHUP");
+              killsAfterHangup = kill.mock.calls.length;
+              process.emit("SIGINT", "SIGINT");
+              killsAfterSecondInterrupt = kill.mock.calls.length;
+              resolve(stoppedEnding());
+            });
+          }),
+      });
+      expect(result.code).toBe(0);
+      expect(stopsAsked).toBe(1);
+      expect(killsAfterHangup).toBe(0);
+      expect(killsAfterSecondInterrupt).toBe(1);
+      expect(kill).toHaveBeenCalledWith(process.pid, "SIGINT");
+    } finally {
+      kill.mockRestore();
+    }
+  });
+
+  it("105-S103: elsewhere no hangup handler is installed, so a terminal going away keeps Node's default", async () => {
+    const before = process.listenerCount("SIGHUP");
+    let during = -1;
+    const result = await drive({
+      isWindows: false,
+      startSession: async () => {
+        during = process.listenerCount("SIGHUP");
+        return { stdout: good(), stderr: "", exitCode: 0, timedOut: false, stopped: false, signal: null, spawnProblem: null };
+      },
+    });
+    expect(result.code).toBe(0);
+    expect(during).toBe(before);
+  });
+});
+
+describe("run: the MCP file is the binary's own", () => {
+  const stale = JSON.stringify({ mcpServers: { "old-name": { type: "http", url: "https://mcp.example.invalid/mcp" } } });
+
+  it("a file on disk naming another URL and another key is rewritten to this binary's values before the harness starts", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mdbrain-mcp-"));
+    try {
+      const at = { platform: process.platform, home: dir, env: { MDBRAIN_CONFIG_DIR: dir } };
+      const path = mcpConfigPath("dev-bot-mdden", at);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, stale);
+      // Read inside the spawn rather than after the run, because what matters is
+      // what Claude Code finds when it starts, not what is left once it has gone.
+      let found: string | null = null;
+      let pointedAt: string | null = null;
+      const ran = await drive({
+        writeMcpFile: (agent, key, harness) => writeMcpConfig(agent, key, harness, at),
+        startSession: async (request) => {
+          const args = request.spawnable.args;
+          pointedAt = args[args.indexOf("--mcp-config") + 1];
+          found = readFileSync(pointedAt, "utf8");
+          return { stdout: good(), stderr: "", exitCode: 0, timedOut: false, stopped: false, signal: null, spawnProblem: null };
+        },
+      });
+      expect(ran.rows[0]).toMatchObject({ outcome: "done" });
+      expect(pointedAt).toBe(path);
+      expect(found).toBe(claudeHarness.mcpConfigText("MDBRAIN_KEY_DEV_BOT_MDDEN"));
+      const servers = (JSON.parse(found!) as { mcpServers: Record<string, { url: string }> }).mcpServers;
+      expect(Object.keys(servers)).toEqual([MCP_SERVER_NAME]);
+      expect(servers[MCP_SERVER_NAME].url).toBe(MCP_URL);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a file that cannot be written holds its agent before anything is claimed, rather than falling back to the one on disk", async () => {
+    const claim = vi.fn(async () => ({ work: [unit()], refused: [] }));
+    const startSession = vi.fn();
+    const ran = await drive({
+      writeMcpFile: async () => {
+        throw new Error("EACCES: permission denied");
+      },
+      claim,
+      startSession,
+    });
+    expect(claim).not.toHaveBeenCalled();
+    expect(startSession).not.toHaveBeenCalled();
+    expect(ran.out.join("\n")).toContain("its MCP file could not be written: EACCES");
+    expect(ran.code).toBe(1);
+  });
+
+  it("the file is written once at startup, not again before each session", async () => {
+    const writeMcpFile = vi.fn(async (agent: string) => mcpConfigPath(agent));
+    await drive({ writeMcpFile, claim: async () => ({ work: [unit(), unit("dev-bot-mdden", "c2f0", 8413)], refused: [] }) });
+    expect(writeMcpFile).toHaveBeenCalledTimes(1);
   });
 });

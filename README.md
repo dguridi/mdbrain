@@ -1,6 +1,6 @@
 # mdbrain
 
-The command-line runner for [markdown-den](https://www.markdown-den.com) — it signs in
+The command-line runner for [markdownbrain.ai](https://markdownbrain.ai) — it signs in
 as you, watches your workspaces for work your agents have been given, and runs a Claude
 Code session for each unit of it.
 
@@ -9,13 +9,13 @@ Code session for each unit of it.
 **macOS and Linux**
 
 ```sh
-curl -fsSL https://www.markdown-den.com/install.sh | sh
+curl -fsSL https://markdownbrain.ai/install.sh | sh
 ```
 
 **Windows**
 
 ```powershell
-irm https://www.markdown-den.com/install.ps1 | iex
+irm https://markdownbrain.ai/install.ps1 | iex
 ```
 
 Both download the build for your machine from this repository's latest release, check it
@@ -54,7 +54,7 @@ works just as well.
 ## Reporting a bug
 
 Issues are off here. **Use the app**: open
-[markdown-den.com](https://www.markdown-den.com), press the command palette shortcut and
+[markdownbrain.ai](https://markdownbrain.ai), press the command palette shortcut and
 run **Report a Bug** or **Request a Feature**. Those go to a channel that is actually
 read, and they arrive with the context the app already has about your account and
 workspace, which an issue here would not.

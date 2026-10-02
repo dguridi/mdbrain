@@ -117,6 +117,21 @@ export function mcpConfigPath(agentName: string, env?: PathEnv): string {
 /**
  * Write one agent's MCP file, creating the folder on the first agent.
  *
+ * **Left alone when it already says exactly this, and replaced by a rename
+ * when it does not.** `run` writes it at startup as well as `configure`, and
+ * a harness that `mdbrain as` or another runner started may be reading it at
+ * that moment: a rename means a reader sees the old file or the new one and
+ * never a truncated one, and the comparison means the common case — nothing
+ * changed — writes nothing at all.
+ *
+ * **On Windows that same reader is what makes a rename fail.** Replacing a file
+ * another process has open is refused with `EPERM` there, where an in-place
+ * write is not — so the moment the rename exists to protect is the one it would
+ * turn into a held agent for the whole run. The rename is therefore tried again
+ * for a short while, which outlasts a harness reading a few hundred bytes, and a
+ * temporary file that never landed is removed: nothing else would, since the
+ * sweep only knows `agent-*.json`.
+ *
  * **The text comes from the harness, not from here.** What that file contains is
  * the harness's question — which keys it carries, and whether it is JSON at all —
  * and this module's question is only where it goes and when it is rewritten.
@@ -130,9 +145,46 @@ export async function writeMcpConfig(
   env?: PathEnv,
 ): Promise<string> {
   const path = mcpConfigPath(agentName, env);
+  const text = harness.mcpConfigText(connectionKeyVariable);
+  const current = await readFile(path, "utf8").catch(() => null);
+  if (current === text) return path;
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, harness.mcpConfigText(connectionKeyVariable), "utf8");
+  const temporary = `${path}.${process.pid}.tmp`;
+  try {
+    await writeFile(temporary, text, "utf8");
+    await renameReplacing(temporary, path);
+  } catch (cause) {
+    await rm(temporary, { force: true });
+    throw cause;
+  }
   return path;
+}
+
+/** The codes Windows answers a rename with while the target is open elsewhere. */
+const TARGET_BUSY = new Set(["EPERM", "EACCES", "EBUSY"]);
+
+/** How often, and how far apart, a rename refused for a busy target is tried. */
+const RENAME_ATTEMPTS = 6;
+const RENAME_BACKOFF_MS = 25;
+
+/**
+ * Rename over an existing file, waiting out a reader that briefly holds it open.
+ *
+ * Any other failure is raised at once, and a target still busy after the last
+ * attempt raises the last refusal, so the caller decides what a file that could
+ * not be replaced means.
+ */
+async function renameReplacing(from: string, to: string): Promise<void> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await rename(from, to);
+      return;
+    } catch (cause) {
+      const code = (cause as NodeJS.ErrnoException).code;
+      if (attempt >= RENAME_ATTEMPTS || code === undefined || !TARGET_BUSY.has(code)) throw cause;
+      await new Promise((resolve) => setTimeout(resolve, RENAME_BACKOFF_MS * attempt));
+    }
+  }
 }
 
 /**

@@ -98,7 +98,7 @@ describe("as: the identity, shared by both modes", () => {
       "/cfg/mcp/dev-bot-mdden.json",
       "--strict-mcp-config",
       "--allowedTools",
-      "mcp__markdown-den",
+      "mcp__markdownbrain",
       "--permission-mode",
       "auto",
       "--session-id",

@@ -33,12 +33,12 @@ import type { CommandContext, CommandSpec } from "../cli.ts";
 import { askForCount, askToStart, AuthError, claimWork, listAgents, listWorkspaceNames, signalBrains } from "../auth/api.ts";
 import { signInAgainMessage } from "../auth/session.ts";
 import { durationMs, POLL_MS, type AgentEntry, type Config } from "../config/schema.ts";
-import { loadConfig, mcpConfigPath } from "../config/store.ts";
+import { loadConfig, writeMcpConfig } from "../config/store.ts";
 import { configPath } from "../config/paths.ts";
 import { keyStorageLine, openConnectionKeyStore, type ConnectionKeyStore } from "../config/secrets.ts";
 import { holdConnectionKeys, type HeldKey } from "../run/connection-keys.ts";
 import { readWork, type WorkUnit } from "../work/instruction.ts";
-import { answerPollNow, CLAIM_LIMIT, placeWork, planStartup, renamedAgents, summaryLines, tickPlan } from "../run/loop.ts";
+import { answerPollNow, CLAIM_LIMIT, placeWork, planStartup, renamedAgents, summaryLines, tickPlan, type Startup } from "../run/loop.ts";
 import { credentialsCollide, harnessFor } from "../run/harness.ts";
 import { runSession, type StopRegistry } from "../run/execute.ts";
 import { readOutcome, type Outcome } from "../run/outcome.ts";
@@ -121,6 +121,14 @@ const TOKEN_UPKEEP_MS = 15 * 60_000;
 export interface RunDeps {
   /** Whether a person is watching, which is the whole of the presenter choice. */
   isTTY: boolean;
+  /**
+   * Whether this is Windows, which decides how a session is spawned and
+   * stopped and that the console window closing is a stop. One edge, handed
+   * on to the session runner rather than read twice, so the signal wiring and
+   * the spawn can never disagree about the platform — and a test on either
+   * platform can ask for both answers.
+   */
+  isWindows: boolean;
   env: Record<string, string | undefined>;
   directoryExists: (path: string) => boolean;
   openKeyStore: () => Promise<ConnectionKeyStore>;
@@ -137,6 +145,15 @@ export interface RunDeps {
    * the floor rests on.
    */
   askToStart: typeof askToStart;
+  /**
+   * Writes one agent's MCP file from this binary's own constants, and answers
+   * where it went.
+   *
+   * An edge because it is the one write to the config root `run` makes, and a
+   * test that asserts the harness was pointed at the right file should not need
+   * that file to be written under the person's real configuration.
+   */
+  writeMcpFile: typeof writeMcpConfig;
   /** Starts one harness session and answers what it left behind. */
   startSession: typeof runSession;
   /** Appends one row to the run log. */
@@ -243,6 +260,7 @@ export function waitFor(ms: number, signal: { stopped: boolean; wake: (() => voi
 
 const defaultDeps: RunDeps = {
   isTTY: process.stdout.isTTY === true,
+  isWindows: process.platform === "win32",
   env: process.env,
   directoryExists: (path) => {
     try {
@@ -258,6 +276,7 @@ const defaultDeps: RunDeps = {
   count: askForCount,
   claim: claimWork,
   askToStart,
+  writeMcpFile: writeMcpConfig,
   startSession: runSession,
   recordRun: appendRun,
   recordDiagnosis: appendDiagnosis,
@@ -358,7 +377,7 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
     err(`Could not read the roster: ${redactSecrets((cause as Error).message)}. Starting anyway; a configured name that no longer exists will simply receive no work.`);
   }
 
-  const startup = planStartup(config, deps.env, deps.directoryExists, rosterNames);
+  const { startup, mcpFiles } = await writeMcpFiles(deps, config, planStartup(config, deps.env, deps.directoryExists, rosterNames));
 
   let keyStore: ConnectionKeyStore;
   try {
@@ -638,7 +657,8 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
   // Every running session registers here. **Ctrl-C does not reach them on its
   // own**: each child is spawned into its own process group so that killing it
   // reaches the tools it started, and the price of that is that the terminal's
-  // signal never arrives. Without this the runner would exit while its harness
+  // signal never arrives — on Windows because each has a console of its own
+  // instead. Without this the runner would exit while its harness
   // sessions carried on with no terminal and nobody watching.
   const stoppers = new Set<() => void>();
   const onSessionStop: StopRegistry = (stopper) => {
@@ -700,7 +720,7 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
     const heldKey = keys.held(entry.id);
     let outcome: Outcome;
     try {
-      outcome = await oneSession(deps, heldKey, entry, unit, onSessionStop);
+      outcome = await oneSession(deps, heldKey, mcpFiles, entry, unit, onSessionStop);
     } catch (cause) {
       outcome = spawnFailed(`the session could not be run: ${(cause as Error).message}`);
     }
@@ -940,10 +960,17 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
     if (stop.stopped) {
       process.off("SIGINT", onStop);
       process.off("SIGTERM", onStop);
+      process.off("SIGHUP", onHangup);
       process.kill(process.pid, "SIGINT");
       return;
     }
     stop.stopped = true;
+    // Every running session is asked to stop before anything is drawn or
+    // aborted, and the order is the point: when the console is being destroyed
+    // a frame can fail, and the one thing this handler has to do cannot sit
+    // behind it. Each session insists after its own grace; the wait below is
+    // what gives them it.
+    for (const stopper of [...stoppers]) stopper();
     // The version check is the one outstanding request nothing is waiting on,
     // and a person who pressed Ctrl-C is owed a prompt rather than a lookup.
     abortVersionCheck();
@@ -952,12 +979,38 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
     // countdown through that is counting down to a poll that will never happen.
     enterFinishing();
     stop.wake?.();
-    // Polling stops, and every running session is asked to stop with it. Each
-    // one insists after its own grace; the wait below is what gives them it.
-    for (const stopper of [...stoppers]) stopper();
+  };
+  /**
+   * The console window closing, which is a stop as well — on Windows.
+   *
+   * Node raises SIGHUP there when the window closes, and Windows ends the
+   * process a few seconds later whatever the handler does, so this is not a way
+   * to survive the window: it is the one chance to walk the tree before going.
+   * It exists because each session sits on a hidden console of its own. The
+   * session itself dies with the runner regardless, held by libuv's job object,
+   * but a command the session's *shell* is running does not, since a shell is
+   * not libuv and its children break away from that job; without this it
+   * carries on, on a console nobody can see, and the rule that a session's
+   * tools die with it holds on Ctrl-C and fails on its sibling.
+   *
+   * **A window closing after a stop has begun is not a second press.** The
+   * escape in `onStop` is for a person who wants their terminal back, and a
+   * closed window has none to give back; taking it would end the runner while
+   * the `taskkill` it just started is still walking the tree. The stop already
+   * under way is left to finish in the time Windows allows.
+   *
+   * Elsewhere a hangup keeps Node's default and the runner exits, deliberately:
+   * sessions there are process groups of their own that a terminal's hangup
+   * never reached, and a handler here would also turn `nohup mdbrain run &`
+   * from a runner that outlives the terminal into one that stops with it — a
+   * ruling nobody has made.
+   */
+  const onHangup = () => {
+    if (!stop.stopped) onStop();
   };
   process.on("SIGINT", onStop);
   process.on("SIGTERM", onStop);
+  if (deps.isWindows) process.on("SIGHUP", onHangup);
 
   /**
    * What a keypress asks for, answered here rather than in the view.
@@ -1435,6 +1488,7 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
   } finally {
     process.off("SIGINT", onStop);
     process.off("SIGTERM", onStop);
+    process.off("SIGHUP", onHangup);
   }
 
   // The exit is written down as well as printed, and that is the gap this closes:
@@ -1475,6 +1529,55 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
 }
 
 /**
+ * Write the MCP file of every agent this run will ask for work, from this
+ * binary's own constants, before anything is claimed.
+ *
+ * **Why `run` writes a file `configure` owns.** The file names the MCP server's
+ * address and the key the allowed-tool prefix is built from, and neither is an
+ * answer anybody gave: both are constants of the binary. A file an older build
+ * wrote carries that build's values, so after `mdbrain upgrade` alone a session
+ * would connect wherever the old build pointed, under a name the new build's
+ * `--allowedTools` does not grant — a session handed tools no server offers,
+ * which ends having done nothing and says nothing. Writing it here is what makes
+ * an upgrade enough on its own.
+ *
+ * **Once, at startup, and not before each session.** The config this process
+ * holds was read at startup too, and a `configure` run while it is going may
+ * rename a key variable or deselect an agent; a write per session would put the
+ * startup copy back over that answer, or recreate a file the sweep removed. And
+ * the constants cannot change while the process runs, so a later write could
+ * only ever restate the first.
+ *
+ * A file that cannot be written holds its agent rather than falling back to the
+ * one on disk, because the file on disk is what cannot be trusted — and held
+ * here, before a claim, it costs no unit of work.
+ *
+ * @returns the plan, with any agent whose file could not be written moved from
+ *   asking to held, and the file each remaining agent's sessions are pointed at —
+ *   the path the write answered, so the file written and the file handed over
+ *   cannot be two computations that drift apart
+ */
+async function writeMcpFiles(
+  deps: RunDeps,
+  config: Config,
+  planned: Startup,
+): Promise<{ startup: Startup; mcpFiles: ReadonlyMap<string, string> }> {
+  const asking: string[] = [];
+  const held = [...planned.held];
+  const mcpFiles = new Map<string, string>();
+  for (const agent of planned.asking) {
+    const entry = config.agents[agent];
+    try {
+      mcpFiles.set(agent, await deps.writeMcpFile(agent, entry.env.connectionKey, harnessFor(entry.harness)));
+      asking.push(agent);
+    } catch (cause) {
+      held.push({ agent, reason: `its MCP file could not be written: ${(cause as Error).message}` });
+    }
+  }
+  return { startup: { ...planned, asking, held }, mcpFiles };
+}
+
+/**
  * One session, from the invocation to the outcome.
  *
  * Split out so the whole of what a session *is* reads in one place: build the
@@ -1488,10 +1591,12 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
  * still the two outcomes they always were, said in the same words.
  *
  * @param heldKey what the run read for this agent when it started
+ * @param mcpFiles the MCP file the run wrote for each agent when it started
  */
 async function oneSession(
   deps: RunDeps,
   heldKey: HeldKey,
+  mcpFiles: ReadonlyMap<string, string>,
   entry: AgentEntry,
   unit: WorkUnit,
   onStop: StopRegistry,
@@ -1533,6 +1638,12 @@ async function oneSession(
   const rendered = renderPrompt(unit.instruction.prompt, unit.instruction.file);
   if (!rendered.ok) return spawnFailed(rendered.reason);
 
+  // Only an agent this run asks for can be claimed for, and every one of those
+  // had its file written; reaching here without one is a bug, said as an
+  // outcome rather than met by handing over a file this binary never wrote.
+  const mcpFile = mcpFiles.get(agent);
+  if (mcpFile === undefined) return spawnFailed(`${agent}'s MCP file was not written when the run started.`);
+
   const spawnable = spec.build({
     prompt: rendered.prompt,
     // The claim id is what the session is named by, so a transcript on this
@@ -1540,7 +1651,7 @@ async function oneSession(
     // The field is general because an attended session has no claim to name
     // itself after; this is the call site where it is a claim id.
     sessionId: unit.instruction.claim,
-    mcpConfigPath: mcpConfigPath(agent),
+    mcpConfigPath: mcpFile,
     cwd: entry.cwd,
     bounds: entry.bounds,
     harnessCredential,
@@ -1549,12 +1660,17 @@ async function oneSession(
     parentEnv: deps.env,
   });
 
-  const ending = await deps.startSession({
-    spawnable,
-    cwd: entry.cwd,
-    wallClockMs: durationMs(entry.bounds.wallClock)!,
-    onStop,
-  });
+  const ending = await deps.startSession(
+    {
+      spawnable,
+      cwd: entry.cwd,
+      wallClockMs: durationMs(entry.bounds.wallClock)!,
+      onStop,
+    },
+    // The same platform answer the hangup wiring uses, so a session is never
+    // spawned for one platform while the runner's signals are wired for another.
+    { isWindows: deps.isWindows },
+  );
   if (ending.spawnProblem !== null) return spawnFailed(ending.spawnProblem);
 
   return readOutcome({

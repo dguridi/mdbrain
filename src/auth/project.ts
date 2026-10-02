@@ -32,18 +32,21 @@ export const PROJECT_URL = "https://rczxydsqwkzobebirkcu.supabase.co";
  * page posts to an http loopback address, so that check refused the real
  * handover and nothing else.
  *
- * **`www.` is load-bearing and must not be tidied away.** The apex answers
- * `https://markdown-den.com/api/…` with a `308` to this host, and a redirect
- * that crosses origins **drops the `Authorization` header** — so a request sent
- * to the apex arrives with no credential and is refused as though the person
- * were signed out. A valid token and a malformed one come back byte-identical,
- * which makes it about as misleading as a failure can be.
+ * **The bare host is load-bearing, and `www.` must not be added.** It is the
+ * canonical host and serves `/api/…` itself, while `https://www.markdownbrain.ai`
+ * answers with a `308` to it — and a redirect that crosses origins **drops the
+ * `Authorization` header**, so a request sent through one arrives with no
+ * credential and is refused as though the person were signed out. A valid token
+ * and a malformed one come back byte-identical, which makes it about as
+ * misleading as a failure can be. Runners already installed call
+ * `https://www.markdown-den.com/api/…` instead, so that origin has to go on
+ * serving `/api` itself, without a redirect, for as long as they are in use.
  *
- * It went unnoticed for as long as it did because **nothing sent a bearer here
- * until `run` did**: the login only opens a page in a browser, which follows the
- * redirect and carries no header of ours.
+ * **Nothing in a browser exercises this.** The login only opens a page, which
+ * follows any redirect and carries no header of ours; only the bearer calls
+ * `run` makes would notice.
  */
-export const APP_URL = "https://www.markdown-den.com";
+export const APP_URL = "https://markdownbrain.ai";
 
 /**
  * The **anon** key, sent as the `apikey` header.
@@ -89,8 +92,13 @@ export function keyRole(key: string): string | null {
  * that file names. **This value is not read off the repository** — the web app
  * takes its copy from an environment variable at build time — so it is the one
  * constant here worth checking against the app's own agent dialog.
+ *
+ * It is also the OAuth resource every connector grant is bound to, so it moves
+ * only together with the web app's `NEXT_PUBLIC_MCP_URL`, which must say
+ * exactly this, and the MCP server's `MCP_PUBLIC_URL`, which is this without
+ * its `/mcp`.
  */
-export const MCP_URL = "https://mcp.markdown-den.com/mcp";
+export const MCP_URL = "https://mcp.markdownbrain.ai/mcp";
 
 /**
  * The name that server is given inside the per-agent MCP file.
@@ -100,5 +108,12 @@ export const MCP_URL = "https://mcp.markdown-den.com/mcp";
  * names the harness's tools after it when it grants the session the one server
  * it was handed. Written twice, the session would be granted tools no server
  * offers and refused the ones it needs, and nothing would say so.
+ *
+ * **A file on disk written by an older binary may still carry the old name**,
+ * which is the same disagreement split across two builds. `run` rewrites each
+ * agent's file from this binary's constants when it starts, which closes it for
+ * every session `run` launches. The name also prefixes every tool a session
+ * sees (`mcp__markdownbrain__whoami`), so an allow-list or a prompt somebody
+ * wrote by hand against the old prefix stops matching when this changes.
  */
-export const MCP_SERVER_NAME = "markdown-den";
+export const MCP_SERVER_NAME = "markdownbrain";

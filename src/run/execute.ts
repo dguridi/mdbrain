@@ -11,7 +11,11 @@
 //
 // **The child is its own process group on POSIX**, so the tools a session starts
 // die with it. A harness that spawns a language server and is killed without its
-// group leaves the language server holding the terminal.
+// group leaves the language server holding the terminal. **On Windows it is on a
+// hidden console of its own**, so nothing it starts can write on the live view —
+// and that console outlives the runner, so the caller turns the runner's own
+// window closing into a stop through the registry below, or a command the
+// session's shell was running is left behind where nobody can see it.
 //
 // **There are two spawns here and not one spawn with a mode on it.** An
 // unattended session captures its streams, is detached, and is bounded by a wall
@@ -48,7 +52,8 @@ export interface SessionEnding {
  * A session **must** be reachable this way, and it is not merely tidiness on
  * POSIX: the child is spawned `detached`, in its own process group, precisely so
  * that killing it reaches the tools it started — and the cost of that is that
- * the terminal's own Ctrl-C never reaches it. Without this the runner would exit
+ * the terminal's own Ctrl-C never reaches it. On Windows the hidden console it
+ * is given costs the same thing for a different reason. Without this the runner would exit
  * while its harness sessions carried on with no terminal and nobody watching.
  */
 export type StopRegistry = (stopper: () => void) => () => void;
@@ -86,7 +91,9 @@ function stopChild(child: ReturnType<typeof spawn>, hard: boolean, isWindows: bo
   if (isWindows) {
     // A fourth thing this program shells out to, and only on the path where
     // nothing else works: Node's `kill` reaches the child and not the tree.
-    spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" }).on("error", () => {});
+    // Hidden like the session, so it neither joins a console that may be in
+    // the middle of closing nor opens one where the runner has none.
+    spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }).on("error", () => {});
     return;
   }
   try {
@@ -108,9 +115,13 @@ function stopChild(child: ReturnType<typeof spawn>, hard: boolean, isWindows: bo
  * it; stderr is captured because it is the only thing a harness that died
  * without printing a result has to say.
  *
+ * @param given whichever edges the caller holds an answer for; the rest are
+ *   the process's own. The runner hands in the platform it wired its signals
+ *   for, so a session is spawned and stopped on the same answer.
  * @returns what the session left behind — never a rejection
  */
-export function runSession(request: SessionRequest, deps: ExecuteDeps = defaultDeps): Promise<SessionEnding> {
+export function runSession(request: SessionRequest, given: Partial<ExecuteDeps> = {}): Promise<SessionEnding> {
+  const deps: ExecuteDeps = { ...defaultDeps, ...given };
   const { spawnable, cwd, wallClockMs } = request;
   const graceMs = request.graceMs ?? GRACE_MS;
 
@@ -123,6 +134,27 @@ export function runSession(request: SessionRequest, deps: ExecuteDeps = defaultD
         // Its own process group where there is one, so the kill below reaches
         // whatever the session started as well as the session.
         detached: !deps.isWindows,
+        // A console of its own on Windows, hidden, which is what the POSIX
+        // process group already gives by leaving no controlling terminal. A
+        // child otherwise shares the runner's console, and so does everything
+        // the session starts: a tool that writes to the console directly rather
+        // than to the pipes lands a line under the live view, and Ink, redrawing
+        // from where it thinks the frame starts, leaves the frame's first line
+        // behind for every such line. The pipes are unaffected.
+        //
+        // **It only holds while no stdio slot is inherited**: libuv gives the
+        // child its own console only then, and otherwise merely hides a window
+        // there is none of — so inheriting stderr here would quietly undo this.
+        // Leaving the runner's console does not let the session itself outlive
+        // the runner: libuv ties every child it did not detach to the parent's
+        // life, and a node grandchild is inside that same job. **A command the
+        // session's shell is running is not**: a shell is not libuv, its
+        // children break away from the job, and this hidden console is not
+        // closed by the runner going, so such a command sits on it afterwards
+        // unless something walks the tree first. That is why the runner treats
+        // its own window closing as a stop and walks the tree through the
+        // registry below while the shell is still there to be walked.
+        windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
       });
     } catch (cause) {
