@@ -7,9 +7,12 @@ import {
   agentChoices,
   agentDefaults,
   assembleConfig,
+  carriedEntries,
+  carriedOver,
   completePath,
   connectionKeyVariableFor,
   DRAFT_VERSION,
+  idsToForget,
   judgeCeiling,
   judgeCwd,
   judgeDuration,
@@ -152,12 +155,13 @@ describe("the roster as the screen offers it", () => {
     expect(renamed).toEqual([]);
   });
 
-  it("105-S15: a configured entry the roster no longer holds is offered, marked, and labelled as gone", () => {
+  it("105-S15: a configured entry the roster no longer holds is offered, unmarked, and labelled as gone", () => {
     const config = existing();
     config.agents["vanished-bot"] = { ...config.agents["dev-bot-mdden"], id: "a-gone" };
     const { options, preselected, disappeared } = agentChoices(roster, config);
     expect(disappeared).toEqual([{ name: "vanished-bot", id: "a-gone", reason: "no longer in the roster" }]);
-    expect(preselected).toContain("a-gone");
+    // Unmarked since 158-S3: its agent was deleted, and its keys with it.
+    expect(preselected).not.toContain("a-gone");
     const gone = options.find((o) => o.value === "a-gone");
     expect(gone?.label).toBe("vanished-bot — no longer in the roster");
     expect(gone?.name).toBe("vanished-bot");
@@ -484,6 +488,107 @@ describe("a configure that did not finish", () => {
     // unusable: a draft is a convenience, and half of one still helps.
     const bent = parseDraft(JSON.stringify({ version: DRAFT_VERSION, chosen: "a-1", agents: { "a-1": { cwd: 7, bounds: "no" } } }));
     expect(bent).toEqual({ version: DRAFT_VERSION, chosen: [], dropped: [], agents: { "a-1": { id: "a-1" } } });
+  });
+});
+
+describe("158: an agent deleted and created again under the same name", () => {
+  const recreatedConfig = (): Config => {
+    const config = existing();
+    config.agents["dev-bot-mdden"] = { ...config.agents["dev-bot-mdden"], id: "a-old" };
+    return config;
+  };
+
+  it("158-S1: the entry is asked about as recreated, and the dead id is never offered as a row", () => {
+    const choices = agentChoices(roster, recreatedConfig());
+    expect(choices.recreated).toEqual([{ name: "dev-bot-mdden", id: "a-1", previousId: "a-old" }]);
+    expect(choices.disappeared).toEqual([]);
+    expect(choices.options.map((o) => o.value)).not.toContain("a-old");
+    expect(choices.preselected).toEqual(["a-1"]);
+  });
+
+  it("158-S1: the carried-over config keeps every field of the entry and swaps only the id", () => {
+    const config = recreatedConfig();
+    const carried = carriedOver(config, agentChoices(roster, config).recreated);
+    expect(carried?.agents["dev-bot-mdden"]).toEqual({ ...config.agents["dev-bot-mdden"], id: "a-1" });
+    // Nothing to carry is the config itself, not a copy that could drift from it.
+    expect(carriedOver(existing(), [])).toEqual(existing());
+  });
+
+  it("158-S1: an entry still visible under its old id is not a deletion, and two namesakes are not guessed between", () => {
+    // Visible but no longer managed: the old agent and its key both still exist.
+    const stillThere = agentChoices(roster, recreatedConfig(), new Set(["a-old"]));
+    expect(stillThere.recreated).toEqual([]);
+    expect(stillThere.disappeared).toEqual([{ name: "dev-bot-mdden", id: "a-old", reason: "no longer an agent you manage" }]);
+
+    const twins: RosterAgent[] = [...roster, { id: "a-9", name: "dev-bot-mdden", organization: "other org", status: "active" }];
+    const ambiguous = agentChoices(twins, recreatedConfig());
+    expect(ambiguous.recreated).toEqual([]);
+    expect(ambiguous.disappeared.map((d) => d.id)).toEqual(["a-old"]);
+  });
+
+  it("158-S1: a namesake this machine already configures is a rename of its own entry, not the dead entry's replacement", () => {
+    // The roster's dev-bot-mdden is a-1, which is configured here as dev-bot and
+    // was renamed onto the dead entry's name. Carrying the dead entry over to a-1
+    // as well would put two entries on one id.
+    const config = recreatedConfig();
+    config.agents["dev-bot"] = { ...config.agents["dev-bot-mdden"], id: "a-1" };
+    const choices = agentChoices(roster, config);
+    expect(choices.recreated).toEqual([]);
+    expect(choices.renamed).toEqual([{ from: "dev-bot", to: "dev-bot-mdden", id: "a-1" }]);
+    expect(choices.disappeared).toEqual([{ name: "dev-bot-mdden", id: "a-old", reason: "no longer in the roster" }]);
+    expect(choices.preselected).toEqual(["a-1"]);
+  });
+
+  it("158-S2: only a carry-over that was not declined and is still chosen needs a key minted for it", () => {
+    const recreated = agentChoices(roster, recreatedConfig()).recreated;
+    expect(carriedEntries(recreated, answersFor([["dev-bot-mdden", "a-1"]]))).toEqual(recreated);
+    expect(carriedEntries(recreated, { ...answersFor([["dev-bot-mdden", "a-1"]]), notCarried: recreated })).toEqual([]);
+    expect(carriedEntries(recreated, answersFor([["spec-warden", "a-2"]]))).toEqual([]);
+  });
+
+  it("158-S3: an entry gone with no namesake is listed unmarked; one no longer yours to manage stays marked", () => {
+    const config = existing();
+    config.agents["vanished-bot"] = { ...config.agents["dev-bot-mdden"], id: "a-gone" };
+    config.agents["theirs-now"] = { ...config.agents["dev-bot-mdden"], id: "a-theirs" };
+    const { options, preselected } = agentChoices(roster, config, new Set(["a-theirs"]));
+    expect(options.find((o) => o.value === "a-gone")?.label).toBe("vanished-bot — no longer in the roster");
+    expect(preselected).not.toContain("a-gone");
+    expect(preselected).toContain("a-theirs");
+  });
+
+  it("158-S4: every id configured before and not after is forgotten, the carried-over entry's old id among them", () => {
+    const before = recreatedConfig();
+    before.agents["spec-warden"] = { ...before.agents["dev-bot-mdden"], id: "a-2" };
+    const after = assembleConfig(answersFor([["dev-bot-mdden", "a-1"]]));
+    expect(idsToForget(before, after).sort()).toEqual(["a-2", "a-old"]);
+    expect(idsToForget(null, after)).toEqual([]);
+  });
+
+  it("158-S5: a failed mint with a key still held names the prefix and the check, and does not say there is no key", () => {
+    const config = assembleConfig(answersFor([["dev-bot-mdden", "a-1"]]));
+    const report = { path: "/c/config.json", mcpPaths: {}, removed: [] };
+    const held = summaryLines(config, report, [], [], {
+      "dev-bot-mdden": { kind: "failed", problem: "Agent not found", heldPrefix: "ab12cd34" },
+    }).join("\n");
+    expect(held).toContain("the server would not mint a new key (Agent not found)");
+    expect(held).toContain("The key already on this machine (smd_agent_ab12cd34…) was kept, and may not work");
+    expect(held).toContain("mdbrain agents check dev-bot-mdden");
+    expect(held).not.toContain("no connection key");
+
+    const none = summaryLines(config, report, [], [], { "dev-bot-mdden": { kind: "failed", problem: "Agent not found" } }).join("\n");
+    expect(none).toContain("no connection key: Agent not found.");
+  });
+
+  it("158-S2: the summary says an entry was carried over, and says so when one was declined", () => {
+    const report = { path: "/c/config.json", mcpPaths: {}, removed: [] };
+    const carried = summaryLines(assembleConfig(answersFor([["dev-bot-mdden", "a-1"]])), report, [], [], {
+      "dev-bot-mdden": { kind: "carried" },
+    }).join("\n");
+    expect(carried).toContain("carried over from the deleted agent: a connection key was requested for the new one");
+
+    const recreated = [{ name: "dev-bot-mdden", id: "a-1", previousId: "a-old" }];
+    const declined = summaryLines(assembleConfig(answersFor([["spec-warden", "a-2"]])), report, [], [], {}, recreated).join("\n");
+    expect(declined).toContain("dev-bot-mdden was dropped: it was deleted and created again in markdown-den");
   });
 });
 
@@ -867,6 +972,43 @@ describe("the screen", () => {
     for (let i = 0; i < 8; i++) { dropped.stdin.write("\r"); await tick(); }
     expect((done as unknown as Answers).dropped).toEqual([{ from: "dev-bot", to: "dev-bot-mdden", id: "a-1" }]);
     expect((done as unknown as Answers).agents.map((a) => a.name)).toEqual(["spec-warden"]);
+  });
+  it("158-S1: asks whether to carry a recreated agent over; yes keeps every answer under the new id", async () => {
+    const config = existing();
+    config.agents["dev-bot-mdden"] = { ...config.agents["dev-bot-mdden"], id: "a-old" };
+    const choices = agentChoices(roster, config);
+    let done: Answers | null = null;
+    const { lastFrame, stdin } = render(
+      configureScreen(plan({ choices, existing: carriedOver(config, choices.recreated) }), (a) => { done = a; }),
+    );
+    await tick();
+    // The frame wraps a long line, so the question is checked in pieces that each fit on one.
+    expect(lastFrame()).toContain("dev-bot-mdden was deleted and created again");
+    expect(lastFrame()).toContain("over to the new one?");
+    stdin.write("\r");
+    await tick();
+    expect(lastFrame()).toContain("Which agents does this machine run?");
+    expect(lastFrame()).not.toContain("no longer in the roster");
+    for (let i = 0; i < 10 && done === null; i++) { stdin.write("\r"); await tick(); }
+    const answers = done as unknown as Answers;
+    expect(answers.agents.map((a) => [a.name, a.id])).toEqual([["dev-bot-mdden", "a-1"]]);
+    expect(answers.agents[0].cwd).toBe(cwd);
+    expect(answers.agents[0].bounds).toEqual({ maxTurns: 40, maxBudgetUsd: 3, wallClock: "20m" });
+    expect(answers.notCarried).toEqual([]);
+  });
+
+  it("158-S1: no drops the entry, so the list arrives with the new agent unmarked", async () => {
+    const config = existing();
+    config.agents["dev-bot-mdden"] = { ...config.agents["dev-bot-mdden"], id: "a-old" };
+    const choices = agentChoices(roster, config);
+    const { lastFrame, stdin } = render(configureScreen(plan({ choices, existing: carriedOver(config, choices.recreated) }), () => {}));
+    await tick();
+    stdin.write("n");
+    await tick();
+    expect(lastFrame()).toContain("Which agents does this machine run?");
+    stdin.write("\r");
+    await tick();
+    expect(lastFrame()).toContain("Pick at least one agent");
   });
 });
 
@@ -1309,5 +1451,177 @@ describe("the command", () => {
     );
     expect(code).toBe(1);
     expect(err[0]).toMatch(/mdbrain login/);
+  });
+  it("158-S23: --new-keys revokes the replaced key once the new one is read back, and the summary names it", async () => {
+    validSession();
+    const store = memoryKeyStore({ "a-1": "smd_agent_ab12cd34_old" });
+    const calls: string[] = [];
+    const { out, context } = io();
+    context.flags["new-keys"] = true;
+    const reply = (url: string, init?: RequestInit) => {
+      if (url.includes("rpc/mint_agent_key")) calls.push(`mint, store holds ${store.held.get("a-1")}`);
+      if (url.includes("rpc/list_agent_keys")) {
+        calls.push(`list, store holds ${store.held.get("a-1")}`);
+        return new Response(JSON.stringify([{ id: "k-old", key_prefix: "ab12cd34", created_at: "2026-10-01", last_used_at: null, revoked_at: null }]), { status: 200 });
+      }
+      if (url.includes("rpc/revoke_agent_key")) {
+        calls.push(`revoke ${String(init?.body)}`);
+        return new Response(null, { status: 204 });
+      }
+      return rosterReply(url);
+    };
+    const original = globalThis.fetch;
+    globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => Promise.resolve(reply(String(input), init))) as typeof fetch;
+    try {
+      expect(await runConfigure(deps({ openKeyStore: async () => store }), context)).toBe(0);
+    } finally {
+      globalThis.fetch = original;
+    }
+    expect(calls).toEqual([
+      "mint, store holds smd_agent_ab12cd34_old",
+      "list, store holds smd_agent_abcdef01_minted",
+      'revoke {"p_key_id":"k-old"}',
+    ]);
+    const said = out.join("\n");
+    expect(said).toContain("replacing the one that was here, which was revoked (smd_agent_ab12cd34…)");
+    expect(said).not.toContain("stays live until it is revoked in the app");
+  });
+
+  it("158-S23: a revoke that fails leaves the summary naming the replaced key as still live", async () => {
+    validSession();
+    const store = memoryKeyStore({ "a-1": "smd_agent_ab12cd34_old" });
+    const { out, context } = io();
+    context.flags["new-keys"] = true;
+    const code = await withFetch(
+      (url) =>
+        url.includes("rpc/list_agent_keys")
+          ? new Response(JSON.stringify({ message: "permission denied" }), { status: 403 })
+          : rosterReply(url),
+      () => runConfigure(deps({ openKeyStore: async () => store }), context),
+    );
+    expect(code).toBe(0);
+    expect(store.held.get("a-1")).toBe("smd_agent_abcdef01_minted");
+    expect(out.join("\n")).toContain(
+      "replacing the one that was here; that key (smd_agent_ab12cd34…) is still live in markdown-den: revoke it on the agent's page",
+    );
+  });
+
+  it("158-S2: a carried-over entry gets a key for its new id without --new-keys, and the old id's key is forgotten", async () => {
+    validSession();
+    mkdirSync(join(root, "config"), { recursive: true });
+    writeFileSync(configPath(), serializeConfig({ ...existing(), agents: { "dev-bot-mdden": { ...existing().agents["dev-bot-mdden"], id: "a-old" } } }));
+    // A key already under the new id as well, so a mint can only be the carry-over forcing one.
+    const store = memoryKeyStore({ "a-old": "smd_agent_0ld0ld00_dead", "a-1": "smd_agent_11111111_stray" });
+    let mints = 0;
+    let offered: ScreenPlan | null = null;
+    const { out, context } = io();
+    const code = await withFetch(
+      (url) => {
+        if (url.includes("rpc/mint_agent_key")) mints += 1;
+        return rosterReply(url);
+      },
+      () =>
+        runConfigure(
+          deps({
+            openKeyStore: async () => store,
+            ask: async (p) => {
+              offered = p;
+              return answersFor([["dev-bot-mdden", "a-1"]]);
+            },
+          }),
+          context,
+        ),
+    );
+    expect(code).toBe(0);
+    const asked = offered as unknown as ScreenPlan;
+    expect(asked.choices.recreated).toEqual([{ name: "dev-bot-mdden", id: "a-1", previousId: "a-old" }]);
+    expect(asked.existing?.agents["dev-bot-mdden"].id).toBe("a-1");
+    expect(mints).toBe(1);
+    expect(store.held.get("a-1")).toBe("smd_agent_abcdef01_minted");
+    expect(store.held.has("a-old")).toBe(false);
+    expect(out.join("\n")).toContain("carried over from the deleted agent");
+  });
+
+  it("158-S4: an entry configured before and unmarked now has its key forgotten once the write lands", async () => {
+    validSession();
+    const before = existing();
+    before.agents["spec-warden"] = { ...before.agents["dev-bot-mdden"], id: "a-2" };
+    mkdirSync(join(root, "config"), { recursive: true });
+    writeFileSync(configPath(), serializeConfig(before));
+    const store = memoryKeyStore({ "a-1": "smd_agent_aaaaaaaa_kept", "a-2": "smd_agent_bbbbbbbb_left" });
+    const { out, context } = io();
+    expect(await withFetch(rosterReply, () => runConfigure(deps({ openKeyStore: async () => store }), context))).toBe(0);
+    expect(store.held.get("a-1")).toBe("smd_agent_aaaaaaaa_kept");
+    expect(store.held.has("a-2")).toBe(false);
+    // a-2 is not in the roster this reply returns, so it is gone and nothing is said about its key.
+    expect(out.join("\n")).not.toContain("smd_agent_bbbbbbbb");
+  });
+
+  it("158-S4: forgetting the key of an agent that still exists names it as still live, and does not revoke it", async () => {
+    validSession();
+    const before = existing();
+    before.agents["spec-warden"] = { ...before.agents["dev-bot-mdden"], id: "a-2" };
+    mkdirSync(join(root, "config"), { recursive: true });
+    writeFileSync(configPath(), serializeConfig(before));
+    const store = memoryKeyStore({ "a-1": "smd_agent_aaaaaaaa_kept", "a-2": "smd_agent_bbbbbbbb_left" });
+    const revoked: string[] = [];
+    const bothAgents = (url: string) => {
+      if (url.includes("rpc/revoke_agent_key")) revoked.push(url);
+      return url.includes("/agents")
+        ? new Response(
+            JSON.stringify([
+              { id: "a-1", org_id: "o-1", display_name: "dev-bot-mdden", status: "active", bot_user_id: "u-1" },
+              { id: "a-2", org_id: "o-1", display_name: "spec-warden", status: "active", bot_user_id: "u-2" },
+            ]),
+            { status: 200 },
+          )
+        : rosterReply(url);
+    };
+    const { out, context } = io();
+    expect(await withFetch(bothAgents, () => runConfigure(deps({ openKeyStore: async () => store }), context))).toBe(0);
+    expect(store.held.has("a-2")).toBe(false);
+    expect(revoked).toEqual([]);
+    expect(out.join("\n")).toContain(
+      "spec-warden is no longer configured here: the key smd_agent_bbbbbbbb… is still live in markdown-den; revoke it on the agent's page if nothing else uses it.",
+    );
+  });
+
+  it("158-S5: a refused mint with a key still held says the key was kept and names the check", async () => {
+    validSession();
+    const store = memoryKeyStore({ "a-1": "smd_agent_ab12cd34_old" });
+    const { out, context } = io();
+    context.flags["new-keys"] = true;
+    const code = await withFetch(
+      (url) =>
+        url.includes("rpc/mint_agent_key")
+          ? new Response(JSON.stringify({ message: "Agent not found" }), { status: 400, headers: { "content-type": "application/json" } })
+          : rosterReply(url),
+      () => runConfigure(deps({ openKeyStore: async () => store }), context),
+    );
+    expect(code).toBe(0);
+    const said = out.join("\n");
+    expect(said).toContain("smd_agent_ab12cd34…");
+    expect(said).toContain("mdbrain agents check dev-bot-mdden");
+    expect(said).not.toContain("no connection key");
+    expect(store.held.get("a-1")).toBe("smd_agent_ab12cd34_old");
+  });
+
+  it("a refused mint whose message echoes the person's bearer is redacted in the summary", async () => {
+    validSession();
+    const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJwZXJzb24ifQ.c2lnbmF0dXJlLXBhcnQ";
+    const store = memoryKeyStore({ "a-1": "smd_agent_ab12cd34_old" });
+    const { out, context } = io();
+    context.flags["new-keys"] = true;
+    await withFetch(
+      (url) =>
+        url.includes("rpc/mint_agent_key")
+          ? new Response(JSON.stringify({ message: `bad gateway, request was Authorization: Bearer ${jwt}` }), { status: 502, headers: { "content-type": "application/json" } })
+          : rosterReply(url),
+      () => runConfigure(deps({ openKeyStore: async () => store }), context),
+    );
+    const said = out.join("\n");
+    expect(said).toContain("the server would not mint a new key");
+    expect(said).not.toContain(jwt);
+    expect(said).toContain("[redacted]");
   });
 });

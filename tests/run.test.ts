@@ -12,6 +12,7 @@ import {
   placeWork,
   planStartup,
   renamedAgents,
+  rosterView,
   summaryLines,
   tickPlan,
   type PollNowState,
@@ -178,12 +179,42 @@ describe("run: startup", () => {
   });
 
   it("105-S21: a configured name the roster does not hold is held; the same id under a new name is reported as a rename", () => {
-    const held = planStartup(config({ "dev-bot": entry() }), { ANTHROPIC_API_KEY: "x" }, () => true, new Set(["someone-else"]));
+    const held = planStartup(config({ "dev-bot": entry() }), { ANTHROPIC_API_KEY: "x" }, () => true, rosterView([{ id: "agent-9", display_name: "someone-else" }]));
     expect(held.asking).toEqual([]);
     expect(held.held[0].reason).toContain("not in the roster");
 
     const renamed = renamedAgents(config({ "dev-bot": entry({ id: "agent-1" }) }), new Map([["dev-bot-mdden", "agent-1"]]));
     expect(renamed).toEqual([{ configuredAs: "dev-bot", nowCalled: "dev-bot-mdden", id: "agent-1" }]);
+  });
+
+  it("158-S6: a name the roster holds under a different id is held as recreated rather than asked for", () => {
+    const plan = planStartup(
+      config({ "dev-bot": entry({ id: "agent-old" }) }),
+      { ANTHROPIC_API_KEY: "x" },
+      () => true,
+      rosterView([{ id: "agent-new", display_name: "dev-bot" }]),
+    );
+    expect(plan.asking).toEqual([]);
+    expect(plan.held).toEqual([
+      { agent: "dev-bot", reason: "its agent was deleted in markdown-den, and an agent of the same name now has a new id: run mdbrain configure." },
+    ]);
+
+    // A rename is still held the way it always was: the id is there, the name is not.
+    const renamed = planStartup(
+      config({ "dev-bot": entry({ id: "agent-1" }) }),
+      { ANTHROPIC_API_KEY: "x" },
+      () => true,
+      rosterView([{ id: "agent-1", display_name: "dev-bot-mdden" }]),
+    );
+    expect(renamed.held[0].reason).toContain("not in the roster");
+
+    const live = planStartup(
+      config({ "dev-bot": entry({ id: "agent-1" }) }),
+      { ANTHROPIC_API_KEY: "x" },
+      () => true,
+      rosterView([{ id: "agent-1", display_name: "dev-bot" }]),
+    );
+    expect(live.asking).toEqual(["dev-bot"]);
   });
 
   it("105-S22: the summary names the agents held and why, and the run log", () => {
@@ -252,7 +283,7 @@ describe("run: startup", () => {
       config({ bob: entry({ pollsWork: false, env: { harness: "B_KEY", connectionKey: "K_B" }, cwd: "/gone" }) }),
       {},
       () => false,
-      new Set(["somebody-else"]),
+      rosterView([{ id: "agent-9", display_name: "somebody-else" }]),
     );
     expect(wouldHold.held).toEqual([]);
     expect(wouldHold.attended).toEqual(["bob"]);

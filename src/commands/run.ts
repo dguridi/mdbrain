@@ -38,7 +38,7 @@ import { configPath } from "../config/paths.ts";
 import { keyStorageLine, openConnectionKeyStore, type ConnectionKeyStore } from "../config/secrets.ts";
 import { holdConnectionKeys, type HeldKey } from "../run/connection-keys.ts";
 import { readWork, type WorkUnit } from "../work/instruction.ts";
-import { answerPollNow, CLAIM_LIMIT, placeWork, planStartup, renamedAgents, summaryLines, tickPlan, type Startup } from "../run/loop.ts";
+import { answerPollNow, CLAIM_LIMIT, placeWork, planStartup, renamedAgents, rosterView, summaryLines, tickPlan, type RosterView, type Startup } from "../run/loop.ts";
 import { credentialsCollide, harnessFor } from "../run/harness.ts";
 import { runSession, type StopRegistry } from "../run/execute.ts";
 import { readOutcome, type Outcome } from "../run/outcome.ts";
@@ -344,7 +344,7 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
   // The roster is read once. A change while running is picked up by a restart,
   // which is what a `configure` ends in anyway — and polling it would be a
   // second network call per tick to answer a question that almost never changes.
-  let rosterNames: Set<string> | null = null;
+  let roster: RosterView | null = null;
   let rosterById = new Map<string, string>();
   // Who each agent *is*, which is what a presence payload carries. Empty when
   // the roster could not be read — and an empty one is why a runner that started
@@ -352,7 +352,7 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
   const identities = new Map<string, AgentIdentity>();
   try {
     const agents = await deps.roster(session.accessToken);
-    rosterNames = new Set(agents.map((a) => a.display_name));
+    roster = rosterView(agents);
     rosterById = new Map(agents.map((a) => [a.display_name, a.id]));
     for (const agent of agents) {
       identities.set(agent.display_name, { userId: agent.bot_user_id, name: agent.display_name });
@@ -377,7 +377,7 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
     err(`Could not read the roster: ${redactSecrets((cause as Error).message)}. Starting anyway; a configured name that no longer exists will simply receive no work.`);
   }
 
-  const { startup, mcpFiles } = await writeMcpFiles(deps, config, planStartup(config, deps.env, deps.directoryExists, rosterNames));
+  const { startup, mcpFiles } = await writeMcpFiles(deps, config, planStartup(config, deps.env, deps.directoryExists, roster));
 
   let keyStore: ConnectionKeyStore;
   try {

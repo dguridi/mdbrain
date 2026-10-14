@@ -50,6 +50,23 @@ export interface ConnectionKeyStore {
   forget(agentId: string): Promise<void>;
 }
 
+/**
+ * The public part of a connection key: the 8 hex characters `mint_agent_key`
+ * puts after `smd_agent_`, which the server stores as `key_prefix` and the
+ * agent's page in the app shows. Null for anything not shaped like a key.
+ *
+ * This is the only part of a key any surface may print, and it is what ties the
+ * key on this machine to a row the owner can see and revoke.
+ */
+export function keyPrefixOf(key: string): string | null {
+  return /^smd_agent_([0-9a-f]{8})_/.exec(key)?.[1] ?? null;
+}
+
+/** A key prefix as every surface writes it, so that no surface can print more of the key. */
+export function shownKey(prefix: string): string {
+  return `smd_agent_${prefix}…`;
+}
+
 /** The file the fallback writes, under the state root and nowhere else. */
 export function secretsPath(env?: PathEnv): string {
   return join(stateDir(env), "secrets.json");

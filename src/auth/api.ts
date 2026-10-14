@@ -8,6 +8,11 @@
 // session and hands it over, so there is no call that trades anything for
 // tokens.
 //
+// **One call is made as an agent rather than as the person**: `presentConnectionKey`
+// hands an agent's connection key to the MCP server exactly as a harness session
+// would, because the server is the only thing that can say whether a key works,
+// and it says so to that key's bearer and nobody else.
+//
 // One call receives a credential rather than sending one: `mintAgentKey` asks
 // the server for an agent's connection key. It is worth being exact about the
 // direction, because the two are easy to conflate — the key is **minted by the
@@ -18,7 +23,7 @@
 // over, and asking again cannot change that; a network failure is the person's
 // to see and act on. A loop here would turn one clear sentence into a hang.
 
-import { ANON_KEY, APP_URL, PROJECT_URL } from "./project.ts";
+import { ANON_KEY, APP_URL, MCP_URL, PROJECT_URL } from "./project.ts";
 import type { StoredSession } from "./session.ts";
 import { STARTUP_ASK_TIMEOUT_MS, versionHeader } from "../upgrade/floor.ts";
 import { VERSION } from "../version.ts";
@@ -493,4 +498,113 @@ export async function claimWork(
   );
   if (!res.ok) throw new AuthError(res.status, await readError(res));
   return res.json();
+}
+
+/** One of an agent's connection keys as the owner may see it: never the secret, never its hash. */
+export interface KeyRow {
+  id: string;
+  key_prefix: string;
+  created_at: string;
+  last_used_at: string | null;
+  revoked_at: string | null;
+}
+
+/**
+ * Every connection key an agent has, revoked ones included, newest first.
+ *
+ * Owner-gated by the same `assert_agent_org_owner` as the mint, so a refusal
+ * here is an answer about the person's rights and not about the key. It is what
+ * lets a refused key be explained: the prefix this machine holds is either in the
+ * list, revoked or not, or it is a key markdown-den does not know for the agent.
+ */
+export async function listAgentKeys(accessToken: string, agentId: string): Promise<KeyRow[]> {
+  const res = await fetch(`${PROJECT_URL}/rest/v1/rpc/list_agent_keys`, {
+    method: "POST",
+    headers: headers(accessToken),
+    body: JSON.stringify({ p_agent_id: agentId }),
+  });
+  if (!res.ok) throw new AuthError(res.status, await readError(res));
+  return (await res.json()) as KeyRow[];
+}
+
+/** What the MCP server said to a connection key: the HTTP status, and `whoami`'s answer when there was one. */
+export interface KeyAnswer {
+  status: number;
+  /** The text `whoami` returned, which is JSON describing the agent. Null unless the status is 200. */
+  whoami: string | null;
+}
+
+/**
+ * Present a connection key to the MCP server the way a harness session does,
+ * and ask it `whoami`.
+ *
+ * Two POSTs, because the server is stateless: every request is authenticated on
+ * its own and nothing carries from one to the next, so the handshake is only
+ * there to be the request a client would make first. **A refused key is
+ * answered 401 on the first of them**, before any tool runs, which is the whole
+ * of what a check needs to know; the second is what tells an accepted key which
+ * brains it can reach.
+ *
+ * Only the key is sent — no session, no `apikey` — so this works for a person
+ * who is signed out, and it says nothing about them to the server.
+ *
+ * **It is a read of the key's standing, and not of nothing**: the server stamps
+ * a key it accepts with `last_used_at`, so a checked key reads as used on the
+ * agent's page whether or not a session ran.
+ *
+ * @param signal bounds the wait; a caller that has to decide quickly (`as`)
+ *   passes a short one, and a network failure or an abort is thrown rather than
+ *   answered, because it is not a verdict on the key
+ * @param handshakeOnly stop after the first POST, for a caller that needs the
+ *   verdict and not the brains: a 200 then answers with `whoami: null`
+ */
+export async function presentConnectionKey(key: string, signal?: AbortSignal, handshakeOnly = false): Promise<KeyAnswer> {
+  const post = (body: unknown, extra: Record<string, string> = {}) =>
+    fetch(MCP_URL, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${key}`,
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        ...extra,
+      },
+      body: JSON.stringify(body),
+      ...(signal === undefined ? {} : { signal }),
+    });
+  const init = await post({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "mdbrain", version: VERSION } },
+  });
+  if (init.status !== 200 || handshakeOnly) {
+    await init.body?.cancel();
+    return { status: init.status, whoami: null };
+  }
+  const handshake = (await init.json().catch(() => null)) as { result?: { protocolVersion?: unknown } } | null;
+  const negotiated = handshake?.result?.protocolVersion;
+  const call = await post(
+    { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "whoami", arguments: {} } },
+    typeof negotiated === "string" ? { "mcp-protocol-version": negotiated } : {},
+  );
+  if (call.status !== 200) {
+    await call.body?.cancel();
+    return { status: call.status, whoami: null };
+  }
+  const answer = (await call.json().catch(() => null)) as { result?: { content?: Array<{ text?: unknown }> } } | null;
+  const text = answer?.result?.content?.[0]?.text;
+  return { status: 200, whoami: typeof text === "string" ? text : null };
+}
+
+/**
+ * Revoke one connection key by its row id. Owner-gated, and a key already
+ * revoked is left as it was rather than refused.
+ */
+export async function revokeAgentKey(accessToken: string, keyId: string): Promise<void> {
+  const res = await fetch(`${PROJECT_URL}/rest/v1/rpc/revoke_agent_key`, {
+    method: "POST",
+    headers: headers(accessToken),
+    body: JSON.stringify({ p_key_id: keyId }),
+  });
+  if (!res.ok) throw new AuthError(res.status, await readError(res));
 }

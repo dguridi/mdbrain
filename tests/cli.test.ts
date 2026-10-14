@@ -30,7 +30,7 @@ describe("the command line", () => {
     expect(await dispatch(["--help"], COMMANDS, VERSION, io)).toBe(0);
     const help = out.join("\n");
     for (const command of COMMANDS) expect(help).toContain(command.name);
-    expect(COMMANDS.map((c) => c.name)).toEqual(["login", "whoami", "logout", "configure", "run", "as", "upgrade"]);
+    expect(COMMANDS.map((c) => c.name)).toEqual(["login", "whoami", "logout", "configure", "run", "as", "agents", "upgrade"]);
   });
 
   it("96-S22a: every command carries a summary, so help cannot go stale silently", () => {

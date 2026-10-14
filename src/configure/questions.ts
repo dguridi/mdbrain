@@ -16,9 +16,11 @@
 // rather than silently dropped. **A credential variable that is not
 // set in this shell is warned about, not refused**: it may well be set in the
 // shell `run` is started from, and refusing would force the two commands to
-// share a shell. **A configured agent the roster no longer holds is kept and
-// marked, never dropped silently**: a dropped entry is indistinguishable from
-// one never configured, so anything that does drop one says so. And **two
+// share a shell. **A configured agent the roster no longer holds is still
+// listed, never dropped silently**: a dropped entry is indistinguishable from
+// one never configured, so anything that does drop one says so. It arrives
+// marked only while its key can still work, and an agent deleted and created
+// again under its name is offered as a carry-over to the new id. And **two
 // agents with one display name cannot both be run here**: the file is keyed by
 // name because the claim request matches by name, so a second agent of the
 // same name would either overwrite the first or receive its work.
@@ -35,7 +37,8 @@
 
 import { basename, dirname, isAbsolute, join, resolve as resolvePath, sep } from "node:path";
 import type { Agent, Membership, Organization } from "../auth/api.ts";
-import type { SecretBackend } from "../config/secrets.ts";
+import { shownKey, type SecretBackend } from "../config/secrets.ts";
+import type { Retirement } from "../agents/retire.ts";
 import {
   CONFIG_VERSION,
   DEFAULT_BOUNDS,
@@ -214,50 +217,112 @@ export interface RenamedEntry {
   id: string;
 }
 
+/**
+ * A configured entry whose agent was deleted and created again under the same
+ * name: the roster holds a managed agent called `name` under `id`, and the
+ * entry still names `previousId`, which no longer exists.
+ */
+export interface RecreatedEntry {
+  name: string;
+  /** The new agent's id — what the entry is carried over to. */
+  id: string;
+  /** The id the entry was configured under, whose keys the deletion took with it. */
+  previousId: string;
+}
+
 /** What the first question offers. */
 export interface AgentChoices {
   options: AgentOption[];
-  /** The ids marked on arrival — every entry the existing config has. */
+  /** The ids marked on arrival — every entry the existing config has whose agent can still be run. */
   preselected: string[];
   disappeared: DisappearedEntry[];
   renamed: RenamedEntry[];
+  recreated: RecreatedEntry[];
 }
+
+/** What is said about an entry whose agent is gone from every roster this account can read. */
+export const GONE_FROM_ROSTER = "no longer in the roster";
 
 /**
  * The agent list, from the live roster and whatever is configured already.
  *
- * A disappeared entry is still offered — labelled as such, and marked — so the
- * person deselects it or keeps it. A renamed entry is offered under its new
- * name, since the request matches by name and an entry under the old one would
- * ask for nobody's work and receive none.
+ * A disappeared entry is still offered, labelled as such, so the person can
+ * mark it or leave it. A renamed entry is offered under its new name, since the
+ * request matches by name and an entry under the old one would ask for nobody's
+ * work and receive none.
+ *
+ * **A recreated agent is the one absence that is not offered as a row.** Its
+ * entry's id was deleted along with every key the server held for it, so the
+ * entry can never work again; the agent that replaced it has the same name and
+ * a new id, and is asked about as a carry-over instead. Offering both would put
+ * two rows of one name on the list, which `judgeSelection` refuses to let a
+ * person mark together, and the one already marked would be the dead one.
+ *
+ * **Recreated needs exactly one namesake, and an id nobody can see.** A deleted
+ * agent is invisible to every read; an agent that is merely in an organization
+ * this account no longer owns is still visible, still has its key, and is not a
+ * deletion. And with two managed agents of that name there is no telling which
+ * one replaced it, so neither is guessed at.
  */
 export function agentChoices(roster: RosterAgent[], existing: Config | null, stillVisible: Set<string> = new Set()): AgentChoices {
   const byId = new Map(roster.map((a) => [a.id, a]));
+  const byName = new Map<string, RosterAgent[]>();
+  for (const agent of roster) byName.set(agent.name, [...(byName.get(agent.name) ?? []), agent]);
   const options: AgentOption[] = roster.map((a) => ({
     value: a.id,
     name: a.name,
     label: `${a.organization} / ${a.name}${a.status === "active" ? "" : ` (${a.status})`}`,
   }));
+  const configuredIds = new Set(Object.values(existing?.agents ?? {}).map((entry) => entry.id));
   const preselected: string[] = [];
   const disappeared: DisappearedEntry[] = [];
   const renamed: RenamedEntry[] = [];
+  const recreated: RecreatedEntry[] = [];
   for (const [name, entry] of Object.entries(existing?.agents ?? {})) {
-    preselected.push(entry.id);
     const live = byId.get(entry.id);
     if (!live) {
+      const namesakes = byName.get(name) ?? [];
+      const visible = stillVisible.has(entry.id);
+      if (!visible && namesakes.length === 1 && !configuredIds.has(namesakes[0].id)) {
+        recreated.push({ name, id: namesakes[0].id, previousId: entry.id });
+        preselected.push(namesakes[0].id);
+        continue;
+      }
       // Two different absences, and telling them apart matters: an agent this
-      // account can still see but no longer owns has not been deleted, and
-      // saying "no longer in the roster" about it would be a lie a person might
-      // act on. The entry is kept and marked either way — its key still works
-      // until somebody revokes it — but it is marked for the right reason.
-      const reason = stillVisible.has(entry.id) ? "no longer an agent you manage" : "no longer in the roster";
+      // account can still see but no longer owns has not been deleted, and its
+      // key still works until somebody revokes it, so it stays marked. A deleted
+      // agent's keys went with it, so its entry is offered unmarked: keeping it
+      // is still possible, but Enter no longer keeps a key that cannot work.
+      const reason = visible ? "no longer an agent you manage" : GONE_FROM_ROSTER;
       disappeared.push({ name, id: entry.id, reason });
       options.push({ value: entry.id, name, label: `${name} — ${reason}` });
-    } else if (live.name !== name) {
-      renamed.push({ from: name, to: live.name, id: entry.id });
+      if (visible) preselected.push(entry.id);
+      continue;
     }
+    preselected.push(entry.id);
+    if (live.name !== name) renamed.push({ from: name, to: live.name, id: entry.id });
   }
-  return { options, preselected, disappeared, renamed };
+  return { options, preselected, disappeared, renamed, recreated };
+}
+
+/**
+ * The existing config as the screen should read it, with every recreated entry
+ * already under its new id.
+ *
+ * Every default the per-agent questions offer — the directory, the harness
+ * variable, the bounds, whether it polls — is looked up by id, and the id is the
+ * one thing a carry-over changes. Swapping it once here is what lets every one
+ * of those lookups find the old answers without each learning about carry-overs.
+ * The entry is otherwise untouched, name included.
+ */
+export function carriedOver(existing: Config | null, recreated: readonly RecreatedEntry[]): Config | null {
+  if (existing === null || recreated.length === 0) return existing;
+  const newId = new Map(recreated.map((r) => [r.previousId, r.id]));
+  const agents = newAgentMap();
+  for (const [name, entry] of Object.entries(existing.agents)) {
+    agents[name] = newId.has(entry.id) ? { ...entry, id: newId.get(entry.id)! } : entry;
+  }
+  return { ...existing, agents };
 }
 
 /**
@@ -646,6 +711,36 @@ export interface Answers {
   sessionsPerHour: number | null;
   /** Renamed entries the person chose not to keep under the new name — dropped, and said so. */
   dropped: RenamedEntry[];
+  /** Recreated entries the person chose not to carry over — dropped, and said so. Absent is none. */
+  notCarried?: RecreatedEntry[];
+}
+
+/**
+ * The recreated entries the answers carry over: offered as a carry-over, not
+ * declined, and still among the agents chosen. Each of these needs a key minted
+ * for its new id whatever `--new-keys` says, since no key held under the old id
+ * can work.
+ */
+export function carriedEntries(recreated: readonly RecreatedEntry[], answers: Answers): RecreatedEntry[] {
+  const declined = new Set((answers.notCarried ?? []).map((r) => r.id));
+  const chosen = new Set(answers.agents.map((a) => a.id));
+  return recreated.filter((r) => !declined.has(r.id) && chosen.has(r.id));
+}
+
+/**
+ * The ids whose keys this machine should forget once the new config is written:
+ * every id configured before that the new config no longer names.
+ *
+ * A key left in the store under an id nothing configures is invisible to every
+ * command, and it is exactly the residue that made a recreated agent's lockout
+ * hard to diagnose. This covers the old id of a carried-over entry, which is
+ * configured before and not after.
+ */
+export function idsToForget(before: Config | null, after: Config): string[] {
+  const kept = new Set(Object.values(after.agents).map((entry) => entry.id));
+  return Object.values(before?.agents ?? {})
+    .map((entry) => entry.id)
+    .filter((id) => !kept.has(id));
 }
 
 /** The answers as the file: the only way a config is made from a screen. */
@@ -674,9 +769,40 @@ export interface WriteReport {
 /** What became of one agent's connection key, by agent name. */
 export type KeyOutcome =
   | { kind: "minted" }
-  | { kind: "renewed" }
+  /** Minted to replace a key this machine held; `retirement` is what became of that key. */
+  | { kind: "renewed"; retirement: Retirement }
   | { kind: "held" }
-  | { kind: "failed"; problem: string };
+  /** Minted for a recreated agent's new id, whose entry was carried over from the deleted one. */
+  | { kind: "carried" }
+  /**
+   * The mint failed. `heldPrefix` is the prefix of a key the store still holds
+   * for this id, which the failure left in place and which may not work.
+   */
+  | { kind: "failed"; problem: string; heldPrefix?: string };
+
+/**
+ * What pays for an entry's harness, in the words the summary uses.
+ *
+ * Shared with `mdbrain agents`, so the two places that describe a configured
+ * agent cannot describe it two ways.
+ */
+export function harnessSentence(entry: AgentEntry): string {
+  return entry.env.harness === null ? "thinks with this machine's own Claude Code account" : `thinks with the key in ${entry.env.harness}`;
+}
+
+/**
+ * Whether `run` asks for an entry's work, in the words the summary uses.
+ *
+ * **In `run`'s vocabulary — *asked for work* — rather than in the screen's
+ * *polls*.** A configured agent is described here and in `mdbrain agents`, and
+ * neither may acquire a sentence about polling: the interval is not a setting,
+ * and a description that says *polls* is how one would come back by a side door.
+ */
+export function workSentence(entry: AgentEntry): string {
+  return entry.pollsWork
+    ? "asked for work by mdbrain run"
+    : "identity only: mdbrain as starts a session as it, and mdbrain run never asks for its work";
+}
 
 /** The lines printed once the file is written. */
 export function summaryLines(
@@ -685,33 +811,20 @@ export function summaryLines(
   disappeared: DisappearedEntry[],
   dropped: RenamedEntry[],
   keys: Record<string, KeyOutcome> = {},
+  notCarried: readonly RecreatedEntry[] = [],
 ): string[] {
   const lines = [`Configuration written to ${report.path}.`, ""];
   for (const [name, entry] of Object.entries(config.agents)) {
     lines.push(`  ${name}`);
     lines.push(`    runs in ${entry.cwd}`);
-    lines.push(
-      entry.env.harness === null
-        ? "    thinks with this machine's own Claude Code account"
-        : `    thinks with the key in ${entry.env.harness}`,
-    );
-    lines.push(`    ${connectionKeyLine(keys[name], entry.env.connectionKey)}`);
+    lines.push(`    ${harnessSentence(entry)}`);
+    lines.push(`    ${connectionKeyLine(keys[name], entry.env.connectionKey, name)}`);
     if (report.mcpPaths[name]) lines.push(`    workspace connection ${report.mcpPaths[name]}`);
     // Said for both answers rather than only for the unusual one. The two
     // entries are identical in the file but for one field, so a summary that
     // marked only the identity-only ones would leave a reader checking the
     // absence of a line to learn what the other agents do.
-    //
-    // **In `run`'s vocabulary — *asked for work* — rather than in the screen's
-    // *polls*.** This block is the one surface that must not acquire a sentence
-    // about polling: the interval stopped being a setting and the line saying so
-    // was taken out of here, and a summary that says *polls* again is how it
-    // comes back by a side door.
-    lines.push(
-      entry.pollsWork
-        ? "    asked for work by mdbrain run"
-        : "    identity only: mdbrain as starts a session as it, and mdbrain run never asks for its work",
-    );
+    lines.push(`    ${workSentence(entry)}`);
   }
   for (const gone of disappeared) {
     if (config.agents[gone.name]) lines.push(`  ${gone.name} is ${gone.reason}, and will receive no work until that changes.`);
@@ -723,6 +836,14 @@ export function summaryLines(
     // this same summary just described.
     if (!config.agents[d.to]) {
       lines.push(`  ${d.from} was dropped: the roster now calls it ${d.to}, and you chose not to keep it under that name.`);
+    }
+  }
+  for (const r of notCarried) {
+    // The same guard as a declined rename: the new agent is still a row on the
+    // list, and a person who declined the carry-over and then marked it has
+    // configured it afresh, which the block above already described.
+    if (config.agents[r.name]?.id !== r.id) {
+      lines.push(`  ${r.name} was dropped: it was deleted and created again in markdown-den, and you chose not to carry this configuration over.`);
     }
   }
   for (const path of report.removed) lines.push(`  removed ${path}, which belonged to an agent no longer configured here`);
@@ -753,18 +874,34 @@ export function summaryLines(
  * when the store has none, so a key pasted into the variable by hand would never
  * be reached.
  */
-function connectionKeyLine(outcome: KeyOutcome | undefined, variable: string): string {
+function connectionKeyLine(outcome: KeyOutcome | undefined, variable: string, name: string): string {
   switch (outcome?.kind) {
     case "minted":
       return "connection key requested from markdown-den and stored on this machine";
-    case "renewed":
-      return "a fresh connection key requested from markdown-den and stored on this machine, replacing the one that was here (the old one stays live until it is revoked in the app)";
+    case "renewed": {
+      const replaced = "a fresh connection key requested from markdown-den and stored on this machine, replacing the one that was here";
+      const { retirement } = outcome;
+      if (retirement.kind === "revoked") return `${replaced}, which was revoked (${shownKey(retirement.prefix)})`;
+      if (retirement.kind === "live") {
+        return `${replaced}; that key (${shownKey(retirement.prefix)}) is still live in markdown-den: revoke it on the agent's page`;
+      }
+      return retirement.prefix === null ? replaced : `${replaced} (${shownKey(retirement.prefix)}), which markdown-den no longer had live`;
+    }
     case "held":
       return "connection key already stored on this machine, and kept (mdbrain configure --new-keys mints another)";
+    case "carried":
+      return "carried over from the deleted agent: a connection key was requested for the new one";
     case "failed": {
       // Punctuated here rather than at each throw site, so that a message which
       // ends in a full stop and one which does not read the same in the summary.
       const problem = outcome.problem.endsWith(".") ? outcome.problem : `${outcome.problem}.`;
+      // **A failed mint leaves the key already here in place, on purpose**, so
+      // saying *no connection key* would be false: `as` and `run` will both find
+      // that key and use it. What is true is that it was kept and may be the
+      // reason the mint was attempted at all.
+      if (outcome.heldPrefix !== undefined) {
+        return `the server would not mint a new key (${outcome.problem.replace(/\.$/, "")}). The key already on this machine (${shownKey(outcome.heldPrefix)}) was kept, and may not work: mdbrain agents check ${name} says.`;
+      }
       return `no connection key: ${problem} mdbrain run will refuse this agent's work until mdbrain configure stores one.`;
     }
     default:

@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 import { join, relative } from "node:path";
 import { childEnvironment, claudeHarness, type Identity } from "../src/run/harness.ts";
 import { releaseTerminalInput, runAttached, type ExecuteDeps } from "../src/run/execute.ts";
-import { runAs, USAGE_MESSAGE, unknownAgentMessage, type AsDeps } from "../src/commands/as.ts";
+import { refusedKeyMessage, runAs, USAGE_MESSAGE, unknownAgentMessage, type AsDeps } from "../src/commands/as.ts";
 import { ambiguousAgentMessage, pickerHeading, resolveAgent } from "../src/as/choose.ts";
 import { agentPicker } from "../src/as/screen.ts";
 import { render as renderInk } from "ink-testing-library";
@@ -85,6 +85,7 @@ function harness(over: Partial<AsDeps> = {}) {
       return Promise.resolve(null);
     },
     newSessionId: () => "9a7b0000-0000-4000-8000-000000000001",
+    checkKey: () => Promise.resolve({ kind: "accepted", brains: ["markdown brain"] }),
     ...over,
   };
   return { deps, context, captured };
@@ -384,6 +385,39 @@ describe("as: startup and the refusals", () => {
     expect(await runAs(deps, context)).toBe(0);
     expect(captured.started[0].cwd).toBe(elsewhere);
     expect(captured.started[0].cwd).not.toBe(process.cwd());
+  });
+});
+
+describe("as: the key, checked before anything starts", () => {
+  it("158-S15: a key the server refuses starts no harness, and names mdbrain agents check", async () => {
+    const { deps, context, captured } = harness({ checkKey: () => Promise.resolve({ kind: "refused" }) });
+    expect(await runAs(deps, context)).toBe(1);
+    expect(captured.started).toEqual([]);
+    expect(captured.errors).toEqual([refusedKeyMessage("dev-bot-mdden")]);
+    expect(captured.errors[0]).toContain("mdbrain agents check dev-bot-mdden");
+  });
+
+  it("158-S16: a check that times out or cannot reach the server starts the session as it always has", async () => {
+    for (const reason of ["the server did not answer in time", "fetch failed"]) {
+      const presented: string[] = [];
+      const { deps, context, captured } = harness({
+        checkKey: (key) => {
+          presented.push(key);
+          return Promise.resolve({ kind: "unchecked", reason });
+        },
+      });
+      expect(await runAs(deps, context)).toBe(0);
+      expect(captured.started).toHaveLength(1);
+      expect(captured.errors).toEqual([]);
+      // The key the session will carry is the key that was checked.
+      expect(presented).toEqual(["smd_agent_deadbeef_secret"]);
+    }
+  });
+
+  it("158-S16: the real check is bounded to three seconds", () => {
+    const source = readFileSync(fileURLToPath(new URL("../src/commands/as.ts", import.meta.url)), "utf8");
+    expect(source).toContain("AS_CHECK_TIMEOUT_MS = 3_000");
+    expect(source).toContain("presentConnectionKey(key, AbortSignal.timeout(AS_CHECK_TIMEOUT_MS), true)");
   });
 });
 

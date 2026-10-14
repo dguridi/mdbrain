@@ -25,9 +25,15 @@
 //
 // **It reads no roster, and so checks no human session.** The key on disk is
 // sufficient and the MCP server authenticates the bot rather than the person, so
-// this works on a machine whose human login has expired. The price is named
-// where it is paid: an agent deleted on the server still starts a session here,
-// and the refusal arrives from the MCP server at the first tool call instead.
+// this works on a machine whose human login has expired.
+//
+// **It does present that key before it starts anything**, because a refused key
+// otherwise surfaces as an MCP failure inside Claude Code, where nothing names
+// the runner or the fix. The check is the key alone — no session, no roster — so
+// it costs this command none of its independence from the person's login, and it
+// is bounded short: a refusal stops the session with a sentence naming
+// `mdbrain agents check`, which can say why, and a check that cannot reach the
+// server starts the session anyway, since it has no verdict to give.
 
 import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -40,6 +46,8 @@ import { pickOnScreen } from "../as/screen.ts";
 import { credentialsCollide, harnessFor } from "../run/harness.ts";
 import { runAttached } from "../run/execute.ts";
 import { holdReason } from "../run/loop.ts";
+import { presentConnectionKey } from "../auth/api.ts";
+import { readProbe, unreachedProbe, type Probe } from "../agents/verdict.ts";
 import { noConfigMessage, UNREADABLE_CONFIG_MESSAGE } from "./run.ts";
 
 /**
@@ -68,7 +76,19 @@ export interface AsDeps {
    * requires a valid UUID, so minting one is the whole of it.
    */
   newSessionId: () => string;
+  /**
+   * Presents the key to the MCP server and answers what came of it. Bounded by
+   * the caller's default to {@link AS_CHECK_TIMEOUT_MS}, and never throws: no
+   * answer is `unchecked`.
+   */
+  checkKey: (key: string) => Promise<Probe>;
 }
+
+/**
+ * How long `as` waits for a verdict on the key before starting anyway. Short,
+ * because a person is waiting for a session, and a slow answer is no answer.
+ */
+export const AS_CHECK_TIMEOUT_MS = 3_000;
 
 const defaultDeps: AsDeps = {
   env: process.env,
@@ -88,7 +108,15 @@ const defaultDeps: AsDeps = {
   isTTY: process.stdin.isTTY === true && process.stdout.isTTY === true,
   pickAgent: (options, typed) => pickOnScreen(options, typed),
   newSessionId: () => randomUUID(),
+  // The handshake alone: a refusal is answered on it, and the brains the second
+  // request would name are nothing this command reads.
+  checkKey: (key) => presentConnectionKey(key, AbortSignal.timeout(AS_CHECK_TIMEOUT_MS), true).then(readProbe, unreachedProbe),
 };
+
+/** The refusal for a key the server would not take, naming the command that explains it. */
+export function refusedKeyMessage(agent: string): string {
+  return `markdown-den refuses ${agent}'s connection key. \`mdbrain agents check ${agent}\` says why.`;
+}
 
 /**
  * The usage sentence for an invocation that named no agent where no list can be
@@ -226,6 +254,15 @@ export async function runAs(deps: AsDeps, context: CommandContext): Promise<numb
   // one.
   if (connectionKey === null) {
     err(`There is no connection key for ${agent} on this machine. Run \`mdbrain configure\` to ask the server for one.`);
+    return 1;
+  }
+
+  // Only a refusal stops the session. Accepted starts it, and so does a check
+  // that got no answer — offline, a timeout, a 5xx — because without a verdict
+  // the session would find out exactly as it always has.
+  const probe = await deps.checkKey(connectionKey);
+  if (probe.kind === "refused") {
+    err(refusedKeyMessage(agent));
     return 1;
   }
 

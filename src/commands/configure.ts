@@ -37,15 +37,28 @@
 import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { CommandContext, CommandSpec } from "../cli.ts";
-import { AuthError, currentUser, listAgents, listMemberships, listOrganizations, mintAgentKey } from "../auth/api.ts";
+import {
+  AuthError,
+  currentUser,
+  listAgentKeys,
+  listAgents,
+  listMemberships,
+  listOrganizations,
+  mintAgentKey,
+  revokeAgentKey,
+} from "../auth/api.ts";
+import { retireKey, stillLiveSentence } from "../agents/retire.ts";
 import { signInAgainMessage } from "../auth/session.ts";
 import { redactSecrets } from "../run/diagnosis.ts";
 import { clearDraft, loadConfig, loadDraft, saveConfig, saveDraft, syncMcpConfigs } from "../config/store.ts";
 import { configPath } from "../config/paths.ts";
-import { keyStorageLine, openConnectionKeyStore, type ConnectionKeyStore } from "../config/secrets.ts";
+import { keyPrefixOf, keyStorageLine, openConnectionKeyStore, type ConnectionKeyStore } from "../config/secrets.ts";
 import {
   agentChoices,
   assembleConfig,
+  carriedEntries,
+  carriedOver,
+  idsToForget,
   keychainGrantLine,
   NOTHING_TO_MANAGE,
   organizationsWithoutAgents,
@@ -122,14 +135,22 @@ async function ensureConnectionKeys(
   accessToken: string,
   agents: Array<{ name: string; id: string }>,
   renew: boolean,
+  carried: ReadonlySet<string> = new Set(),
 ): Promise<Record<string, KeyOutcome>> {
   const outcomes: Record<string, KeyOutcome> = {};
   for (const agent of agents) {
+    const carriedOver = carried.has(agent.id);
     try {
-      if (!renew && (await store.get(agent.id))) {
+      // A carried-over entry always mints, flag or not: nothing held under the
+      // deleted agent's id can work for the new one.
+      if (!renew && !carriedOver && (await store.get(agent.id))) {
         outcomes[agent.name] = { kind: "held" };
         continue;
       }
+      // The key being replaced, read before anything is minted, since it is
+      // what gets revoked once the new one is safely here.
+      const replaced = carriedOver ? null : await store.get(agent.id);
+      const replacedPrefix = replaced === null ? null : keyPrefixOf(replaced);
       // Minted before it is stored, deliberately: a mint that fails must leave
       // the key already here intact, since it may be the working one.
       const key = await mintAgentKey(accessToken, agent.id);
@@ -137,9 +158,26 @@ async function ensureConnectionKeys(
       if ((await store.get(agent.id)) !== key) {
         throw new Error("the key was stored, but reading it back did not return it, so this machine cannot use it");
       }
-      outcomes[agent.name] = { kind: renew ? "renewed" : "minted" };
+      if (carriedOver) outcomes[agent.name] = { kind: "carried" };
+      else if (replacedPrefix === null || replacedPrefix === keyPrefixOf(key)) outcomes[agent.name] = { kind: "minted" };
+      else {
+        // Only now, with the new key stored and read back: mint, store, read
+        // back, revoke is the order in which any failure leaves the old key live
+        // rather than leaving none. The revoke is best-effort and says so.
+        const retirement = await retireKey({ listKeys: listAgentKeys, revoke: revokeAgentKey }, accessToken, agent.id, replacedPrefix);
+        outcomes[agent.name] = { kind: "renewed", retirement };
+      }
     } catch (cause) {
-      outcomes[agent.name] = { kind: "failed", problem: (cause as Error).message };
+      // Redacted for the reason the roster read below is: the summary prints it,
+      // and it is the body of whatever answered the mint.
+      const problem = redactSecrets((cause as Error).message);
+      // What the store still holds is part of the answer: the mint ran first so
+      // that a failure leaves the old key in place, and a summary that says *no
+      // key* about an agent `as` will happily start with is the one that sent a
+      // person looking in the wrong place.
+      const held = await store.get(agent.id).catch(() => null);
+      const heldPrefix = held === null ? null : keyPrefixOf(held);
+      outcomes[agent.name] = heldPrefix === null ? { kind: "failed", problem } : { kind: "failed", problem, heldPrefix };
     }
   }
   return outcomes;
@@ -235,7 +273,9 @@ export async function runConfigure(deps: ConfigureDeps, context: CommandContext)
     choices,
     emptyOrganizations,
     withheld,
-    existing,
+    // Every default is looked up by id, and a carry-over is the one change that
+    // moves an id, so the screen reads the config with that move already made.
+    existing: carriedOver(existing, choices.recreated),
     draft,
     currentDirectory: deps.currentDirectory,
     env: deps.env,
@@ -261,7 +301,8 @@ export async function runConfigure(deps: ConfigureDeps, context: CommandContext)
     out(grant);
     out("");
   }
-  const keys = await ensureConnectionKeys(store, session.accessToken, answers.agents, context.flags[NEW_KEYS_FLAG] === true);
+  const carried = new Set(carriedEntries(choices.recreated, answers).map((r) => r.id));
+  const keys = await ensureConnectionKeys(store, session.accessToken, answers.agents, context.flags[NEW_KEYS_FLAG] === true, carried);
 
   const config = assembleConfig(answers);
   try {
@@ -271,7 +312,29 @@ export async function runConfigure(deps: ConfigureDeps, context: CommandContext)
     // a stale convenience, and reporting it as a configuration that could not be
     // written would be a lie about the file that is now on disk.
     await clearDraft().catch(() => {});
-    for (const line of summaryLines(config, { path, mcpPaths, removed }, choices.disappeared, answers.dropped, keys)) out(line);
+    // After the write and never before it: until the new config is on disk the
+    // old one still names these ids, and a key forgotten under a config that
+    // still names it is an agent that stopped working for no reason anybody
+    // gave. A key that will not go is left behind rather than failing a write
+    // that has already landed; it is unreachable either way.
+    //
+    // **Forgetting is not revoking**, and for an agent that still exists the key
+    // forgotten here is still live in markdown-den. It is not revoked from here —
+    // unmarking an agent in this list is not the decision to retire its key that
+    // `mdbrain agents remove` is — but it is named, because once this machine
+    // has forgotten it nothing here can name it again.
+    const stillLive: string[] = [];
+    for (const id of idsToForget(existing, config)) {
+      const held = await store.get(id).catch(() => null);
+      const prefix = held === null ? null : keyPrefixOf(held);
+      if (prefix !== null && stillVisible.has(id)) {
+        const name = Object.entries(existing?.agents ?? {}).find(([, entry]) => entry.id === id)?.[0] ?? id;
+        stillLive.push(`  ${name} is no longer configured here: ${stillLiveSentence(prefix)} if nothing else uses it.`);
+      }
+      await store.forget(id).catch(() => {});
+    }
+    for (const line of summaryLines(config, { path, mcpPaths, removed }, choices.disappeared, answers.dropped, keys, answers.notCarried)) out(line);
+    for (const line of stillLive) out(line);
     out(keyStorageLine(store.backend));
   } catch (cause) {
     err(`The configuration could not be written: ${(cause as Error).message}`);
@@ -319,12 +382,12 @@ export const configure: CommandSpec = {
   // The login's flags, because the login can run inside this command and its
   // `--port` takes a value: a flag not declared here would be parsed as bare and
   // refused by the login for the exact form the person typed. Plus this
-  // command's own one, which is the only way out of a key that no longer works:
-  // a key the store holds is otherwise kept for good, and a key revoked in the
-  // app looks identical from here to one that works.
+  // command's own one, which renews every agent's key at once: a key the store
+  // holds is otherwise kept for good. `mdbrain agents check` is what tells a
+  // revoked key from a working one, and `agents renew` renews just the one.
   flags: [
     ...(login.flags ?? []),
-    { name: NEW_KEYS_FLAG, summary: "mint new connection keys, replacing any this machine already holds" },
+    { name: NEW_KEYS_FLAG, summary: "mint new connection keys, revoking any this machine already holds" },
   ],
   run(context) {
     return runConfigure(

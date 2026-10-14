@@ -67,6 +67,17 @@ export async function saveConfig(config: Config, env?: PathEnv): Promise<string>
   return path;
 }
 
+/**
+ * Delete the configuration file.
+ *
+ * Only for removing the last agent: `parseConfig` refuses a file with no
+ * agents, so writing one would leave a file every command refuses, where no file
+ * at all gives each of them its ordinary *run mdbrain configure* answer.
+ */
+export async function removeConfig(env?: PathEnv): Promise<void> {
+  await rm(configPath(env), { force: true });
+}
+
 /** Where a `configure` in progress records what has been answered so far. */
 export function draftPath(env?: PathEnv): string {
   return join(configDir(env), "configure-draft.json");
@@ -112,6 +123,13 @@ export function mcpDir(env?: PathEnv): string {
 /** Where the harness is pointed at for one agent's workspace connection. */
 export function mcpConfigPath(agentName: string, env?: PathEnv): string {
   return join(mcpDir(env), mcpFileNameFor(agentName));
+}
+
+/** Delete one agent's MCP file. Already gone is not a failure. */
+export async function removeMcpConfig(agentName: string, env?: PathEnv): Promise<string> {
+  const path = mcpConfigPath(agentName, env);
+  await rm(path, { force: true });
+  return path;
 }
 
 /**

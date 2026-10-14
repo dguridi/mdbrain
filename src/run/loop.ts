@@ -27,18 +27,41 @@ export interface HeldReason {
 }
 
 /**
+ * The roster as the hold checks read it: which ids exist, and which names.
+ *
+ * **Both, because a name alone cannot tell a live entry from a dead one.** An
+ * agent deleted and created again under the same name has the old name and a
+ * new id, so a check by name passes an entry whose id, and every key under it,
+ * is gone. The claim still matches by name, which is why the names are kept too:
+ * an id the roster holds under another name is a rename, and the old name would
+ * be asked for nobody's work.
+ */
+export interface RosterView {
+  ids: ReadonlySet<string>;
+  names: ReadonlySet<string>;
+}
+
+/** The roster read into the two sets the hold checks need. */
+export function rosterView(agents: ReadonlyArray<{ id: string; display_name: string }>): RosterView {
+  return { ids: new Set(agents.map((a) => a.id)), names: new Set(agents.map((a) => a.display_name)) };
+}
+
+/**
  * Why an agent is held for the life of the process.
  *
- * Held at startup rather than per tick, because none of these three can change
+ * Held at startup rather than per tick, because none of these can change
  * without the process being restarted — the environment is read once, and the
  * roster is read once for the reason §5a gives.
+ *
+ * @param roster the roster as read at startup, or null when it is unknown —
+ *   unreadable, or deliberately not read — which holds nobody for it
  */
 export function holdReason(
   agent: string,
   entry: Config["agents"][string],
   env: Record<string, string | undefined>,
   directoryExists: (path: string) => boolean,
-  rosterNames: ReadonlySet<string> | null,
+  roster: RosterView | null,
 ): string | null {
   if (entry.env.harness !== null && !env[entry.env.harness]) {
     return `${entry.env.harness} is not set.`;
@@ -46,7 +69,15 @@ export function holdReason(
   if (!directoryExists(entry.cwd)) {
     return `its directory ${entry.cwd} is not there.`;
   }
-  if (rosterNames !== null && !rosterNames.has(agent)) {
+  if (roster === null) return null;
+  // By id first. A name the roster holds under a different id is the agent
+  // having been deleted and created again, and it needs its own sentence: the
+  // entry looks healthy by every name on screen, and its sessions would each be
+  // refused by the server one unit at a time.
+  if (!roster.ids.has(entry.id) && roster.names.has(agent)) {
+    return "its agent was deleted in markdown-den, and an agent of the same name now has a new id: run mdbrain configure.";
+  }
+  if (!roster.ids.has(entry.id) || !roster.names.has(agent)) {
     return "it is not in the roster this account can see; it is configured here and will receive no work.";
   }
   return null;
@@ -81,7 +112,7 @@ export function planStartup(
   config: Config,
   env: Record<string, string | undefined>,
   directoryExists: (path: string) => boolean,
-  rosterNames: ReadonlySet<string> | null,
+  roster: RosterView | null,
 ): Startup {
   const asking: string[] = [];
   const held: HeldReason[] = [];
@@ -97,7 +128,7 @@ export function planStartup(
       attended.push(agent);
       continue;
     }
-    const reason = holdReason(agent, entry, env, directoryExists, rosterNames);
+    const reason = holdReason(agent, entry, env, directoryExists, roster);
     if (reason === null) asking.push(agent);
     else held.push({ agent, reason });
   }

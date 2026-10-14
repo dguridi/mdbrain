@@ -47,6 +47,7 @@ import {
   type ConfigureDraft,
   type DraftAgent,
   type Judgement,
+  type RecreatedEntry,
   type RenamedEntry,
 } from "./questions.ts";
 import type { Config } from "../config/schema.ts";
@@ -195,6 +196,8 @@ interface AgentAnswer extends AgentDefaults {
 
 type Phase =
   | { kind: "rename"; index: number }
+  /** Whether a recreated agent takes over the deleted one's configuration, one entry at a time. */
+  | { kind: "recreated"; index: number }
   | { kind: "agents" }
   /** Which of the agents just marked are asked for work, offered from that answer. */
   | { kind: "pollers" }
@@ -222,6 +225,8 @@ interface State {
   phase: Phase;
   /** Renamed entries the person chose NOT to keep — dropped, and reported as such. */
   dropped: RenamedEntry[];
+  /** Recreated entries the person chose NOT to carry over — dropped, and reported as such. */
+  notCarried: RecreatedEntry[];
   chosen: string[];
   /**
    * The chosen agents that will be asked for work — **null until that question
@@ -258,8 +263,9 @@ function ConfigureScreen({ plan, onDone }: { plan: ScreenPlan; onDone: (answers:
     agentDefaults(nameOf(id), existingById.get(id)?.entry ?? null, plan.currentDirectory, plan.draft?.agents[id] ?? null);
 
   const [state, setState] = useState<State>(() => ({
-    phase: plan.choices.renamed.length > 0 ? { kind: "rename", index: 0 } : { kind: "agents" },
+    phase: afterRenames(plan, -1),
     dropped: [],
+    notCarried: [],
     chosen: [],
     pollers: null,
     agents: [],
@@ -383,7 +389,7 @@ function ConfigureScreen({ plan, onDone }: { plan: ScreenPlan; onDone: (answers:
       version: DRAFT_VERSION,
       chosen: s.chosen.length > 0 ? s.chosen : (plan.draft?.chosen ?? []),
       agents,
-      dropped: s.dropped.map((d) => d.id),
+      dropped: [...s.dropped.map((d) => d.id), ...s.notCarried.map((r) => r.id)],
       sessionsPerHour: s.sessionsPerHour,
     };
     // Laid over the earlier draft the same way the agents are: this run has no
@@ -438,11 +444,10 @@ function ConfigureScreen({ plan, onDone }: { plan: ScreenPlan; onDone: (answers:
   if (phase.kind === "rename") {
     const rename = plan.choices.renamed[phase.index];
     const advanceRename = (keep: boolean) => {
-      const nextIndex = phase.index + 1;
       advance({
         ...state,
         dropped: keep ? state.dropped : [...state.dropped, rename],
-        phase: nextIndex < plan.choices.renamed.length ? { kind: "rename", index: nextIndex } : { kind: "agents" },
+        phase: afterRenames(plan, phase.index),
       });
     };
     question = h(
@@ -462,8 +467,38 @@ function ConfigureScreen({ plan, onDone }: { plan: ScreenPlan; onDone: (answers:
         onCancel: () => advanceRename(false),
       }),
     );
+  } else if (phase.kind === "recreated") {
+    const recreated = plan.choices.recreated[phase.index];
+    const answerCarry = (carry: boolean) => {
+      const nextIndex = phase.index + 1;
+      advance({
+        ...state,
+        notCarried: carry ? state.notCarried : [...state.notCarried, recreated],
+        phase: nextIndex < plan.choices.recreated.length ? { kind: "recreated", index: nextIndex } : { kind: "agents" },
+      });
+    };
+    question = h(
+      Box,
+      { flexDirection: "column" },
+      h(
+        Text,
+        null,
+        `${recreated.name} was deleted and created again in markdown-den. Carry this machine's configuration over to the new one? `,
+      ),
+      h(
+        Text,
+        { dimColor: true },
+        "Its directory, harness and bounds are kept and a new connection key is requested, since the deleted agent's keys went with it. Answering no drops the entry.",
+      ),
+      h(ConfirmInput, {
+        key: `recreated-${phase.index}`,
+        defaultChoice: plan.draft?.dropped.includes(recreated.id) ? "cancel" : "confirm",
+        onConfirm: () => answerCarry(true),
+        onCancel: () => answerCarry(false),
+      }),
+    );
   } else if (phase.kind === "agents") {
-    const droppedIds = new Set(state.dropped.map((d) => d.id));
+    const droppedIds = new Set([...state.dropped.map((d) => d.id), ...state.notCarried.map((r) => r.id)]);
     // A draft's marks are the person's most recent answer to this same question,
     // so they stand ahead of the config's — but only when there is a draft, since
     // an empty list from one that never reached this question would unmark
@@ -543,7 +578,7 @@ function ConfigureScreen({ plan, onDone }: { plan: ScreenPlan; onDone: (answers:
           // Recorded before the screen goes, so a write that fails leaves a draft
           // holding every answer rather than one short of the last.
           advance({ ...state, sessionsPerHour: judged.value, problem: null, warning: null });
-          onDone({ agents: state.agents, sessionsPerHour: judged.value, dropped: state.dropped });
+          onDone({ agents: state.agents, sessionsPerHour: judged.value, dropped: state.dropped, notCarried: state.notCarried });
           exit();
         }
       }),
@@ -565,6 +600,20 @@ function ConfigureScreen({ plan, onDone }: { plan: ScreenPlan; onDone: (answers:
     ...lines,
     question,
   );
+}
+
+/**
+ * The phase after rename question `index` (-1 for before the first): the next
+ * rename, then the first carry-over, then the list.
+ *
+ * Both kinds are asked before the list because both decide what it arrives
+ * marked with: an entry declined here is unmarked there, and a person should
+ * not have to undo a mark the program made after they had said no.
+ */
+function afterRenames(plan: ScreenPlan, index: number): Phase {
+  if (index + 1 < plan.choices.renamed.length) return { kind: "rename", index: index + 1 };
+  if (plan.choices.recreated.length > 0) return { kind: "recreated", index: 0 };
+  return { kind: "agents" };
 }
 
 /** What a question offers as its starting value. */
