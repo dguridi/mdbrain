@@ -420,7 +420,7 @@ export function liveView(state: ViewState, frame: ScreenFrame): ReactElement {
   // The keys are named on screen rather than left to be known. A terminal whose
   // stdin cannot be put in raw mode reads none, and offering them there would be
   // an instruction that does nothing.
-  if (keysActive) children.push(h(Text, { key: "keys", dimColor: true }, `  ${keyHints().join("   ")}`));
+  if (keysActive) children.push(h(Text, { key: "keys", dimColor: true }, `  ${keyHints(open).join("   ")}`));
 
   return h(
     Box,
@@ -481,11 +481,16 @@ function LiveScreen({ state, onRequest }: ScreenProps): ReactElement {
   const { isRawModeSupported } = useStdin();
   useInput(
     (input, key) => {
-      const action = actionForKey(input, key);
+      const open = selectedRun(state.recent, selection);
+      const action = actionForKey(input, key, open);
       // A key this view does not offer is ignored rather than guessed at.
       if (action === null) return;
       if (action.to === "loop") onRequest(action.request);
-      else setSelection((current) => moveSelection(state.recent, current, action.action));
+      // The run goes with the request: the loop resumes exactly the row the
+      // person was looking at, and reads nothing of the screen's to find it.
+      else if (action.to === "resume") {
+        if (open !== null) onRequest({ kind: "resume", agent: open.agent, claim: open.claim });
+      } else setSelection((current) => moveSelection(state.recent, current, action.action));
     },
     { isActive: isRawModeSupported },
   );
@@ -512,8 +517,19 @@ export function livePresenter(out: (line: string) => void, now: () => Date = () 
   let state = emptyView;
   let handler: (request: ViewRequest) => void = () => {};
   const forward = (request: ViewRequest) => handler(request);
-  const app = render(h(LiveScreen, { state, onRequest: forward }), { exitOnCtrlC: false });
+  const mount = () => render(h(LiveScreen, { state, onRequest: forward }), { exitOnCtrlC: false });
+  let app = mount();
   let live = true;
+  /**
+   * Whether the view is unmounted for a resumed session rather than for good.
+   *
+   * Events go on being applied while it is: the loop keeps running, and the view
+   * mounted again afterwards has to be current at once rather than wait for the
+   * next event to catch up.
+   */
+  let suspended = false;
+  /** Set by the last line, after which nothing is mounted again. */
+  let finished = false;
 
   const unmount = () => {
     if (!live) return;
@@ -524,6 +540,7 @@ export function livePresenter(out: (line: string) => void, now: () => Date = () 
   return {
     present(event, at) {
       if (event.kind === "stopped") {
+        finished = true;
         unmount();
         const text = plainLine({ at: at ?? now(), event });
         if (text !== null) out(text);
@@ -535,7 +552,22 @@ export function livePresenter(out: (line: string) => void, now: () => Date = () 
     listen(next) {
       handler = next;
     },
+    async suspend() {
+      if (!live) return;
+      suspended = true;
+      unmount();
+      // Resolved once Ink has let go of the terminal, which is what makes it safe
+      // for the caller to hand that terminal to a harness straight afterwards.
+      await app.waitUntilExit();
+    },
+    resume() {
+      if (!suspended || finished) return;
+      suspended = false;
+      live = true;
+      app = mount();
+    },
     async stop() {
+      finished = true;
       unmount();
       await app.waitUntilExit();
     },

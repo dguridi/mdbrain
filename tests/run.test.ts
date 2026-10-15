@@ -64,8 +64,12 @@ const cwd = process.platform === "win32" ? "C:\\work\\checkout" : "/work/checkou
  * rather than Ink's rendering — which `liveView` is drawn directly to check.
  */
 const captured = vi.hoisted(() => ({
-  handler: null as ((request: "poll-now" | "quit") => void) | null,
+  handler: null as ((request: import("../src/run/keys.ts").ViewRequest) => void) | null,
   events: [] as import("../src/run/present.ts").RunEvent[],
+  /** Each time the view gave the terminal up or took it back, in order. */
+  terminal: [] as string[],
+  /** Called when the view takes the terminal back, so a test can act just after. */
+  onResume: null as (() => void) | null,
 }));
 
 vi.mock("../src/run/screen.ts", async (importOriginal) => {
@@ -76,8 +80,16 @@ vi.mock("../src/run/screen.ts", async (importOriginal) => {
       present(event: import("../src/run/present.ts").RunEvent) {
         captured.events.push(event);
       },
-      listen(handler: (request: "poll-now" | "quit") => void) {
+      listen(handler: (request: import("../src/run/keys.ts").ViewRequest) => void) {
         captured.handler = handler;
+      },
+      suspend() {
+        captured.terminal.push("suspend");
+        return Promise.resolve();
+      },
+      resume() {
+        captured.terminal.push("resume");
+        captured.onResume?.();
       },
       stop: () => Promise.resolve(),
     }),
@@ -87,6 +99,8 @@ vi.mock("../src/run/screen.ts", async (importOriginal) => {
 beforeEach(() => {
   captured.handler = null;
   captured.events = [];
+  captured.terminal = [];
+  captured.onResume = null;
 });
 
 const entry = (over: Record<string, unknown> = {}) => ({
@@ -118,7 +132,7 @@ const unit = (agent = "dev-bot-mdden", claim = "c1f0", seq = 8412, over: Partial
 
 const invocation = (over: Partial<Invocation> = {}): Invocation => ({
   prompt: "Triage what landed.",
-  sessionId: "3f2a0000-0000-4000-8000-000000000000",
+  session: { kind: "new", id: "3f2a0000-0000-4000-8000-000000000000" },
   mcpConfigPath: "/cfg/mcp/dev-bot-mdden.json",
   cwd,
   bounds: { maxTurns: 50, maxBudgetUsd: 5, wallClock: "30m" },
@@ -684,6 +698,39 @@ describe("run: spawning", () => {
     expect(ended.timedOut).toBe(false);
   });
 
+  it("163-S2: a real spawn reports its pid once the harness has started, and a missing command reports nothing", async () => {
+    const { runSession } = await import("../src/run/execute.ts");
+    const { spawn } = await import("node:child_process");
+    const spawned: (number | undefined)[] = [];
+    const ran = await runSession(
+      {
+        spawnable: { command: process.execPath, args: ["-e", "0"], env: { PATH: process.env.PATH ?? "" } },
+        cwd: process.cwd(),
+        wallClockMs: 5_000,
+        onSpawned: (pid) => spawned.push(pid),
+      },
+      { spawn, isWindows: process.platform === "win32" },
+    );
+    expect(ran.spawnProblem).toBeNull();
+    expect(spawned).toHaveLength(1);
+    expect(typeof spawned[0]).toBe("number");
+
+    // `spawn()` returns a child for a command that is not there and says so
+    // only afterwards, which is why the record waits for the event.
+    const missing: (number | undefined)[] = [];
+    const failed = await runSession(
+      {
+        spawnable: { command: "definitely-not-a-real-command-mdbrain", args: [], env: {} },
+        cwd: process.cwd(),
+        wallClockMs: 5_000,
+        onSpawned: (pid) => missing.push(pid),
+      },
+      { spawn, isWindows: process.platform === "win32" },
+    );
+    expect(failed.spawnProblem).not.toBeNull();
+    expect(missing).toEqual([]);
+  });
+
   it("105-S34: a session that outlives its wall clock is signalled and reported as timed out", async () => {
     const { runSession } = await import("../src/run/execute.ts");
     const { spawn } = await import("node:child_process");
@@ -796,6 +843,11 @@ async function drive(over: Partial<import("../src/commands/run.ts").RunDeps> = {
   let signalCloses = 0;
   let signalsOpened: import("../src/run/signals.ts").SignalLinkOptions | null = null;
   let fire: ((dueInMs: number) => void) | null = null;
+  // The in-flight records, in memory: what is on "disk" now, and every write
+  // and removal in the order they happened.
+  const inFlight = new Map<string, import("../src/run/inflight.ts").InFlightRecord>();
+  const inFlightLog: string[] = [];
+  const resumesAsked: import("../src/commands/resume.ts").ResumeTarget[] = [];
   const deps: import("../src/commands/run.ts").RunDeps = {
     isTTY: false,
     isWindows: false,
@@ -820,9 +872,30 @@ async function drive(over: Partial<import("../src/commands/run.ts").RunDeps> = {
     },
     recordRun: async (row) => {
       rows.push(row);
+      inFlightLog.push(`row ${(row as { claim: string }).claim}`);
     },
     recordDiagnosis: async (row) => {
       notes.push(row);
+    },
+    inFlight: {
+      write: async (record) => {
+        inFlight.set(record.claim, record);
+        inFlightLog.push(`write ${record.claim}`);
+      },
+      remove: async (claim) => {
+        inFlight.delete(claim);
+        inFlightLog.push(`remove ${claim}`);
+      },
+      list: async () => [...inFlight.values()],
+      lock: async () => null,
+      nameHarness: async () => {},
+      unlock: async () => {},
+    },
+    isAlive: () => false,
+    pid: 4410,
+    prepareResume: async (target) => {
+      resumesAsked.push(target);
+      return null;
     },
     sleep: async () => {},
     now: () => new Date(2026, 8, 4, 12, 4, 1),
@@ -872,6 +945,9 @@ async function drive(over: Partial<import("../src/commands/run.ts").RunDeps> = {
       fire: (dueInMs = 0) => fire?.(dueInMs),
     },
     nameAsks,
+    inFlight,
+    inFlightLog,
+    resumesAsked,
   };
 }
 
@@ -4425,5 +4501,355 @@ describe("run: the MCP file is the binary's own", () => {
     const writeMcpFile = vi.fn(async (agent: string) => mcpConfigPath(agent));
     await drive({ writeMcpFile, claim: async () => ({ work: [unit(), unit("dev-bot-mdden", "c2f0", 8413)], refused: [] }) });
     expect(writeMcpFile).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("run: the in-flight record a session leaves while it runs", () => {
+  type InFlightRecord = import("../src/run/inflight.ts").InFlightRecord;
+  type RunDeps = import("../src/commands/run.ts").RunDeps;
+
+  /** An in-memory store, with every write, removal and run-log row in order. */
+  const store = () => {
+    const records = new Map<string, InFlightRecord>();
+    const log: string[] = [];
+    const inFlight: RunDeps["inFlight"] = {
+      write: async (record) => {
+        records.set(record.claim, record);
+        log.push(`write ${record.claim}`);
+      },
+      remove: async (claim) => {
+        records.delete(claim);
+        log.push(`remove ${claim}`);
+      },
+      list: async () => [...records.values()],
+      lock: async () => null,
+      nameHarness: async () => {},
+      unlock: async () => {},
+    };
+    const recordRun: RunDeps["recordRun"] = async (row) => {
+      log.push(`row ${row.claim}`);
+    };
+    return { records, log, inFlight, recordRun };
+  };
+
+  /** A session that spawns, and remembers which records existed while it ran. */
+  const spawning = (records: Map<string, InFlightRecord>, during: InFlightRecord[][], over: Record<string, unknown> = {}): RunDeps["startSession"] =>
+    async (request) => {
+      request.onSpawned?.(5150);
+      // One turn for the write the spawn started.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      during.push([...records.values()]);
+      return { stdout: good(), stderr: "", exitCode: 0, timedOut: false, stopped: false, signal: null, spawnProblem: null, ...over };
+    };
+
+  it("163-S1: the record exists while the session runs, names the entry and both pids, and goes after the row, on any outcome", async () => {
+    for (const over of [{}, { stdout: "", stderr: "boom", exitCode: 1 }]) {
+      const { records, log, inFlight, recordRun } = store();
+      const during: InFlightRecord[][] = [];
+      await drive({ inFlight, recordRun, startSession: spawning(records, during, over) });
+
+      expect(during).toHaveLength(1);
+      expect(during[0]).toEqual([
+        expect.objectContaining({
+          claim: "c1f0",
+          agentEntryId: "agent-1",
+          agent: "dev-bot-mdden",
+          workspace: "01-ideas",
+          cwd,
+          ownerPid: 4410,
+          harnessPid: 5150,
+          resumes: 0,
+        }),
+      ]);
+      // The ending is in the run log before the record says the session is over.
+      expect(log).toEqual(["write c1f0", "row c1f0", "remove c1f0"]);
+      expect(records.size).toBe(0);
+    }
+  });
+
+  it("163-S2: a session that never spawned writes no record", async () => {
+    const { log, inFlight, recordRun } = store();
+    await drive({
+      inFlight,
+      recordRun,
+      startSession: async () => ({ stdout: "", stderr: "", exitCode: null, timedOut: false, stopped: false, signal: null, spawnProblem: "spawn claude ENOENT" }),
+    });
+    expect(log).toEqual(["row c1f0"]);
+  });
+
+  it("163-S4: a record that cannot be written is one note, and the session ends exactly as it would have", async () => {
+    const { records, log, recordRun } = store();
+    const during: InFlightRecord[][] = [];
+    const rows: unknown[] = [];
+    const driven = await drive({
+      inFlight: {
+        write: async () => {
+          throw new Error("EACCES: permission denied");
+        },
+        remove: async (claim) => {
+          log.push(`remove ${claim}`);
+        },
+        list: async () => [],
+        lock: async () => null,
+        nameHarness: async () => {},
+        unlock: async () => {},
+      },
+      recordRun: async (row) => {
+        rows.push(row);
+        await recordRun(row);
+      },
+      startSession: spawning(records, during),
+    });
+    expect(driven.code).toBe(0);
+    expect(rows).toEqual([expect.objectContaining({ claim: "c1f0", outcome: "done" })]);
+    const notes = driven.out.filter((line) => line.includes("in-flight record could not be written"));
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toContain("EACCES");
+    // Nothing was written, so nothing is removed.
+    expect(log).toEqual(["row c1f0"]);
+  });
+
+  it("163-S21: a runner that finds records a crash left says where to pick them up, and starts nothing for them", async () => {
+    const left: InFlightRecord = {
+      claim: "77e00000-0000-4000-8000-000000000000",
+      agentEntryId: "agent-1",
+      agent: "dev-bot-mdden",
+      workspace: "01-ideas",
+      brain: "markdown brain",
+      cwd,
+      startedAt: "2026-09-04T09:00:00.000Z",
+      ownerPid: 999,
+      harnessPid: null,
+      resumes: 0,
+    };
+    const crashed = await drive({
+      inFlight: { write: async () => {}, remove: async () => {}, list: async () => [left], lock: async () => null, nameHarness: async () => {}, unlock: async () => {} },
+      count: async () => ({ waiting: 0, capped: false }),
+    });
+    expect(crashed.spawned).toEqual([]);
+    const said = crashed.out.filter((line) => line.includes("mdbrain resume"));
+    expect(said).toHaveLength(1);
+    expect(said[0]).toContain("dev-bot-mdden");
+    expect(said[0]).toContain("77e0");
+
+    // A record whose session is still running elsewhere is not left behind.
+    const elsewhere = await drive({
+      inFlight: { write: async () => {}, remove: async () => {}, list: async () => [left], lock: async () => null, nameHarness: async () => {}, unlock: async () => {} },
+      isAlive: (pid) => pid === 999,
+      count: async () => ({ waiting: 0, capped: false }),
+    });
+    expect(elsewhere.out.join("\n")).not.toContain("mdbrain resume");
+  });
+});
+
+describe("run: r on a failed run", () => {
+  const feed = (events: RunEvent[]) => events.reduce((state, event) => applyEvent(state, event, AT), emptyView);
+  const press = (over: Partial<KeyModifiers> = {}): KeyModifiers => ({ ctrl: false, upArrow: false, downArrow: false, escape: false, ...over });
+  const recent = (outcome: OutcomeKind) =>
+    feed([
+      { kind: "configured", agent: "a" },
+      outcome === "done" || outcome === "stopped"
+        ? { kind: "done", agent: "a", claim: "c9", ms: 1000, costUsd: 0.1, turns: 1, message: "Finished." }
+        : { kind: "failed", agent: "a", claim: "c9", outcome, ms: 1000, message: "It went wrong." },
+    ]).recent[0];
+
+  it("163-S18: r is offered and taken only for a run whose harness ran and lost its ending", () => {
+    for (const outcome of ["failed", "timed-out", "unreadable"] as const) {
+      const run = recent(outcome);
+      expect(actionForKey("r", press(), run)).toEqual({ to: "resume" });
+      expect(keyHints(run)).toContain("r — resume this run");
+    }
+    for (const outcome of ["done", "stopped", "spawn-failed"] as const) {
+      const run = { ...recent(outcome), outcome };
+      expect(actionForKey("r", press(), run)).toBeNull();
+      expect(keyHints(run).join(" ")).not.toContain("resume");
+    }
+    // With nothing open there is nothing to resume.
+    expect(actionForKey("r", press(), null)).toBeNull();
+    expect(keyHints().join(" ")).not.toContain("resume");
+  });
+
+  it("163-S18: on the real screen, r on the open failed run asks the loop for exactly that run, and r on a done one asks nothing", async () => {
+    const DOWN = "\u001b[B";
+    const settle = async () => {
+      for (let i = 0; i < 4; i += 1) await new Promise((r) => setTimeout(r, 25));
+    };
+    const asked: ViewRequest[] = [];
+    const view = feed([
+      { kind: "configured", agent: "a" },
+      { kind: "done", agent: "a", claim: "c1", ms: 1000, costUsd: 0.1, turns: 1, message: "Triaged three files." },
+      { kind: "failed", agent: "a", claim: "c2", outcome: "timed-out", ms: 2000, message: "the wall clock ran out" },
+    ]);
+    const { lastFrame, stdin } = render(liveScreenFor(view, (request) => asked.push(request)));
+    await settle();
+    stdin.write("r");
+    await settle();
+    expect(asked).toEqual([]);
+    stdin.write(DOWN);
+    await settle();
+    expect(lastFrame() ?? "").toContain("r — resume this run");
+    stdin.write("r");
+    await settle();
+    expect(asked).toEqual([{ kind: "resume", agent: "a", claim: "c2" }]);
+    stdin.write(DOWN);
+    await settle();
+    expect(lastFrame() ?? "").not.toContain("resume this run");
+    stdin.write("r");
+    await settle();
+    expect(asked).toHaveLength(1);
+  });
+
+  it("163-S19/S20: the view gives the terminal up while the loop goes on, an interrupt then is the person's, and Ctrl-C stops the runner again after", async () => {
+    const { waitFor } = await import("../src/commands/run.ts");
+    const until = async (done: () => boolean) => {
+      for (let i = 0; i < 200 && !done(); i += 1) await new Promise((r) => setTimeout(r, 5));
+      expect(done()).toBe(true);
+    };
+    const polls = () => captured.events.filter((e) => e.kind === "poll").length;
+    const order: string[] = [];
+    let claimed = false;
+    let waits = 0;
+    // Once the view is back, Ctrl-C is the runner's again, and it is what ends this run.
+    captured.onResume = () => setTimeout(() => process.emit("SIGINT", "SIGINT"), 10);
+
+    const driven = await drive(
+      {
+        isTTY: true,
+        count: async () => ({ waiting: claimed ? 0 : 1, capped: false }),
+        claim: async () => {
+          claimed = true;
+          return { work: [unit()], refused: [] };
+        },
+        // The unit fails, which is what makes it resumable from the view.
+        startSession: async () => ({ stdout: "", stderr: "boom", exitCode: 1, timedOut: false, stopped: false, signal: null, spawnProblem: null }),
+        prepareResume: async (target) => {
+          order.push(`prepare ${target.agent} ${target.claim} ${target.workspace} ${target.cwd}`);
+          return {
+            cancel: async () => {
+              order.push("cancel");
+            },
+            start: async () => {
+              order.push(`start, view ${captured.terminal.at(-1)}`);
+              // S20: the person presses Ctrl-C inside their session.
+              process.emit("SIGINT", "SIGINT");
+              // S19: the loop is still going, and its events still arrive.
+              const before = polls();
+              captured.handler?.("poll-now");
+              await until(() => polls() > before);
+              order.push("polled while resumed");
+              return 0;
+            },
+          };
+        },
+        sleep: (ms, signal) => {
+          const waiting = waitFor(ms, signal);
+          waits += 1;
+          // Asked after the failed session has ended, as a person would.
+          if (waits === 1) setTimeout(() => captured.handler?.({ kind: "resume", agent: "dev-bot-mdden", claim: "c1f0" }), 20);
+          return waiting;
+        },
+      },
+      { once: false },
+    );
+    void driven;
+    // Unreachable unless the runner stopped: the stop below is what ends it.
+    expect(order).toEqual([`prepare dev-bot-mdden c1f0 01-ideas ${cwd}`, "start, view suspend", "polled while resumed"]);
+    expect(captured.terminal).toEqual(["suspend", "resume"]);
+    const kinds = captured.events.map((e) => (e.kind === "phase" ? `phase:${e.phase.kind}` : e.kind));
+    // The interrupt during the session did not stop the runner: the poll after
+    // it happened, and finishing came only with the Ctrl-C after the remount.
+    expect(kinds.lastIndexOf("poll")).toBeLessThan(kinds.indexOf("phase:finishing"));
+    expect(captured.events).toContainEqual({ kind: "note", message: "dev-bot-mdden's resumed session ended." });
+  });
+
+  // A resumed session's harness inherits this process's terminal. A runner that
+  // finished without it would print its last line over the person's session and
+  // drop the interrupt guard under them.
+  it("163-S24: a SIGTERM while a resumed session has the terminal ends the runner after that session, never from under it", async () => {
+    const { waitFor } = await import("../src/commands/run.ts");
+    const until = async (done: () => boolean) => {
+      for (let i = 0; i < 200 && !done(); i += 1) await new Promise((r) => setTimeout(r, 5));
+      expect(done()).toBe(true);
+    };
+    const order: string[] = [];
+    let claimed = false;
+    let waits = 0;
+
+    await drive(
+      {
+        isTTY: true,
+        count: async () => ({ waiting: claimed ? 0 : 1, capped: false }),
+        claim: async () => {
+          claimed = true;
+          return { work: [unit()], refused: [] };
+        },
+        startSession: async () => ({ stdout: "", stderr: "boom", exitCode: 1, timedOut: false, stopped: false, signal: null, spawnProblem: null }),
+        prepareResume: async () => ({
+          cancel: async () => {
+            order.push("cancel");
+          },
+          start: async () => {
+            process.emit("SIGTERM", "SIGTERM");
+            await until(() => captured.events.some((e) => e.kind === "phase" && e.phase.kind === "finishing"));
+            // Long enough for a runner that did not wait to have reached its last line.
+            await new Promise((r) => setTimeout(r, 50));
+            order.push(`session ends; runner already stopped: ${captured.events.some((e) => e.kind === "stopped")}`);
+            return 0;
+          },
+        }),
+        sleep: (ms, signal) => {
+          const waiting = waitFor(ms, signal);
+          waits += 1;
+          if (waits === 1) setTimeout(() => captured.handler?.({ kind: "resume", agent: "dev-bot-mdden", claim: "c1f0" }), 20);
+          return waiting;
+        },
+      },
+      { once: false },
+    );
+
+    expect(order).toEqual(["session ends; runner already stopped: false"]);
+    expect(captured.events.at(-1)?.kind).toBe("stopped");
+  });
+
+  it("163-S25: a runner that begins stopping while a resume is being checked cancels it, and never gives the terminal up", async () => {
+    const { waitFor } = await import("../src/commands/run.ts");
+    const order: string[] = [];
+    let claimed = false;
+    let waits = 0;
+
+    await drive(
+      {
+        isTTY: true,
+        count: async () => ({ waiting: claimed ? 0 : 1, capped: false }),
+        claim: async () => {
+          claimed = true;
+          return { work: [unit()], refused: [] };
+        },
+        startSession: async () => ({ stdout: "", stderr: "boom", exitCode: 1, timedOut: false, stopped: false, signal: null, spawnProblem: null }),
+        prepareResume: async () => {
+          // The stop lands while the checks are still running.
+          process.emit("SIGTERM", "SIGTERM");
+          return {
+            cancel: async () => {
+              order.push("cancel");
+            },
+            start: async () => {
+              order.push("start");
+              return 0;
+            },
+          };
+        },
+        sleep: (ms, signal) => {
+          const waiting = waitFor(ms, signal);
+          waits += 1;
+          if (waits === 1) setTimeout(() => captured.handler?.({ kind: "resume", agent: "dev-bot-mdden", claim: "c1f0" }), 20);
+          return waiting;
+        },
+      },
+      { once: false },
+    );
+
+    expect(order).toEqual(["cancel"]);
+    expect(captured.terminal).toEqual([]);
   });
 });

@@ -11,6 +11,7 @@ import { dispatch, type CommandSpec } from "./cli.ts";
 import { configure } from "./commands/configure.ts";
 import { login } from "./commands/login.ts";
 import { logout } from "./commands/logout.ts";
+import { resume } from "./commands/resume.ts";
 import { run as runCommand } from "./commands/run.ts";
 import { upgrade } from "./commands/upgrade.ts";
 import { whoami } from "./commands/whoami.ts";
@@ -24,7 +25,7 @@ import { VERSION } from "./version.ts";
 export { VERSION };
 
 /** Every command this binary has. */
-export const COMMANDS: CommandSpec[] = [login, whoami, logout, configure, runCommand, as, agents, upgrade];
+export const COMMANDS: CommandSpec[] = [login, whoami, logout, configure, runCommand, as, resume, agents, upgrade];
 
 /**
  * Run one invocation.

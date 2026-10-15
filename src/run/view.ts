@@ -38,6 +38,20 @@ import { versionNoticeText } from "../upgrade/notice.ts";
 /** How many finished sessions the view remembers. Memory only, and never read back. */
 export const RECENT_LIMIT = 5;
 
+/**
+ * The outcomes whose session can be picked up again: a harness ran, and its
+ * ending was lost or went wrong.
+ *
+ * Not `done` or `stopped`, which lost nothing, and not `spawn-failed`, which
+ * never ran and so left no transcript to resume.
+ */
+export const RESUMABLE_OUTCOMES: readonly OutcomeKind[] = ["failed", "timed-out", "unreadable"];
+
+/** Whether a finished run's session can be resumed. */
+export function resumableOutcome(outcome: OutcomeKind): boolean {
+  return RESUMABLE_OUTCOMES.includes(outcome);
+}
+
 /** One agent, as a row. */
 export interface AgentRow {
   agent: string;

@@ -43,12 +43,13 @@ import { configPath } from "../config/paths.ts";
 import { openConnectionKeyStore, type ConnectionKeyStore } from "../config/secrets.ts";
 import { ambiguousAgentMessage, resolveAgent } from "../as/choose.ts";
 import { pickOnScreen } from "../as/screen.ts";
-import { credentialsCollide, harnessFor } from "../run/harness.ts";
-import { runAttached } from "../run/execute.ts";
+import { credentialsCollide, harnessFor, type HarnessSpec, type Spawnable } from "../run/harness.ts";
+import { runAttached, type AttachedEnding } from "../run/execute.ts";
 import { holdReason } from "../run/loop.ts";
 import { presentConnectionKey } from "../auth/api.ts";
 import { readProbe, unreachedProbe, type Probe } from "../agents/verdict.ts";
 import { noConfigMessage, UNREADABLE_CONFIG_MESSAGE } from "./run.ts";
+import type { AgentEntry } from "../config/schema.ts";
 
 /**
  * What the command needs from outside itself, so a test can stand each one in.
@@ -90,6 +91,13 @@ export interface AsDeps {
  */
 export const AS_CHECK_TIMEOUT_MS = 3_000;
 
+/**
+ * What an attended session's preflight reads, and nothing else — the part of
+ * {@link AsDeps} a resume shares, because a resume is an attended session that
+ * starts from a transcript.
+ */
+export type AttendedDeps = Pick<AsDeps, "env" | "directoryExists" | "openKeyStore" | "checkKey">;
+
 const defaultDeps: AsDeps = {
   env: process.env,
   directoryExists: (path) => {
@@ -111,6 +119,14 @@ const defaultDeps: AsDeps = {
   // The handshake alone: a refusal is answered on it, and the brains the second
   // request would name are nothing this command reads.
   checkKey: (key) => presentConnectionKey(key, AbortSignal.timeout(AS_CHECK_TIMEOUT_MS), true).then(readProbe, unreachedProbe),
+};
+
+/** The preflight's edges as this process has them, for the other attended path to start from. */
+export const defaultAttendedDeps: AttendedDeps = {
+  env: defaultDeps.env,
+  directoryExists: defaultDeps.directoryExists,
+  openKeyStore: defaultDeps.openKeyStore,
+  checkKey: defaultDeps.checkKey,
 };
 
 /** The refusal for a key the server would not take, naming the command that explains it. */
@@ -207,6 +223,52 @@ export async function runAs(deps: AsDeps, context: CommandContext): Promise<numb
     return 1;
   }
 
+  const ready = await prepareAttended(deps, agent, entry, err);
+  if (ready === null) return 1;
+
+  const spawnable = ready.spec.buildInteractive({
+    session: { kind: "new", id: deps.newSessionId() },
+    mcpConfigPath: mcpConfigPath(agent),
+    cwd: entry.cwd,
+    harnessCredential: ready.harnessCredential,
+    connectionKeyVariable: entry.env.connectionKey,
+    connectionKey: ready.connectionKey,
+    parentEnv: deps.env,
+  });
+
+  // Nothing is printed before the harness takes the terminal. The harness draws
+  // its own header and names the directory in it, the person just typed the
+  // agent's name, and a line saying how this session differs from a triggered
+  // one is a decision that has been taken the other way.
+  const ending = await deps.startSession({ spawnable, cwd: entry.cwd });
+  return attendedExitCode(ending, ready.spec, spawnable, err);
+}
+
+/** What an attended session needs once its entry has passed every check. */
+export interface Attended {
+  spec: HarnessSpec;
+  connectionKey: string;
+  /** Null for the machine's own signed-in account. */
+  harnessCredential: string | null;
+}
+
+/**
+ * Every check an attended session makes before it spends anything, in order,
+ * with each refusal said in one sentence.
+ *
+ * **Shared with the resume, and that is why it is a function.** A resume is an
+ * attended session that starts from a transcript; one that ran its own copy of
+ * these checks would be a second opinion about what makes an entry unrunnable,
+ * and the two would drift the first time either was changed.
+ *
+ * @returns what the spawn needs, or null once a refusal has been said
+ */
+export async function prepareAttended(
+  deps: AttendedDeps,
+  agent: string,
+  entry: AgentEntry,
+  err: (line: string) => void,
+): Promise<Attended | null> {
   // **`holdReason` with a null roster, which is that function's existing
   // contract for *the roster is unknown*.** Two of its three reasons are exactly
   // this command's checks; the third needs a roster, the roster needs the human
@@ -217,7 +279,7 @@ export async function runAs(deps: AsDeps, context: CommandContext): Promise<numb
   const held = holdReason(agent, entry, deps.env, deps.directoryExists, null);
   if (held !== null) {
     err(`${agent} cannot start here: ${held}`);
-    return 1;
+    return null;
   }
 
   const spec = harnessFor(entry.harness);
@@ -227,7 +289,7 @@ export async function runAs(deps: AsDeps, context: CommandContext): Promise<numb
     keyStore = await deps.openKeyStore();
   } catch (cause) {
     err(`Could not open the connection key store: ${(cause as Error).message}`);
-    return 1;
+    return null;
   }
 
   // Refused before the key is read rather than after, because either resolution
@@ -239,7 +301,7 @@ export async function runAs(deps: AsDeps, context: CommandContext): Promise<numb
       `${agent}'s connection key and its harness credential are both \`${spec.credentialVariable}\`. ` +
         "One variable cannot hold both; give the connection key its own name in config.json.",
     );
-    return 1;
+    return null;
   }
 
   let connectionKey: string | null;
@@ -247,14 +309,14 @@ export async function runAs(deps: AsDeps, context: CommandContext): Promise<numb
     connectionKey = await keyStore.get(entry.id);
   } catch (cause) {
     err(`The connection key could not be read: ${(cause as Error).message}`);
-    return 1;
+    return null;
   }
   // Named as `configure`'s to fix rather than this command's: nothing here may
   // ask the server for a key, and it could not write one down if it were given
   // one.
   if (connectionKey === null) {
     err(`There is no connection key for ${agent} on this machine. Run \`mdbrain configure\` to ask the server for one.`);
-    return 1;
+    return null;
   }
 
   // Only a refusal stops the session. Accepted starts it, and so does a check
@@ -263,30 +325,25 @@ export async function runAs(deps: AsDeps, context: CommandContext): Promise<numb
   const probe = await deps.checkKey(connectionKey);
   if (probe.kind === "refused") {
     err(refusedKeyMessage(agent));
-    return 1;
+    return null;
   }
 
   const harnessCredential = entry.env.harness === null ? null : (deps.env[entry.env.harness] ?? null);
   if (entry.env.harness !== null && harnessCredential === null) {
     err(`${entry.env.harness} is no longer set, so the harness has no credential.`);
-    return 1;
+    return null;
   }
 
-  const spawnable = spec.buildInteractive({
-    sessionId: deps.newSessionId(),
-    mcpConfigPath: mcpConfigPath(agent),
-    cwd: entry.cwd,
-    harnessCredential,
-    connectionKeyVariable: entry.env.connectionKey,
-    connectionKey,
-    parentEnv: deps.env,
-  });
+  return { spec, connectionKey, harnessCredential };
+}
 
-  // Nothing is printed before the harness takes the terminal. The harness draws
-  // its own header and names the directory in it, the person just typed the
-  // agent's name, and a line saying how this session differs from a triggered
-  // one is a decision that has been taken the other way.
-  const ending = await deps.startSession({ spawnable, cwd: entry.cwd });
+/**
+ * The exit code an attended session ends the command with, and the one line its
+ * ending is owed when it did not simply exit.
+ *
+ * @returns the child's own code, or 1 for a spawn that failed or a signal
+ */
+export function attendedExitCode(ending: AttachedEnding, spec: HarnessSpec, spawnable: Spawnable, err: (line: string) => void): number {
   if (ending.spawnProblem !== null) {
     // Named for the harness rather than the errno, because `claude` not being on
     // PATH is the common one and `ENOENT` does not tell anybody that.

@@ -20,8 +20,11 @@ import { COMMANDS } from "../src/main.ts";
 
 const cwd = process.platform === "win32" ? "C:\\work\\checkout" : "/work/checkout";
 
-const identity = (over: Partial<Identity> = {}): Identity => ({
-  sessionId: "3f2a0000-0000-4000-8000-000000000000",
+/** An identity for a new transcript, which is what either builder may be handed. */
+type NewIdentity = Identity & { session: { kind: "new"; id: string } };
+
+const identity = (over: Partial<NewIdentity> = {}): NewIdentity => ({
+  session: { kind: "new", id: "3f2a0000-0000-4000-8000-000000000000" },
   mcpConfigPath: "/cfg/mcp/dev-bot-mdden.json",
   cwd,
   harnessCredential: "sk-live",
@@ -110,8 +113,8 @@ describe("as: the identity, shared by both modes", () => {
   it("125-S1: two entries whose bounds differ in every field answer the same but for the paths", () => {
     // Bounds are not on `Identity` at all, which is the point: the shared half
     // cannot vary with them because it cannot see them.
-    const one = claudeHarness.identityArgs(identity({ mcpConfigPath: "/a.json", sessionId: "11110000-0000-4000-8000-000000000000" }));
-    const two = claudeHarness.identityArgs(identity({ mcpConfigPath: "/b.json", sessionId: "22220000-0000-4000-8000-000000000000" }));
+    const one = claudeHarness.identityArgs(identity({ mcpConfigPath: "/a.json", session: { kind: "new", id: "11110000-0000-4000-8000-000000000000" } }));
+    const two = claudeHarness.identityArgs(identity({ mcpConfigPath: "/b.json", session: { kind: "new", id: "22220000-0000-4000-8000-000000000000" } }));
     expect(one.length).toBe(two.length);
     const differing = one.map((arg, i) => (arg === two[i] ? null : i)).filter((i) => i !== null);
     expect(differing).toEqual([1, 8]);
@@ -337,7 +340,7 @@ describe("as: startup and the refusals", () => {
     // pass by agreeing with a copy of the list that has drifted.
     expect(started.args).toEqual(
       claudeHarness.buildInteractive({
-        sessionId: "9a7b0000-0000-4000-8000-000000000001",
+        session: { kind: "new", id: "9a7b0000-0000-4000-8000-000000000001" },
         mcpConfigPath: mcpConfigPath("dev-bot-mdden"),
         cwd,
         harnessCredential: "sk-live",

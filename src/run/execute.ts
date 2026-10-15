@@ -66,6 +66,15 @@ export interface SessionRequest {
   graceMs?: number;
   /** How this session learns the runner is stopping. */
   onStop?: StopRegistry;
+  /**
+   * Called once the harness has actually started, with its pid.
+   *
+   * **The child's `spawn` event and not the return of `spawn()`**: a command
+   * that is not on PATH still returns a child, and only says so afterwards with
+   * `error`. The caller writes its in-flight record here, and a record written
+   * for a session that never ran would offer a transcript that does not exist.
+   */
+  onSpawned?: (pid: number | undefined) => void;
 }
 
 /** The pieces a test stands in for, so none of this needs a real harness. */
@@ -184,6 +193,7 @@ export function runSession(request: SessionRequest, given: Partial<ExecuteDeps> 
     let settled = false;
     let hardKill: ReturnType<typeof setTimeout> | null = null;
 
+    child.on("spawn", () => request.onSpawned?.(child.pid));
     child.stdout?.on("data", (chunk: Buffer) => stdoutChunks.push(chunk));
     child.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
 
@@ -253,6 +263,13 @@ export function runSession(request: SessionRequest, given: Partial<ExecuteDeps> 
 export interface AttachedRequest {
   spawnable: Spawnable;
   cwd: string;
+  /**
+   * Called once the harness has started, with its pid — on the `spawn` event,
+   * for the reason {@link SessionRequest.onSpawned} gives. A resume records it,
+   * because an attended harness can outlive the `mdbrain` that started it when
+   * that process is killed outright.
+   */
+  onSpawned?: (pid: number | undefined) => void;
 }
 
 /**
@@ -357,6 +374,7 @@ export function runAttached(request: AttachedRequest, deps: AttachedDeps = defau
       return;
     }
 
+    child.on("spawn", () => request.onSpawned?.(child.pid));
     let settled = false;
     const settle = (exitCode: number | null, signal: NodeJS.Signals | null, spawnProblem: string | null) => {
       if (settled) return;

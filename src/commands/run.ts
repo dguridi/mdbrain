@@ -41,6 +41,9 @@ import { readWork, type WorkUnit } from "../work/instruction.ts";
 import { answerPollNow, CLAIM_LIMIT, placeWork, planStartup, renamedAgents, rosterView, summaryLines, tickPlan, type RosterView, type Startup } from "../run/loop.ts";
 import { credentialsCollide, harnessFor } from "../run/harness.ts";
 import { runSession, type StopRegistry } from "../run/execute.ts";
+import { diskInFlight, processAlive, type InFlightStore } from "../run/inflight.ts";
+import { leftBehindNote } from "../resume/rows.ts";
+import { prepareResume, resumeSessionDefaults, type PreparedResume, type ResumeTarget } from "./resume.ts";
 import { readOutcome, type Outcome } from "../run/outcome.ts";
 import { renderPrompt } from "../run/prompt.ts";
 import { appendRun, logRow, runLogPath } from "../run/log.ts";
@@ -58,7 +61,8 @@ import {
 } from "../run/diagnosis.ts";
 import { dayLine, plainPresenter, type Presenter, type RunEvent } from "../run/present.ts";
 import { livePresenter } from "../run/screen.ts";
-import type { ViewRequest } from "../run/keys.ts";
+import type { ResumeRequest, ViewRequest } from "../run/keys.ts";
+import { resumableOutcome } from "../run/view.ts";
 import { desiredPresence } from "../run/presence.ts";
 import { presenceLink, silentLink, type AgentIdentity, type PresenceLink, type PresenceLinkOptions } from "../run/realtime.ts";
 import { socketUrl } from "../run/channel.ts";
@@ -111,6 +115,12 @@ const LISTEN_LOOKUP_TIMEOUT_MS = 5_000;
 const TOKEN_UPKEEP_MS = 15 * 60_000;
 
 /**
+ * How many finished runs the runner remembers well enough to resume from the
+ * view. More than the view draws, so a run still on screen is always one of them.
+ */
+const RESUMABLE_REMEMBERED = 20;
+
+/**
  * What the command needs from outside itself, so a test can stand each one in.
  *
  * Every edge is here — the disk, the session, the three network calls, the
@@ -158,6 +168,22 @@ export interface RunDeps {
   startSession: typeof runSession;
   /** Appends one row to the run log. */
   recordRun: typeof appendRun;
+  /**
+   * The in-flight records: one written when a session's harness has started,
+   * removed once its row is in the run log, so a session whose ending was never
+   * recorded is exactly a session with a record.
+   */
+  inFlight: InFlightStore;
+  /** Whether a pid is a live process, which is what tells a running session from a lost one. */
+  isAlive: (pid: number) => boolean;
+  /** This process, named in every record it writes as the session's owner. */
+  pid: number;
+  /**
+   * Every check a resume asked for from the view makes, and the spawn it will
+   * make — `mdbrain resume`'s own path, so the two doors cannot disagree about
+   * what a resume is. An edge so a test can see the request without a harness.
+   */
+  prepareResume: (target: ResumeTarget, err: (line: string) => void) => Promise<PreparedResume | null>;
   /**
    * Appends one row to the diagnosis log — the start, a refusal, the stop.
    *
@@ -279,6 +305,12 @@ const defaultDeps: RunDeps = {
   writeMcpFile: writeMcpConfig,
   startSession: runSession,
   recordRun: appendRun,
+  inFlight: diskInFlight,
+  isAlive: processAlive,
+  pid: process.pid,
+  // Built per call, because `resume.ts` reaches this module again through
+  // `as.ts`, and a default read at load time would be read half-evaluated.
+  prepareResume: (target, err) => prepareResume(resumeSessionDefaults(), target, err),
   recordDiagnosis: appendDiagnosis,
   sleep: waitFor,
   now: () => new Date(),
@@ -444,6 +476,19 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
   // still said by `configure`, where somebody is asking rather than being told.
   const keyStorage = keyStore.backend.kind === "keychain" ? null : keyStorageLine(keyStore.backend);
   say({ kind: "summary", lines: summaryLines(startup, runLogPath(), keyStorage) });
+
+  // **What a crash left behind is said, and nothing is done about it.** A session
+  // with a record and no live process is one whose ending was never written, and
+  // the person is told where to pick it up. Resuming it here would be the
+  // unattended resume that is ruled out, and re-running its claim would be
+  // delivering a unit twice. A list that cannot be read says nothing: this is a
+  // courtesy, and the run does not depend on it.
+  try {
+    const left = leftBehindNote(await deps.inFlight.list(), (pid) => pid !== deps.pid && deps.isAlive(pid));
+    if (left !== null) say({ kind: "note", message: left });
+  } catch {
+    // Unreadable is silent, for the reason above.
+  }
 
   // Declared before the connection rather than beside the loop's other flags,
   // because the connection can report a state during its own construction — a
@@ -668,6 +713,19 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
   let anyFailed = false;
   /** How many sessions this process started, so a stop row reads as a history rather than a list. */
   let sessionsStarted = 0;
+  /**
+   * The workspace and brain of each finished run the view could ask to resume,
+   * by claim — what the record a resume writes needs and the view's row does
+   * not carry. Bounded, because the view itself remembers only a handful.
+   */
+  const resumable = new Map<string, { workspace: string; brain: string | null; cwd: string }>();
+  /** Whether a resume is being prepared or is running, so a second `r` is refused. */
+  let resuming = false;
+  /**
+   * Whether a resumed session has the terminal, which is when an interrupt is
+   * the person's and not the runner's.
+   */
+  let holdingTerminal = false;
 
   /**
    * Run one unit to its end, then start whatever was waiting behind it.
@@ -718,9 +776,40 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
     // Read before the session rather than inside the reporting below, because
     // it is also what decides whether the failure that follows was about the key.
     const heldKey = keys.held(entry.id);
+    const claim = unit.instruction.claim;
+    const brain = brainNames.get(unit.instruction.workspace) ?? null;
+    // **Written once the harness has started and not before**, so a session that
+    // never spawned leaves no record offering a transcript that does not exist.
+    // Held as a promise, because the removal below has to come after it however
+    // quickly the session ends.
+    const inFlight: { written: Promise<boolean> | null } = { written: null };
+    const onSpawned = (harnessPid: number | undefined) => {
+      inFlight.written = deps.inFlight
+        .write({
+          claim,
+          agentEntryId: entry.id,
+          agent,
+          workspace: unit.instruction.workspace,
+          brain,
+          cwd: entry.cwd,
+          startedAt: deps.now().toISOString(),
+          ownerPid: deps.pid,
+          harnessPid: harnessPid ?? null,
+          resumes: 0,
+        })
+        .then(
+          () => true,
+          (cause: unknown) => {
+            // A note and never a failure, the rule the run log has: the session
+            // is running either way, and only its recoverability is lost.
+            say({ kind: "note", message: `The in-flight record could not be written: ${(cause as Error).message}` });
+            return false;
+          },
+        );
+    };
     let outcome: Outcome;
     try {
-      outcome = await oneSession(deps, heldKey, mcpFiles, entry, unit, onSessionStop);
+      outcome = await oneSession(deps, heldKey, mcpFiles, entry, unit, onSessionStop, onSpawned);
     } catch (cause) {
       outcome = spawnFailed(`the session could not be run: ${(cause as Error).message}`);
     }
@@ -733,6 +822,21 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
       // The work happened. Losing the record of it is smaller than reporting an
       // outcome that did not occur, so this is a note rather than a failure.
       say({ kind: "note", message: `The run log could not be written: ${(cause as Error).message}` });
+    }
+    // **After the row, whatever the outcome.** The ending is recorded now, so the
+    // session is no longer in flight; a failed one is resumed from the view while
+    // this runner lives, by the claim the view already holds.
+    if (inFlight.written !== null && (await inFlight.written)) {
+      try {
+        await deps.inFlight.remove(claim);
+      } catch (cause) {
+        say({ kind: "note", message: `The in-flight record could not be removed: ${(cause as Error).message}` });
+      }
+    }
+    if (resumableOutcome(outcome.kind)) {
+      resumable.set(claim, { workspace: unit.instruction.workspace, brain, cwd: entry.cwd });
+      // Oldest first in a Map's order, so the first key is the one to let go of.
+      if (resumable.size > RESUMABLE_REMEMBERED) resumable.delete(resumable.keys().next().value!);
     }
 
     if (outcome.kind === "done" || outcome.kind === "stopped") {
@@ -958,7 +1062,7 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
     // pressing Ctrl-C again would do nothing at all and the terminal would be
     // held for as long as the slowest harness took to die.
     if (stop.stopped) {
-      process.off("SIGINT", onStop);
+      process.off("SIGINT", onInterrupt);
       process.off("SIGTERM", onStop);
       process.off("SIGHUP", onHangup);
       process.kill(process.pid, "SIGINT");
@@ -1008,9 +1112,86 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
   const onHangup = () => {
     if (!stop.stopped) onStop();
   };
-  process.on("SIGINT", onStop);
+  /**
+   * Ctrl-C, which is a stop unless a resumed session has the terminal.
+   *
+   * **Then it is the person's, and it belongs to their session.** The harness
+   * shares this console, so the interrupt reaches this process as well — and
+   * reaching `onStop` would end the runner, and every unattended session it
+   * holds, because somebody stopped a turn in a conversation. A `SIGTERM` and a
+   * closing window are not keys, and still stop the runner.
+   */
+  const onInterrupt = () => {
+    if (holdingTerminal) return;
+    onStop();
+  };
+  process.on("SIGINT", onInterrupt);
   process.on("SIGTERM", onStop);
   if (deps.isWindows) process.on("SIGHUP", onHangup);
+
+  /**
+   * A resume asked for from the view: checked with the view still drawn, then
+   * the view unmounted while the person drives the session, then drawn again.
+   *
+   * **The runner does not pause.** The loop goes on polling and starting
+   * unattended sessions, which need no terminal, and its events go on reaching the
+   * reducer — so the view that comes back is current at once.
+   *
+   * **The resumed session is waited for like every other session**, so a runner
+   * told to stop while one is running ends after it rather than from under it.
+   * It joins that set in the same turn as the last check that the runner is not
+   * finishing, because the wait at the end takes its list once: joined a turn
+   * later, it could be left out, and the runner would print its last line over
+   * the person's session and give up the interrupt guard under them.
+   *
+   * **It is the one session the loop does not start.** A person asked for it,
+   * and the loop's unattended rule is untouched: nothing here is triggered work.
+   */
+  const onResume = async (request: ResumeRequest): Promise<void> => {
+    const note = (message: string) => say({ kind: "note", message });
+    if (finishing) {
+      note("The runner is stopping, so nothing is resumed from it now.");
+      return;
+    }
+    if (resuming) {
+      note("A resume is already under way.");
+      return;
+    }
+    const entry = config.agents[request.agent];
+    const known = resumable.get(request.claim);
+    if (entry === undefined || known === undefined) {
+      note(`${request.agent}'s run ${request.claim.slice(0, 4)}… cannot be resumed from here.`);
+      return;
+    }
+    resuming = true;
+    try {
+      const prepared = await deps.prepareResume({ agent: request.agent, entry, claim: request.claim, ...known }, note);
+      // Asked again on the far side of the checks, which can take seconds: a
+      // runner that began stopping meanwhile has no terminal to give back.
+      if (prepared === null) return;
+      if (stop.stopped || finishing) {
+        await prepared.cancel();
+        return;
+      }
+      holdingTerminal = true;
+      const running = (async () => {
+        await presenter.suspend();
+        return prepared.start();
+      })().then(
+        (code) => (code === 0 ? note(`${request.agent}'s resumed session ended.`) : undefined),
+        (cause: unknown) => note(`The resumed session could not be run: ${(cause as Error).message}`),
+      );
+      sessions.add(running);
+      await running;
+      sessions.delete(running);
+    } finally {
+      if (holdingTerminal) {
+        holdingTerminal = false;
+        presenter.resume();
+      }
+      resuming = false;
+    }
+  };
 
   /**
    * What a keypress asks for, answered here rather than in the view.
@@ -1024,11 +1205,20 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
    * **A poll is asked for, not performed.** The answer is a pure decision, the
    * refusal is said out loud so a key never looks dropped, and all a taken one
    * does is end the wait the loop is sitting in — the loop is still the only
-   * thing that polls, claims and spawns.
+   * thing that polls, claims and starts unattended work.
+   *
+   * **A resume is handed on, not decided here either**: it goes to `onResume`,
+   * whose checks are `mdbrain resume`'s own.
    */
   const onRequest = (request: ViewRequest) => {
     if (request === "quit") {
       onStop();
+      return;
+    }
+    if (typeof request === "object") {
+      // Its own promise, caught here: a presenter callback has nobody to hand a
+      // rejection to, and an unhandled one ends the process with every session.
+      onResume(request).catch((cause: unknown) => say({ kind: "note", message: `The resume failed: ${(cause as Error).message}` }));
       return;
     }
     const answer = answerPollNow(deps.now().getTime(), { polling, finishing, lastTakenAt: lastAskedAt });
@@ -1486,7 +1676,7 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
     signals.close();
     throw cause;
   } finally {
-    process.off("SIGINT", onStop);
+    process.off("SIGINT", onInterrupt);
     process.off("SIGTERM", onStop);
     process.off("SIGHUP", onHangup);
   }
@@ -1600,6 +1790,7 @@ async function oneSession(
   entry: AgentEntry,
   unit: WorkUnit,
   onStop: StopRegistry,
+  onSpawned: (pid: number | undefined) => void,
 ): Promise<Outcome> {
   const agent = unit.instruction.agent;
   const spec = harnessFor(entry.harness);
@@ -1650,7 +1841,7 @@ async function oneSession(
     // machine and a row on the server share one name without a lookup table.
     // The field is general because an attended session has no claim to name
     // itself after; this is the call site where it is a claim id.
-    sessionId: unit.instruction.claim,
+    session: { kind: "new", id: unit.instruction.claim },
     mcpConfigPath: mcpFile,
     cwd: entry.cwd,
     bounds: entry.bounds,
@@ -1666,6 +1857,7 @@ async function oneSession(
       cwd: entry.cwd,
       wallClockMs: durationMs(entry.bounds.wallClock)!,
       onStop,
+      onSpawned,
     },
     // The same platform answer the hangup wiring uses, so a session is never
     // spawned for one platform while the runner's signals are wired for another.

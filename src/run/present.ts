@@ -415,6 +415,16 @@ export interface Presenter {
    * implement this by doing nothing at all.
    */
   listen(handler: (request: ViewRequest) => void): void;
+  /**
+   * Give the terminal up for a resumed session, and resolve once it is given up.
+   *
+   * Events still arrive while suspended and are kept, so the view mounted again
+   * by {@link Presenter.resume} is current at once. The plain presenter never
+   * holds the terminal, so both are nothing to it.
+   */
+  suspend(): Promise<void>;
+  /** Take the terminal back after a resumed session. */
+  resume(): void;
   /** Let the presenter finish — the plain one has nothing to do. */
   stop(): Promise<void>;
 }
@@ -435,6 +445,11 @@ export function plainPresenter(out: (line: string) => void, now: () => Date = ()
       // Nothing behind a service manager is pressing keys, and a presenter that
       // pretended otherwise would be inventing a person.
     },
+    // Never asked: only a key can ask for a resume, and nothing presses one here.
+    suspend() {
+      return Promise.resolve();
+    },
+    resume() {},
     stop() {
       return Promise.resolve();
     },

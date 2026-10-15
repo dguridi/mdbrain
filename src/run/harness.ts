@@ -57,15 +57,21 @@ import { readOutcome, type Outcome, type SessionEnd } from "./outcome.ts";
  */
 export interface Identity {
   /**
-   * The harness's `--session-id`, which names the transcript on this machine.
+   * The transcript this session writes to: a new one under this id, or the
+   * existing one of that id picked up again.
    *
    * **Not called `claimId`, because an attended session has no claim.** A field
    * naming a thing one of its two callers does not have is a name that has to be
    * filled in with something, and what gets filled in is a lie the type signs
    * off on. `run` passes its claim id, so a transcript here and a row on the
-   * server still share one name; `as` mints a UUID of its own.
+   * server still share one name; `as` mints a UUID of its own; a resume names
+   * the claim whose transcript it continues.
+   *
+   * **Tagged rather than a string beside a flag**, so the choice between
+   * `--session-id` and `--resume` is made once, in `identityArgs`, and no
+   * builder can carry one flag while its caller meant the other.
    */
-  sessionId: string;
+  session: SessionName;
   /** The per-agent MCP file, which names the connection key's variable. */
   mcpConfigPath: string;
   cwd: string;
@@ -82,6 +88,12 @@ export interface Identity {
   parentEnv: Record<string, string | undefined>;
 }
 
+/** A transcript to start under an id, or one to continue. */
+export interface SessionName {
+  kind: "new" | "resume";
+  id: string;
+}
+
 /**
  * An unattended session: an identity, an instruction, and the bounds on it.
  *
@@ -90,6 +102,13 @@ export interface Identity {
  * watching needs an outer edge.
  */
 export interface Invocation extends Identity {
+  /**
+   * Always a new transcript. **An unattended session never resumes one**, and
+   * the type is where that is held: a caller that tried to retry a lost session
+   * through `build` does not compile, rather than quietly becoming the
+   * unattended resume that is ruled out.
+   */
+  session: SessionName & { kind: "new" };
   /** The instruction's prompt, byte for byte. Nothing is prepended or appended. */
   prompt: string;
   bounds: Bounds;
@@ -270,8 +289,14 @@ export const claudeHarness: HarnessSpec = {
       // The transcript's name. `run` passes its claim id, so a transcript here
       // and a row on the server share one name without a lookup table; an
       // attended session passes a UUID minted for it.
-      "--session-id",
-      identity.sessionId,
+      //
+      // **A resume names the same transcript with `--resume` instead**, and
+      // without `--fork-session`: measured, a resume without it keeps the id,
+      // so the transcript, the claim and the in-flight record go on sharing one
+      // name. Swapped here rather than by a caller, so the identity a resumed
+      // session carries is every other flag above, unchanged.
+      identity.session.kind === "resume" ? "--resume" : "--session-id",
+      identity.session.id,
     ];
   },
 
