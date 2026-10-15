@@ -447,8 +447,10 @@ async function readInFlight(claim: string, env?: PathEnv): Promise<InFlightRecor
  * one session inside that gap would both pass the check and hand one transcript
  * to two writers. An exclusive create is the one step two processes cannot both
  * win. A stale lock ({@link lockIsStale}) is taken over, so a crash strands a
- * session behind it only once the system has reused both of its pids, or, where
- * the record could not be told the harness, the harness's alone.
+ * session behind it only once both of its pids have been reused, or one of them
+ * where only one was ever written down: the harness's, where the record could
+ * not be told the harness, and the holder's, where it was killed after writing
+ * the record and before naming its harness.
  *
  * @param now the clock a lock's age is read against
  * @returns null once this process holds it, or the live process that does, or
@@ -472,8 +474,12 @@ export async function lockInFlight(claim: string, pid: number, isAlive: (pid: nu
  *
  * The check and the rename are two steps, so a takeover landing between them is
  * overwritten. That needs this live lock to have been judged stale already,
- * which {@link lockIsStale} only does to an unnamed lock whose holder has not yet
- * written its record, after {@link UNNAMED_LOCK_MS}.
+ * which {@link lockIsStale} does to an unnamed lock in two cases: one whose holder
+ * has not yet written its record, after {@link UNNAMED_LOCK_MS}, and one whose
+ * holder's record already names a harness that has died. The second needs the
+ * record's write to win its race with this naming and the harness to exit at
+ * once, and a second resume is still refused by the running check then, because
+ * the record's owner is alive.
  */
 export async function nameHarnessInLock(claim: string, harnessPid: number, env?: PathEnv): Promise<void> {
   const path = lockPath(claim, env);

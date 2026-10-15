@@ -65,3 +65,7 @@ The source in this repository is a **snapshot of `apps/agent-runner/`** - its so
 its tests - copied here by the release workflow each time a version ships. Development
 happens in a private monorepo, so the history here is a series of release commits rather
 than the history of the work.
+
+## License
+
+The source in this repository is released under the [MIT License](LICENSE).

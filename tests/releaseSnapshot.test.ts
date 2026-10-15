@@ -73,6 +73,12 @@ d("what a release publishes to the public repository", () => {
     expect(published).toContain("tests");
   });
 
+  it("the MIT license travels with the source", () => {
+    // The public repository's README points readers at LICENSE, and published
+    // source without its license grants nobody the right to use it.
+    expect(listNamed("published")).toContain("LICENSE");
+  });
+
   it("109-S25: and the copy is driven by that list, not by the directory", () => {
     // The lists only decide what a release publishes if the copy CONSULTS them.
     // Every assertion above reads the two `name="..."` lines, so all of them

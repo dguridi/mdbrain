@@ -1,7 +1,8 @@
 {
   "name": "@markdown-den/agent-runner",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "mdbrain — the runner you can log into",
   "scripts": {
