@@ -8,7 +8,7 @@
 // not touched anything else.
 
 /** The version `--version` prints; kept in step with `package.json`. */
-export const VERSION = "0.7.0";
+export const VERSION = "0.8.0";
 
 /**
  * The release artifact this binary was compiled as.

@@ -2039,7 +2039,7 @@ async function oneSession(
   // reason the check is here and not inside the harness's own arguments: past
   // this line a session exists, and a session that ran on a broken prompt reads
   // exactly like one that worked.
-  const rendered = renderPrompt(unit.instruction.prompt, unit.instruction.file);
+  const rendered = renderPrompt(unit.instruction.prompt, { file: unit.instruction.file, due: unit.instruction.due });
   if (!rendered.ok) return spawnFailed(rendered.reason);
 
   // Only an agent this run asks for can be claimed for, and every one of those

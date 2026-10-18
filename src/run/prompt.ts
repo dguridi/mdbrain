@@ -1,11 +1,12 @@
 // Rendering the prompt a trigger's author wrote into the prompt a session is
 // given.
 //
-// A trigger fires because a particular file arrived or changed, and the person
-// who wrote the prompt should be able to name it. `{path}` and `{id}` stand for
-// that file and are replaced at the moment the session starts. Nothing else in
-// the prompt is touched, and the prompt still travels verbatim in every other
-// respect.
+// A trigger fires because a particular file arrived or changed, or because a
+// schedule came due, and the person who wrote the prompt should be able to name
+// what it fired about. `{path}` and `{id}` stand for that file and `{due}` for
+// the moment the schedule was due, and each is replaced at the moment the session
+// starts. Nothing else in the prompt is touched, and the prompt still travels
+// verbatim in every other respect.
 //
 // **An unrecognised placeholder is refused rather than passed through, and that
 // is the one opinion here.** A prompt reaching a harness with `{paht}` still in
@@ -49,10 +50,28 @@ export interface TriggerFile {
   path: string;
 }
 
+/**
+ * What a firing was about, as far as a prompt can name it: the file its event
+ * names, and the moment a schedule was due. Either may be missing, since no kind
+ * has both.
+ */
+export interface TriggerContext {
+  file: TriggerFile | null;
+  due?: string | null | undefined;
+}
+
+/** One placeholder: what it stands for, and the sentence's word for the fact it
+ *  needs when the event does not carry that fact. */
+interface Placeholder {
+  readonly resolve: (context: TriggerContext) => string | null;
+  readonly needs: "file" | "due";
+}
+
 /** The placeholders a prompt may use, and what each stands for. */
-export const PLACEHOLDERS: Readonly<Record<string, (file: TriggerFile) => string>> = Object.freeze({
-  path: (file) => file.path,
-  id: (file) => file.id,
+export const PLACEHOLDERS: Readonly<Record<string, Placeholder>> = Object.freeze({
+  path: { resolve: (c) => c.file?.path ?? null, needs: "file" },
+  id: { resolve: (c) => c.file?.id ?? null, needs: "file" },
+  due: { resolve: (c) => c.due ?? null, needs: "due" },
 });
 
 /**
@@ -69,6 +88,10 @@ export function placeholderNames(): string[] {
   return Object.keys(PLACEHOLDERS).sort();
 }
 
+/** A list of words joined the way a sentence lists them. */
+const listed = (words: readonly string[]): string =>
+  words.length <= 1 ? words.join("") : `${words.slice(0, -1).join(", ")} and ${words[words.length - 1]}`;
+
 /** A rendered prompt, or the sentence saying why there is not one. */
 export type Rendered = { ok: true; prompt: string } | { ok: false; reason: string };
 
@@ -80,24 +103,30 @@ export type Rendered = { ok: true; prompt: string } | { ok: false; reason: strin
  * genuinely named `{id}.md` substitutes once and is then left alone.
  *
  * @param prompt the trigger author's prompt, as it arrived in the instruction
- * @param file the file the event names, or null when it names none
+ * @param context the file the event names and the moment it was due, either of
+ *   them missing when the event carries none; a bare file, or null, is read as
+ *   a context with only that file
  * @returns the rendered prompt, or a refusal naming what could not be resolved
  */
-export function renderPrompt(prompt: string, file: TriggerFile | null): Rendered {
+export function renderPrompt(prompt: string, context: TriggerContext | TriggerFile | null): Rendered {
+  const given: TriggerContext = context === null ? { file: null } : "file" in context ? context : { file: context };
   const unknown: string[] = [];
   const needsFile: string[] = [];
+  const needsDue: string[] = [];
 
   const rendered = prompt.replace(PLACEHOLDER, (whole, name: string) => {
-    const resolve = Object.prototype.hasOwnProperty.call(PLACEHOLDERS, name) ? PLACEHOLDERS[name] : undefined;
-    if (resolve === undefined) {
+    const placeholder = Object.prototype.hasOwnProperty.call(PLACEHOLDERS, name) ? PLACEHOLDERS[name] : undefined;
+    if (placeholder === undefined) {
       if (!unknown.includes(name)) unknown.push(name);
       return whole;
     }
-    if (file === null) {
-      if (!needsFile.includes(name)) needsFile.push(name);
+    const value = placeholder.resolve(given);
+    if (value === null) {
+      const missing = placeholder.needs === "file" ? needsFile : needsDue;
+      if (!missing.includes(name)) missing.push(name);
       return whole;
     }
-    return resolve(file);
+    return value;
   });
 
   // The unrecognised name is reported first when both are wrong: a typo is the
@@ -106,7 +135,7 @@ export function renderPrompt(prompt: string, file: TriggerFile | null): Rendered
   // there sends them to look in the wrong place.
   if (unknown.length > 0) {
     const named = unknown.map((n) => `{${n}}`).join(", ");
-    const known = placeholderNames().map((n) => `{${n}}`).join(" and ");
+    const known = listed(placeholderNames().map((n) => `{${n}}`));
     return {
       ok: false,
       reason:
@@ -123,6 +152,16 @@ export function renderPrompt(prompt: string, file: TriggerFile | null): Rendered
       reason:
         `The prompt uses ${named}, but the event that fired this trigger names no file, so there is nothing to ` +
         `substitute. Nothing was started, and this unit of work is spent.`,
+    };
+  }
+
+  if (needsDue.length > 0) {
+    const named = needsDue.map((n) => `{${n}}`).join(", ");
+    return {
+      ok: false,
+      reason:
+        `The prompt uses ${named}, but the event that fired this trigger is not a schedule's, so there is no ` +
+        `moment it was due. Nothing was started, and this unit of work is spent.`,
     };
   }
 

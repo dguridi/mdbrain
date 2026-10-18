@@ -103,9 +103,9 @@ describe("105-S77: a trigger whose event names no file", () => {
 });
 
 describe("the recognised set is one table", () => {
-  it("names exactly path and id", () => {
-    expect(placeholderNames()).toEqual(["id", "path"]);
-    expect(Object.keys(PLACEHOLDERS).sort()).toEqual(["id", "path"]);
+  it("names exactly path, id and due", () => {
+    expect(placeholderNames()).toEqual(["due", "id", "path"]);
+    expect(Object.keys(PLACEHOLDERS).sort()).toEqual(["due", "id", "path"]);
   });
 
   it("does not answer for a name inherited from Object.prototype", () => {
@@ -115,5 +115,36 @@ describe("the recognised set is one table", () => {
       const out = renderPrompt(`x {${name}} y`, file);
       expect(out.ok, name).toBe(false);
     }
+  });
+});
+
+describe("185-S29: a schedule's prompt can say when the firing was due", () => {
+  const due = "2026-10-19T09:00+02:00";
+
+  it("substitutes {due} with the local time and its offset", () => {
+    const out = renderPrompt("Do your rounds. This round was due at {due}.", { file: null, due });
+    expect(out).toEqual({ ok: true, prompt: "Do your rounds. This round was due at 2026-10-19T09:00+02:00." });
+  });
+
+  it("refuses {due} on an event that is not a schedule's, and spends the unit saying so", () => {
+    const out = renderPrompt("Due {due}.", file);
+    expect(out.ok).toBe(false);
+    if (!out.ok) {
+      expect(out.reason).toContain("{due}");
+      expect(out.reason).toContain("not a schedule's");
+      expect(out.reason).toContain("spent");
+    }
+  });
+
+  it("refuses {path} on a schedule's event, which names no file", () => {
+    const out = renderPrompt("Read {path}.", { file: null, due });
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.reason).toContain("names no file");
+  });
+
+  it("lists all three names when one is unknown", () => {
+    const out = renderPrompt("{nope}", { file: null, due });
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.reason).toContain("{due}, {id} and {path}");
   });
 });

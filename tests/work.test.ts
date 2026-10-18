@@ -103,6 +103,16 @@ describe("reading the claim's answer", () => {
     expect((readWork({ work: [unit()] }) as { work: { instruction: { file: unknown } }[] }).work[0].instruction.file).toBeNull();
   });
 
+  it("185-S29: carries the moment a schedule's firing was due, and nothing where there is none", () => {
+    const due = "2026-10-19T09:00+02:00";
+    const named = readWork({ work: [unit({}, { due })] });
+    expect(named.kind === "work" && named.work[0].instruction.due).toBe(due);
+    const plain = readWork({ work: [unit()] });
+    expect(plain.kind === "work" && "due" in plain.work[0].instruction).toBe(false);
+    // Present and not text is an answer this version does not understand.
+    expect(readWork({ work: [unit({}, { due: 7 })] }).kind).toBe("unreadable");
+  });
+
   it("105-S73: a file it cannot shape is refused, not half-read", () => {
     // Half of this is worse than none: a path with no id cannot be followed back
     // and an id with no path is what the placeholder exists to save a lookup on.

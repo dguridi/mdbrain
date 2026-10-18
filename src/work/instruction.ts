@@ -36,6 +36,12 @@ export interface Instruction {
    * to decide, and it refuses rather than substituting an empty string.
    */
   file: InstructionFile | null;
+  /**
+   * The moment a schedule's firing was due, as a local time with its offset,
+   * which `{due}` in the prompt stands for. Absent on every unit that is not an
+   * occurrence of a clock, which is every kind but one.
+   */
+  due?: string;
 }
 
 /** One unit of work as the server answers it: the instruction, in an envelope
@@ -87,11 +93,14 @@ function readUnit(v: unknown): WorkUnit | null {
   // sends one it cannot shape is answering something this version does not
   // understand, and acting on the rest would substitute half a fact.
   if (i.file !== undefined && i.file !== null && file === null) return null;
+  // The same rule for the due moment: absent is fine, and present but not text
+  // is a server answering something this version does not understand.
+  if (i.due !== undefined && !isText(i.due)) return null;
   return {
     kind: v.kind,
     seq: v.seq,
     at: v.at,
-    instruction: { claim: i.claim, workspace: i.workspace, agent: i.agent, prompt: i.prompt, file },
+    instruction: { claim: i.claim, workspace: i.workspace, agent: i.agent, prompt: i.prompt, file, ...(isText(i.due) ? { due: i.due } : {}) },
   };
 }
 
