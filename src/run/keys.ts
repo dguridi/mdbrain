@@ -10,7 +10,7 @@
 // the *runner* for something — poll now, stop — and those are requests: a
 // sentence about what the person wants, handed to the loop, which stays the only
 // thing that polls, claims and spawns. The rest are the *screen's* own: moving a
-// cursor through the recent runs changes what is drawn and nothing about what the
+// cursor through the sessions changes what is drawn and nothing about what the
 // runner is doing. Keeping the two apart in the table is what stops the second
 // kind quietly becoming the first.
 //
@@ -27,9 +27,16 @@
 // to know it. A binding can say when it is offered, and the hint line and the
 // matcher both ask, so a key that does nothing for this run is neither drawn nor
 // taken.
+//
+// **`k` kills one running session, and it does not kill anything itself.** It
+// is offered only on a running session that is not already ending, and pressing
+// it opens a question on the screen. The answer to that question is read by the
+// screen and never through this table: a `y` matched here would also be read as
+// whatever the table binds `y` to, and an `esc` meant as *no* would also clear
+// the cursor. Only the `y` sends a request, and the loop decides what to do
+// with it.
 
-import type { RecentRun } from "./view.ts";
-import { resumableOutcome } from "./view.ts";
+import type { PickedSession } from "./view.ts";
 
 /**
  * Picking up a finished run's session again, with the person driving it.
@@ -43,8 +50,22 @@ export interface ResumeRequest {
   claim: string;
 }
 
+/**
+ * Ending one running session, after the person confirmed it.
+ *
+ * **A name and never a handle.** The agent and claim are what the row said; the
+ * loop looks the claim up in its own registry and checks the agent is still
+ * running it, so a request that arrives after the session ended — or that names
+ * a session the loop does not hold — is refused out loud rather than acted on.
+ */
+export interface KillRequest {
+  kind: "kill";
+  agent: string;
+  claim: string;
+}
+
 /** What a person can ask the runner for. Every one of them is an ask. */
-export type ViewRequest = "poll-now" | "quit" | ResumeRequest;
+export type ViewRequest = "poll-now" | "quit" | ResumeRequest | KillRequest;
 
 /** What a person can ask the screen for. None of these reach the runner. */
 export type ScreenAction = "older" | "newer" | "clear";
@@ -54,11 +75,13 @@ export type ScreenAction = "older" | "newer" | "clear";
  *
  * `resume` goes to the loop as well, but only once the screen has added the run
  * the cursor is on, which is why it is its own destination rather than a
- * request with nothing in it.
+ * request with nothing in it. `kill` stops at the screen first: it opens the
+ * confirmation, and only the screen's own reading of a `y` sends the request.
  */
 export type KeyAction =
   | { to: "loop"; request: "poll-now" | "quit" }
   | { to: "resume" }
+  | { to: "kill" }
   | { to: "screen"; action: ScreenAction };
 
 /** The parts of Ink's `Key` this module reads. Narrowed so a test needs no Ink. */
@@ -82,10 +105,10 @@ export interface KeyBinding {
   summary: string;
   matches: (input: string, key: KeyModifiers) => boolean;
   /**
-   * Whether the key does anything with this run open, or absent for a key that
-   * always does. A key that is not offered is neither named nor matched.
+   * Whether the key does anything with this session picked, or absent for a key
+   * that always does. A key that is not offered is neither named nor matched.
    */
-  offered?: (selected: RecentRun | null) => boolean;
+  offered?: (selected: PickedSession | null) => boolean;
 }
 
 /**
@@ -110,13 +133,13 @@ export const KEY_BINDINGS: readonly KeyBinding[] = [
   {
     action: { to: "screen", action: "newer" },
     label: "↑",
-    summary: "pick a recent run",
+    summary: "pick a session",
     matches: (_input, key) => key.upArrow,
   },
   {
     action: { to: "screen", action: "older" },
     label: "↓",
-    summary: "pick a recent run",
+    summary: "pick a session",
     matches: (_input, key) => key.downArrow,
   },
   {
@@ -130,9 +153,21 @@ export const KEY_BINDINGS: readonly KeyBinding[] = [
     label: "r",
     summary: "resume this run",
     matches: (input, key) => input === "r" && !key.ctrl,
-    // Only where a harness ran and lost its ending: a run that finished has
-    // nothing to pick up, and one that never spawned has no transcript.
-    offered: (selected) => selected !== null && resumableOutcome(selected.outcome),
+    // Only where a harness ran and was cut short, and a resume has something to
+    // go from: a run that finished has nothing to pick up, one that never
+    // spawned has no transcript, and a restored run whose record is gone has
+    // nothing to resume it as.
+    offered: (selected) => selected !== null && selected.kind === "recent" && selected.run.resumable,
+  },
+  {
+    action: { to: "kill" },
+    label: "k",
+    summary: "kill this session",
+    matches: (input, key) => input === "k" && !key.ctrl,
+    // Only on a session that is running and not already being ended: a run that
+    // finished has nothing to kill, and a second kill of one session would be a
+    // key that looks like it did something and did not.
+    offered: (selected) => selected !== null && selected.kind === "running" && !selected.ending,
   },
   {
     action: { to: "loop", request: "quit" },
@@ -148,17 +183,18 @@ export const KEY_BINDINGS: readonly KeyBinding[] = [
   },
 ];
 
-/** Whether a binding does anything with this run open. */
-function isOffered(binding: KeyBinding, selected: RecentRun | null): boolean {
+/** Whether a binding does anything with this session picked. */
+function isOffered(binding: KeyBinding, selected: PickedSession | null): boolean {
   return binding.offered === undefined || binding.offered(selected);
 }
 
 /**
  * What a keypress does, or null when it asks for nothing this view offers.
  *
- * @param selected the run the cursor is on, which decides whether `r` is a key
+ * @param selected the session the cursor is on, which decides whether `r` and
+ *   `k` are keys
  */
-export function actionForKey(input: string, key: KeyModifiers, selected: RecentRun | null = null): KeyAction | null {
+export function actionForKey(input: string, key: KeyModifiers, selected: PickedSession | null = null): KeyAction | null {
   for (const binding of KEY_BINDINGS) {
     if (isOffered(binding, selected) && binding.matches(input, key)) return binding.action;
   }
@@ -172,7 +208,7 @@ export function actionForKey(input: string, key: KeyModifiers, selected: RecentR
  * read as one offer and so do the two ways of stopping. Derived from the table
  * above, which is what stops the screen naming a key that does nothing.
  */
-export function keyHints(selected: RecentRun | null = null): string[] {
+export function keyHints(selected: PickedSession | null = null): string[] {
   const order: string[] = [];
   const labels = new Map<string, string[]>();
   for (const binding of KEY_BINDINGS) {

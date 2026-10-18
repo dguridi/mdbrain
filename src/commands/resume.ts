@@ -169,6 +169,7 @@ export async function prepareResume(deps: ResumeSessionDeps, target: ResumeTarge
 
   const spawnable = ready.spec.buildInteractive({
     session: { kind: "resume", id: claim },
+    agent,
     mcpConfigPath: mcpConfigPath(agent),
     cwd: target.cwd,
     harnessCredential: ready.harnessCredential,
@@ -188,6 +189,10 @@ export async function prepareResume(deps: ResumeSessionDeps, target: ResumeTarge
     ownerPid: deps.pid,
     harnessPid: null,
     resumes: (earlier?.resumes ?? 0) + 1,
+    // Carried through a resume, so a record a failed resume keeps still says how
+    // the run it came from ended.
+    ended: earlier?.ended ?? null,
+    endedAt: earlier?.endedAt ?? null,
     ...over,
   });
   const write = async (value: InFlightRecord) => {

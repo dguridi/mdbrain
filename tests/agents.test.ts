@@ -29,7 +29,7 @@ const entry = (over: Partial<AgentEntry> = {}): AgentEntry => ({
   pollsWork: true,
   cwd,
   env: { harness: null, connectionKey: "MDBRAIN_KEY_BOT" },
-  bounds: { maxTurns: 50, maxBudgetUsd: 5, wallClock: "30m" },
+  limits: {},
   ...over,
 });
 
@@ -123,6 +123,7 @@ function harness(over: Partial<AgentsDeps> = {}, seed: Record<string, string> = 
       events.push(`remove-mcp:${name}`);
       return name;
     },
+    configure: async () => 0,
     browse: async () => {},
     confirm: async () => true,
     ...over,
@@ -158,7 +159,7 @@ describe("agents: the report", () => {
     expect(text).toContain(`harness claude, in ${cwd}`);
     expect(text).toContain("asked for work by mdbrain run");
     expect(text).toContain("thinks with this machine's own Claude Code account");
-    expect(text).toContain("bounds: 50 turns, $5, 30m a session");
+    expect(text).toContain("limits: none");
     expect(text).toContain("key smd_agent_ab12cd34…");
     // The other agent holds no key here, and says so rather than saying nothing.
     expect(text).toContain("no key on this machine");
@@ -219,7 +220,7 @@ describe("agents: the verdict", () => {
       { "agent-old": OLD_KEY },
     );
     expect(await runAgents(h.deps, h.context(["check", "dev-bot-mdden"]))).toBe(1);
-    expect(h.out).toEqual(["dev-bot-mdden: refused: agent deleted in markdown-den: mdbrain agents remove dev-bot-mdden"]);
+    expect(h.out).toEqual(["dev-bot-mdden: refused: agent deleted in markdownbrain.ai: mdbrain agents remove dev-bot-mdden"]);
   });
 
   it("158-S10: a refused key whose id is gone while a managed agent has its name is recreated; with no namesake, deleted", () => {
@@ -231,7 +232,7 @@ describe("agents: the verdict", () => {
     const theirs = owner({ agents: [{ id: "agent-new", org_id: "org-9", display_name: "bot", status: "active" }] });
     expect(verdictFor(refused, bot, "ab12cd34", theirs, null)).toEqual({ kind: "refused", cause: { kind: "deleted" } });
     expect(verdictSentence("bot", verdictFor(refused, bot, "ab12cd34", owner({ agents: [] }), null))).toBe(
-      "refused: agent deleted in markdown-den: mdbrain agents remove bot",
+      "refused: agent deleted in markdownbrain.ai: mdbrain agents remove bot",
     );
   });
 
@@ -251,7 +252,7 @@ describe("agents: the verdict", () => {
     expect(verdictSentence("bot", revoked)).toBe("refused: key revoked on 2026-10-12: mdbrain agents renew bot");
 
     const unknown = verdictFor(refused, bot, "ab12cd34", owner(), [keyRow({ key_prefix: "00000000" })]);
-    expect(verdictSentence("bot", unknown, "ab12cd34")).toContain("smd_agent_ab12cd34… is not one markdown-den knows for this agent");
+    expect(verdictSentence("bot", unknown, "ab12cd34")).toContain("smd_agent_ab12cd34… is not one markdownbrain.ai knows for this agent");
 
     // Listed and live, refused anyway: the runner says it cannot see why rather than guessing.
     expect(verdictFor(refused, bot, "ab12cd34", owner(), [keyRow()])).toEqual({ kind: "refused", cause: { kind: "unexplained" } });
@@ -295,7 +296,7 @@ describe("agents: remove", () => {
     expect(h.saved()!.agents.other).toEqual(entry({ id: "agent-2" }));
     // The config before the file it names, the revoke after both, the local key last.
     expect(h.events).toEqual(["save-config", "remove-mcp:bot", "owner-view", "revoke:key-row-1", "forget:agent-1"]);
-    expect(h.out.join("\n")).toContain("the key smd_agent_ab12cd34… was revoked in markdown-den");
+    expect(h.out.join("\n")).toContain("the key smd_agent_ab12cd34… was revoked in markdownbrain.ai");
   });
 
   it("158-S19: removing the last agent deletes config.json rather than writing it empty", async () => {
@@ -309,14 +310,14 @@ describe("agents: remove", () => {
     const h = harness({ session: async () => ({ kind: "stop", reason: "sign-in", message: "Not signed in." }) });
     expect(await runAgents(h.deps, h.context(["remove", "bot"], { yes: true }))).toBe(0);
     expect(h.events).toEqual(["save-config", "remove-mcp:bot", "forget:agent-1"]);
-    expect(h.out.join("\n")).toContain("the key smd_agent_ab12cd34… is still live in markdown-den; revoke it on the agent's page");
+    expect(h.out.join("\n")).toContain("the key smd_agent_ab12cd34… is still live in markdownbrain.ai; revoke it on the agent's page");
   });
 
   it("158-S18: a deleted agent's key is not revoked, since its keys went with it", async () => {
     const h = harness({ ownerView: async () => owner({ agents: [] }) });
     expect(await runAgents(h.deps, h.context(["remove", "bot"], { yes: true }))).toBe(0);
     expect(h.events.some((e) => e.startsWith("revoke:"))).toBe(false);
-    expect(h.out.join("\n")).toContain("bot is gone from markdown-den, and its keys with it");
+    expect(h.out.join("\n")).toContain("bot is gone from markdownbrain.ai, and its keys with it");
   });
 
   it("158-S21: with no terminal and no --yes it writes nothing and names the flag", async () => {
@@ -330,8 +331,8 @@ describe("agents: remove", () => {
     let shown: string[] = [];
     const h = harness({ isTTY: true, confirm: async (lines) => { shown = lines; return false; } });
     expect(await runAgents(h.deps, h.context(["remove", "bot"]))).toBe(1);
-    expect(shown.join("\n")).toContain("the key smd_agent_ab12cd34… is forgotten on this machine and revoked in markdown-den");
-    expect(shown.join("\n")).toContain("stays in markdown-den");
+    expect(shown.join("\n")).toContain("the key smd_agent_ab12cd34… is forgotten on this machine and revoked in markdownbrain.ai");
+    expect(shown.join("\n")).toContain("stays in markdownbrain.ai");
     expect(h.events).toEqual([]);
   });
 });
@@ -361,7 +362,7 @@ describe("agents: the writers take a whole name and ask first", () => {
     let shown: string[] = [];
     const h = harness({ isTTY: true, confirm: async (lines) => { shown = lines; return false; } });
     expect(await runAgents(h.deps, h.context(["renew", "bot"]))).toBe(1);
-    expect(shown.join("\n")).toContain("the key it replaces, smd_agent_ab12cd34…, is revoked in markdown-den");
+    expect(shown.join("\n")).toContain("the key it replaces, smd_agent_ab12cd34…, is revoked in markdownbrain.ai");
     expect(h.events).toEqual([]);
   });
 });
@@ -403,7 +404,7 @@ describe("agents: renew", () => {
     expect(await runAgents(h.deps, h.context(["renew", "bot"], { yes: true }))).toBe(0);
     expect(h.events).toEqual(["mint:agent-1", "set:agent-1", "revoke:key-row-1"]);
     expect(h.held.get("agent-1")).toBe(NEW_KEY);
-    expect(h.out.join("\n")).toContain("the key smd_agent_ab12cd34… was revoked in markdown-den");
+    expect(h.out.join("\n")).toContain("the key smd_agent_ab12cd34… was revoked in markdownbrain.ai");
   });
 
   it("158-S22: a failed mint leaves the old key in the store and live on the server", async () => {
@@ -504,5 +505,65 @@ describe("agents: the browser", () => {
     expect(browserActionFor("x", { ctrl: false, upArrow: false, downArrow: false, escape: false })).toBeNull();
     expect(browserActionFor("c", { ctrl: true, upArrow: false, downArrow: false, escape: false })).toBe("quit");
     expect(browserActionFor("c", { ctrl: false, upArrow: false, downArrow: false, escape: false })).toBe("check");
+  });
+});
+
+describe("177: e in the agents browser", () => {
+  const tick = async () => {
+    for (let i = 0; i < 4; i += 1) await new Promise((r) => setTimeout(r, 25));
+  };
+  const browserPlan = (over: Partial<BrowserPlan> = {}): BrowserPlan => ({
+    locations: [],
+    rows: [{ name: "bot", lines: ["bot"], heldPrefix: null }],
+    check: async () => ({ kind: "unchecked", reason: "not asked" }),
+    renewPlan: () => [],
+    removePlan: () => [],
+    renew: async () => ({ lines: [], rows: [] }),
+    remove: async () => ({ lines: [], rows: [] }),
+    ...over,
+  });
+
+  it("177-S19: e on a configured agent hands over to configure, opened at that agent", async () => {
+    const edited: string[] = [];
+    const app = render(agentsBrowser(browserPlan({ canEdit: () => true, edit: (name) => edited.push(name) })));
+    await tick();
+    expect(app.lastFrame()).toContain("e change its settings");
+    app.stdin.write("e");
+    await tick();
+    expect(edited).toEqual(["bot"]);
+    // The browser has gone, so configure is not waiting behind it: a key it
+    // would have answered draws nothing.
+    const drawn = app.frames.length;
+    app.stdin.write("c");
+    await tick();
+    expect(app.frames.length).toBe(drawn);
+
+    const { deps, context } = harness();
+    let openedAt: string | null = null;
+    const code = await runAgents(
+      {
+        ...deps,
+        isTTY: true,
+        browse: async (plan) => plan.edit?.("other"),
+        configure: async (id) => {
+          openedAt = id;
+          return 0;
+        },
+      },
+      context(),
+    );
+    expect(code).toBe(0);
+    expect(openedAt).toBe("agent-2");
+  });
+
+  it("177-S20: e is neither drawn nor matched for an agent this machine has not configured", async () => {
+    const edited: string[] = [];
+    const app = render(agentsBrowser(browserPlan({ canEdit: () => false, edit: (name) => edited.push(name) })));
+    await tick();
+    expect(app.lastFrame()).not.toContain("change its settings");
+    app.stdin.write("e");
+    await tick();
+    expect(edited).toEqual([]);
+    expect(browserActionFor("e", { ctrl: false, upArrow: false, downArrow: false, escape: false }, () => false)).toBeNull();
   });
 });

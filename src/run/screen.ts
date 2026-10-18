@@ -36,7 +36,7 @@ import {
   emptyView,
   messagePreview,
   moveSelection,
-  selectedRun,
+  pickedSession,
   type AgentRow,
   type RecentRun,
   type Selection,
@@ -58,7 +58,7 @@ export const COUNTDOWN_TICK_MS = 1_000;
  * one that ran into the hundreds.
  *
  * **The outcome's width is derived from the declaration and not written down.**
- * Six of the seven outcomes are longer than `failed`, so a number chosen from
+ * Four of the seven outcomes are longer than `failed`, so a number chosen from
  * the two a person sees most would leave every other kind pushing the columns
  * after it sideways — and the rows it happens to be wrong about are exactly the
  * ones somebody is scanning for. A kind added later widens the column by being
@@ -212,15 +212,30 @@ export function connectionRow(
   return { ...light, presence };
 }
 
-/** One agent's row: its state, the spinner when it is running, and what it is doing. */
-function agentLine(row: AgentRow, width: number): ReactElement {
+/**
+ * What a running row says while a kill the person confirmed is taking effect.
+ *
+ * On POSIX that can be the whole thirty-second grace, and a row still reading
+ * as plainly running through it would make the kill look ignored.
+ */
+export const ENDING_BY_YOU = "ending (killed by you)";
+
+/**
+ * One agent's row: its state, the spinner when it is running, and what it is doing.
+ *
+ * @param picked whether the cursor is on this row's session, marked in the
+ *   gutter as a picked recent run is
+ * @param ending whether the person has confirmed a kill of this row's session
+ */
+function agentLine(row: AgentRow, width: number, picked: boolean, ending: boolean): ReactElement {
   const trailing: string[] = [];
+  if (ending) trailing.push(ENDING_BY_YOU);
   if (row.queued > 0) trailing.push(`${row.queued} waiting`);
   if (row.note !== null) trailing.push(row.note);
   return h(
     Box,
     { key: row.agent },
-    h(Text, { color: STATE_COLOR[row.state] }, `  ${row.agent.padEnd(width)}  `),
+    h(Text, { color: STATE_COLOR[row.state], bold: picked }, `${picked ? "› " : "  "}${row.agent.padEnd(width)}  `),
     row.state === "running"
       ? h(Spinner, { label: trailing.length > 0 ? trailing.join(" · ") : "running" })
       : h(
@@ -317,6 +332,59 @@ function runDetail(run: RecentRun, now: number): ReactElement[] {
   return children;
 }
 
+/** How long a running row's session has run, read against `now`, so the detail and the question agree. */
+function ranFor(row: AgentRow, now: number): string {
+  return durationText(row.startedAt === null ? 0 : now - row.startedAt.getTime());
+}
+
+/**
+ * The running session the cursor is on, drawn in full: who, which claim, what it
+ * is working on, how long it has run, and what is queued behind it.
+ *
+ * How long it has run is the subtraction a recent run's age is, from the moment
+ * its `start` event was stamped; the clock moves the figure and nothing else.
+ */
+function runningDetail(row: AgentRow, now: number, ending: boolean): ReactElement[] {
+  const queued = row.queued === 0 ? "nothing queued behind it" : `${row.queued} queued behind it`;
+  return [
+    h(Text, { key: "detail-heading", color: FRAME_COLOR }, "The session you picked"),
+    h(
+      Text,
+      { key: "detail-head", color: ACTIVE_COLOR },
+      `  ${row.agent}  ${ending ? `${ENDING_BY_YOU} · ` : ""}running ${ranFor(row, now)}  claim ${shortClaim(row.claim ?? "")}`,
+    ),
+    h(Text, { key: "detail-working", dimColor: true }, `  ${row.note ?? "(nothing said about the work)"} · ${queued}`),
+  ];
+}
+
+/**
+ * The question `k` asks before anything is killed.
+ *
+ * **It names the session rather than asking *are you sure?***, because a bare
+ * question is the weakest guard there is on an action that cannot be undone and
+ * costs money: the agent, the short claim and how long it has run are what tell
+ * a person they are on the row they meant. **The queue sentence is there only
+ * when something is queued**, since the next unit starting at once is the one
+ * consequence that would otherwise read as the kill failing; with nothing queued
+ * it is left out rather than saying what a person assumes anyway.
+ *
+ * Pure and exported, so the wording is assertable without a terminal.
+ *
+ * @param row the running row the question is about
+ * @param now the moment the elapsed time is read against, in epoch milliseconds
+ */
+export function killQuestion(row: AgentRow, now: number): string {
+  const queue = row.queued > 0 ? " Its next queued unit will start right away." : "";
+  return `Kill ${row.agent}'s session (claim ${shortClaim(row.claim ?? "")}, running ${ranFor(row, now)})?${queue} y to kill, any other key to keep it.`;
+}
+
+/**
+ * What the screen says when the session a question was about ended before it
+ * was answered. The question closes rather than waiting for a `y` that would
+ * mean nothing.
+ */
+export const KILL_OUTRUN = "That session finished before it was killed.";
+
 /** What the screen needs beyond the runner’s own state to draw one frame. */
 export interface ScreenFrame {
   /** The moment the countdown is read against, in epoch milliseconds. */
@@ -326,13 +394,21 @@ export interface ScreenFrame {
    * hint naming a key nothing is listening for is worse than no hint at all.
    */
   keysActive: boolean;
-  /** Which recent run is open, which is the person’s state and not the runner’s. */
+  /** Which session is open, which is the person’s state and not the runner’s. */
   selection: Selection;
+  /** The claims the person has confirmed a kill for, whose rows read as ending. */
+  ending?: ReadonlySet<string>;
+  /** The kill question being asked, which takes the place of the key hints while it is open. */
+  question?: string | null;
+  /** A sentence the screen itself says, such as a question that closed on its own. */
+  said?: string | null;
 }
 
 /** The whole screen. Exported so a test can draw it with its own clock. */
 export function liveView(state: ViewState, frame: ScreenFrame): ReactElement {
   const { now, keysActive, selection } = frame;
+  const ending = frame.ending ?? new Set<string>();
+  const picked = pickedSession(state, selection, ending);
   // One width for both lists rather than one each: they are two blocks of the
   // same screen a few lines apart, and a name column that changed width halfway
   // down reads as two unrelated tables. The recent list is included because it
@@ -347,11 +423,15 @@ export function liveView(state: ViewState, frame: ScreenFrame): ReactElement {
   if (state.agents.length === 0) {
     children.push(h(Text, { key: "no-agents", dimColor: true }, "  (none configured)"));
   } else {
-    for (const row of state.agents) children.push(agentLine(row, width));
+    for (const row of state.agents) {
+      const onRow = picked !== null && picked.kind === "running" && picked.row.agent === row.agent;
+      const killing = row.state === "running" && row.claim !== null && ending.has(row.claim);
+      children.push(agentLine(row, width, onRow, killing));
+    }
   }
 
   children.push(h(Text, { key: "recent-heading", color: FRAME_COLOR }, "Recent runs"));
-  const open = selectedRun(state.recent, selection);
+  const open = picked !== null && picked.kind === "recent" ? picked.run : null;
   if (state.recent.length === 0) {
     children.push(h(Text, { key: "no-recent", dimColor: true }, "  (none this session)"));
   } else {
@@ -384,6 +464,7 @@ export function liveView(state: ViewState, frame: ScreenFrame): ReactElement {
     });
   }
   if (open !== null) children.push(...runDetail(open, now));
+  if (picked !== null && picked.kind === "running") children.push(...runningDetail(picked.row, now, picked.ending));
 
   // The version notice sits beside the note rather than in either list above:
   // it is a fact about the program, not about an agent or a run, so a row in
@@ -420,7 +501,11 @@ export function liveView(state: ViewState, frame: ScreenFrame): ReactElement {
   // The keys are named on screen rather than left to be known. A terminal whose
   // stdin cannot be put in raw mode reads none, and offering them there would be
   // an instruction that does nothing.
-  if (keysActive) children.push(h(Text, { key: "keys", dimColor: true }, `  ${keyHints(open).join("   ")}`));
+  if (frame.said) children.push(h(Text, { key: "said", dimColor: true }, `  ${frame.said}`));
+  // While a kill question is open every key is its answer, so the hints would
+  // name keys that do not do what they say; the question stands in their place.
+  if (keysActive && frame.question) children.push(h(Text, { key: "question", bold: true }, `  ${frame.question}`));
+  else if (keysActive) children.push(h(Text, { key: "keys", dimColor: true }, `  ${keyHints(picked).join("   ")}`));
 
   return h(
     Box,
@@ -454,6 +539,12 @@ interface ScreenProps {
  * never leave this component while the two that ask the runner for something
  * always do.
  *
+ * **A kill question is the person's state as well**, the same pattern
+ * `mdbrain resume` uses for a dismissal: `k` opens it here, the answer is read
+ * here, and only a `y` reaches the loop. The claims a kill was confirmed for are
+ * kept here too, so the row reads as ending through the grace — nothing the
+ * runner emits says a session is being ended until its ending lands.
+ *
  * **The condition is two things and not one, which is what the ages cost.** It
  * was the deadline alone, which was right while the countdown was the only
  * clock-derived value: a runner that is polling, or one that has not said yet,
@@ -466,8 +557,31 @@ interface ScreenProps {
 function LiveScreen({ state, onRequest }: ScreenProps): ReactElement {
   const [now, setNow] = useState(() => Date.now());
   const [selection, setSelection] = useState<Selection>(null);
+  /** The session a kill question is waiting on `y` for, or null when none is open. */
+  const [confirming, setConfirming] = useState<{ agent: string; claim: string } | null>(null);
+  /** The claims a kill was confirmed for, until their sessions end. */
+  const [ending, setEnding] = useState<ReadonlySet<string>>(() => new Set());
+  const [said, setSaid] = useState<string | null>(null);
   const deadline = state.poll.kind === "waiting" ? state.poll.at : null;
-  const ticking = deadline !== null || state.recent.length > 0;
+  // A picked or asked-about running session counts too: its detail and a kill
+  // question both say how long it has run, the same subtraction a run's age is.
+  const ticking = deadline !== null || state.recent.length > 0 || confirming !== null || pickedSession(state, selection)?.kind === "running";
+  const stillRunning = (claim: string) => state.agents.some((row) => row.state === "running" && row.claim === claim);
+
+  // **The question closes by itself when its session ends first**, and says so.
+  // Left open, it would wait for a `y` that could only be refused — and a
+  // question about a session that is gone reads as if it were still running.
+  useEffect(() => {
+    if (confirming !== null && !stillRunning(confirming.claim)) {
+      setConfirming(null);
+      setSaid(KILL_OUTRUN);
+    }
+    // Forgotten once the session is over, so the set holds only what is ending.
+    if ([...ending].some((claim) => !stillRunning(claim))) {
+      setEnding((current) => new Set([...current].filter(stillRunning)));
+    }
+  }, [state, confirming, ending]);
+
   useEffect(() => {
     if (!ticking) return;
     // Read the clock once on arrival too: whatever started this is new, and
@@ -481,7 +595,34 @@ function LiveScreen({ state, onRequest }: ScreenProps): ReactElement {
   const { isRawModeSupported } = useStdin();
   useInput(
     (input, key) => {
-      const open = selectedRun(state.recent, selection);
+      // **An open question takes every key, before the keymap sees any.** Only
+      // `y` kills and any other key keeps the session — so a kill is never one
+      // stray keypress, a `y` is never also read as a binding, and an `esc`
+      // meant as *no* does not also clear the cursor.
+      if (confirming !== null) {
+        setConfirming(null);
+        // Ctrl-C is the exception, and it keeps the session too: in raw mode it
+        // reaches the runner only through the keymap, and a question that
+        // swallowed it would leave a person unable to stop the runner the way
+        // they always do.
+        const interrupt = key.ctrl ? actionForKey(input, key) : null;
+        if (interrupt !== null && interrupt.to === "loop") {
+          onRequest(interrupt.request);
+          return;
+        }
+        if (input !== "y" || key.ctrl) return;
+        // Checked again at the answer, so a session that ended between the
+        // question and the `y` is said rather than asked of the loop.
+        if (!stillRunning(confirming.claim)) {
+          setSaid(KILL_OUTRUN);
+          return;
+        }
+        setEnding((current) => new Set([...current, confirming.claim]));
+        onRequest({ kind: "kill", agent: confirming.agent, claim: confirming.claim });
+        return;
+      }
+      setSaid(null);
+      const open = pickedSession(state, selection, ending);
       const action = actionForKey(input, key, open);
       // A key this view does not offer is ignored rather than guessed at.
       if (action === null) return;
@@ -489,13 +630,23 @@ function LiveScreen({ state, onRequest }: ScreenProps): ReactElement {
       // The run goes with the request: the loop resumes exactly the row the
       // person was looking at, and reads nothing of the screen's to find it.
       else if (action.to === "resume") {
-        if (open !== null) onRequest({ kind: "resume", agent: open.agent, claim: open.claim });
-      } else setSelection((current) => moveSelection(state.recent, current, action.action));
+        if (open !== null && open.kind === "recent") onRequest({ kind: "resume", agent: open.run.agent, claim: open.run.claim });
+      } else if (action.to === "kill") {
+        if (open !== null && open.kind === "running") setConfirming({ agent: open.row.agent, claim: open.row.claim });
+      } else setSelection((current) => moveSelection(state, current, action.action));
     },
     { isActive: isRawModeSupported },
   );
 
-  return liveView(state, { now, keysActive: isRawModeSupported, selection });
+  const asking = confirming === null ? undefined : state.agents.find((row) => row.state === "running" && row.claim === confirming.claim);
+  return liveView(state, {
+    now,
+    keysActive: isRawModeSupported,
+    selection,
+    ending,
+    question: asking === undefined ? null : killQuestion(asking, now),
+    said,
+  });
 }
 
 /** The screen as an element, so a test can drive its keys without a terminal. */
@@ -512,9 +663,12 @@ export function liveScreenFor(state: ViewState, onRequest: (request: ViewRequest
  * The request handler starts as a no-op and is replaced by `listen`, because the
  * screen is drawn before the loop that answers a keypress exists — and a key
  * pressed in that window should do nothing rather than reach a half-built runner.
+ *
+ * @param recent the runs the view opens with, read back from the run log by the
+ *   runner; a starting state, not events, so nothing is printed for them
  */
-export function livePresenter(out: (line: string) => void, now: () => Date = () => new Date()): Presenter {
-  let state = emptyView;
+export function livePresenter(out: (line: string) => void, now: () => Date = () => new Date(), recent: readonly RecentRun[] = []): Presenter {
+  let state: ViewState = { ...emptyView, recent: [...recent] };
   let handler: (request: ViewRequest) => void = () => {};
   const forward = (request: ViewRequest) => handler(request);
   const mount = () => render(h(LiveScreen, { state, onRequest: forward }), { exitOnCtrlC: false });

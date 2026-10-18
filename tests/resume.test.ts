@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { render } from "ink-testing-library";
 import { claudeHarness, type Identity } from "../src/run/harness.ts";
 import { diskInFlight, GUARD_MS, inFlightDir, inFlightPath, lockInFlight, lockIsStale, nameHarnessInLock, readHolding, readRecord, sweepGuards, UNNAMED_LOCK_MS, unlockInFlight, runningPid, writeInFlight, type InFlightRecord, type InFlightStore } from "../src/run/inflight.ts";
-import { beingResumedMessage, HAZARD_LINE, NO_TERMINAL_MESSAGE, NOTHING_TO_RESUME, resumeRows, rowText, unfinishedMessage } from "../src/resume/rows.ts";
+import { beingResumedMessage, HAZARD_LINE, leftBehindNote, NO_TERMINAL_MESSAGE, NOTHING_TO_RESUME, resumeRows, rowText, stateText, unfinishedMessage } from "../src/resume/rows.ts";
 import { sessionPicker, type PickAnswer } from "../src/resume/screen.ts";
 import { prepareResume, runResume, type ResumeDeps } from "../src/commands/resume.ts";
 import { runAs, type AsDeps } from "../src/commands/as.ts";
@@ -51,7 +51,7 @@ const entry = (over: Partial<AgentEntry> = {}): AgentEntry => ({
   pollsWork: true,
   cwd,
   env: { harness: "MY_KEY", connectionKey: "MDBRAIN_KEY_DEV_BOT_MDDEN" },
-  bounds: { maxTurns: 50, maxBudgetUsd: 5, wallClock: "30m" },
+  limits: {},
   ...over,
 });
 
@@ -72,6 +72,8 @@ const record = (over: Partial<InFlightRecord> = {}): InFlightRecord => ({
   ownerPid: 111,
   harnessPid: 112,
   resumes: 0,
+  ended: null,
+  endedAt: null,
   ...over,
 });
 
@@ -313,6 +315,7 @@ describe("resume: the command", () => {
 
     const identity: Identity = {
       session: { kind: "new", id: CLAIM },
+      agent: "dev-bot-mdden",
       mcpConfigPath: mcpConfigPath("dev-bot-mdden"),
       cwd,
       harnessCredential: "sk-live",
@@ -322,8 +325,9 @@ describe("resume: the command", () => {
     };
     const shared = claudeHarness.identityArgs(identity);
     const sessionAt = shared.indexOf("--session-id");
-    // Every identity flag `as` carries, in order, with only the session flag swapped.
-    expect(args).toEqual([...shared.slice(0, sessionAt), "--resume", CLAIM]);
+    // Every identity flag `as` carries, in order, with only the session flag
+    // swapped, and the attended session's name after them, as `as` names it.
+    expect(args).toEqual([...shared.slice(0, sessionAt), "--resume", CLAIM, "--name", "dev-bot-mdden-as"]);
     for (const absent of ["--session-id", "--fork-session", "-p", "--max-turns", "--max-budget-usd", "--permission-prompts", "--output-format"]) {
       expect(args).not.toContain(absent);
     }
@@ -820,5 +824,68 @@ describe("resume: the command", () => {
     const command = COMMANDS.find((c) => c.name === "resume");
     expect(command?.summary).toMatch(/run session/);
     expect(command?.flags ?? []).toEqual([]);
+  });
+});
+
+describe("resume: a session kept after its runner has gone", () => {
+  const stopped = (over: Partial<InFlightRecord> = {}) =>
+    record({ ownerPid: null, harnessPid: null, ended: "stopped", endedAt: "2026-10-14T10:00:00.000Z", startedAt: "2026-10-14T09:00:00.000Z", ...over });
+
+  it("176-S5: a record with no ending still reads, as one that never ended", () => {
+    const { ended: _ended, endedAt: _endedAt, ...older } = record();
+    expect(readRecord(older)).toEqual(expect.objectContaining({ claim: CLAIM, ended: null, endedAt: null }));
+    // An ending this build does not know is read the same way, rather than losing the session.
+    expect(readRecord({ ...older, ended: "evaporated", endedAt: "2026-10-14T10:00:00.000Z" })).toEqual(expect.objectContaining({ ended: null, endedAt: null }));
+    expect(readRecord(stopped())).toEqual(expect.objectContaining({ ended: "stopped", endedAt: "2026-10-14T10:00:00.000Z" }));
+    // An ending with no date it could be aged from is no ending a row can say.
+    expect(readRecord({ ...older, ended: "stopped", endedAt: "x" })).toEqual(expect.objectContaining({ ended: null, endedAt: null }));
+  });
+
+  it("176-S6: the picker says how a kept session ended, aged from its ending, and a record with no ending still reads never ended", () => {
+    const rows = resumeRows(
+      [stopped(), stopped({ claim: OTHER, ended: "failed" }), record({ claim: "77e00000-0000-4000-8000-000000000000", ownerPid: null, harnessPid: null })],
+      config(),
+      () => false,
+    );
+    const text = Object.fromEntries(rows.map((row) => [row.record.claim, stateText(row, NOW.getTime())]));
+    expect(text[CLAIM]).toBe("stopped 2h ago, when the runner stopped");
+    expect(text[OTHER]).toBe("failed 2h ago");
+    expect(text["77e00000-0000-4000-8000-000000000000"]).toBe("started 2h ago, never ended");
+    // A resume is the newer fact than the ending it came from, and it is the one that did not end.
+    expect(stateText(resumeRows([stopped({ resumes: 1, startedAt: "2026-10-14T11:00:00.000Z" })], config(), () => false)[0], NOW.getTime())).toBe(
+      "resumed 1h ago, never ended",
+    );
+    for (const [ended, said] of [["timed-out", "timed out 2h ago"], ["unreadable", "unreadable 2h ago"], ["killed", "killed 2h ago"]] as const) {
+      expect(stateText(resumeRows([stopped({ ended })], config(), () => false)[0], NOW.getTime())).toBe(said);
+    }
+  });
+
+  it("176-S7: the next run's note says a session was stopped with the runner, and keeps today's sentence for one with no ending", () => {
+    expect(leftBehindNote([stopped()], () => false)).toBe("dev-bot-mdden's session 3f2a… was stopped with the runner. `mdbrain resume` can pick it up.");
+    expect(leftBehindNote([record({ ownerPid: 999 })], () => false)).toBe("dev-bot-mdden's session 3f2a… started and never ended. `mdbrain resume` can pick it up.");
+    expect(leftBehindNote([stopped(), stopped({ claim: OTHER, agentEntryId: "agent-2", agent: "ux-critic", ended: "failed" })], () => false)).toBe(
+      "2 sessions were cut short (dev-bot-mdden, ux-critic). `mdbrain resume` can pick them up.",
+    );
+    expect(leftBehindNote([stopped(), record({ claim: OTHER, ownerPid: 999 })], () => false)).toContain("2 sessions were cut short or never ended");
+    // A kept session a person resumed since, whose resume died, is said as the resume, as the picker says it.
+    expect(leftBehindNote([stopped({ resumes: 1 })], () => false)).toBe("dev-bot-mdden's session 3f2a… was resumed and never ended. `mdbrain resume` can pick it up.");
+    expect(leftBehindNote([stopped({ resumes: 1 }), stopped({ claim: OTHER })], () => false)).toContain("2 sessions were cut short or never ended");
+  });
+
+  it("176-S8: a session stopped with its runner is listed by mdbrain resume and resumed through prepareResume", async () => {
+    const { deps, context, picks, started, answers, memory } = harness({}, [stopped()]);
+    answers.push({ kind: "resume", claim: CLAIM });
+    expect(await runResume(deps, context)).toBe(0);
+    expect(picks[0]).toEqual({ claims: [CLAIM], states: ["resumable"] });
+    expect(started).toHaveLength(1);
+    expect(started[0].args).toEqual(expect.arrayContaining(["--resume", CLAIM]));
+    expect(memory.log).toEqual(expect.arrayContaining([`lock ${CLAIM}`, `remove ${CLAIM}`]));
+  });
+
+  it("a resume of a kept session that fails keeps the ending it came with", async () => {
+    const { deps, context, memory, answers } = harness({ startSession: () => Promise.resolve({ exitCode: 2, signal: null, spawnProblem: null }) }, [stopped()]);
+    answers.push({ kind: "resume", claim: CLAIM });
+    await runResume(deps, context);
+    expect(memory.records.get(CLAIM)).toEqual(expect.objectContaining({ resumes: 1, ownerPid: null, ended: "stopped", endedAt: "2026-10-14T10:00:00.000Z" }));
   });
 });

@@ -25,6 +25,7 @@ type NewIdentity = Identity & { session: { kind: "new"; id: string } };
 
 const identity = (over: Partial<NewIdentity> = {}): NewIdentity => ({
   session: { kind: "new", id: "3f2a0000-0000-4000-8000-000000000000" },
+  agent: "dev-bot-mdden",
   mcpConfigPath: "/cfg/mcp/dev-bot-mdden.json",
   cwd,
   harnessCredential: "sk-live",
@@ -40,7 +41,7 @@ const entry = (over: Partial<AgentEntry> = {}): AgentEntry => ({
   pollsWork: true,
   cwd,
   env: { harness: "MY_KEY", connectionKey: "MDBRAIN_KEY_DEV_BOT_MDDEN" },
-  bounds: { maxTurns: 50, maxBudgetUsd: 5, wallClock: "30m" },
+  limits: {},
   ...over,
 });
 
@@ -95,7 +96,17 @@ function harness(over: Partial<AsDeps> = {}) {
 }
 
 describe("as: the identity, shared by both modes", () => {
-  it("125-S1: identityArgs is the five flags and nothing else, whatever the bounds say", () => {
+  it("names neither mode's session in the shared set, so each builder names its own", () => {
+    expect(claudeHarness.identityArgs(identity())).not.toContain("--name");
+  });
+
+  it("names an attended session after its agent with -as, once", () => {
+    const built = claudeHarness.buildInteractive(identity({ agent: "Field Notes" }));
+    const names = built.args.filter((_, i) => built.args[i - 1] === "--name");
+    expect(names).toEqual(["Field Notes-as"]);
+  });
+
+  it("125-S1: identityArgs is the five flags and nothing else, whatever the limits say", () => {
     const args = claudeHarness.identityArgs(identity());
     expect(args).toEqual([
       "--mcp-config",
@@ -110,8 +121,8 @@ describe("as: the identity, shared by both modes", () => {
     ]);
   });
 
-  it("125-S1: two entries whose bounds differ in every field answer the same but for the paths", () => {
-    // Bounds are not on `Identity` at all, which is the point: the shared half
+  it("125-S1: two entries whose limits differ in every field answer the same but for the paths", () => {
+    // Limits are not on `Identity` at all, which is the point: the shared half
     // cannot vary with them because it cannot see them.
     const one = claudeHarness.identityArgs(identity({ mcpConfigPath: "/a.json", session: { kind: "new", id: "11110000-0000-4000-8000-000000000000" } }));
     const two = claudeHarness.identityArgs(identity({ mcpConfigPath: "/b.json", session: { kind: "new", id: "22220000-0000-4000-8000-000000000000" } }));
@@ -120,9 +131,9 @@ describe("as: the identity, shared by both modes", () => {
     expect(differing).toEqual([1, 8]);
   });
 
-  it("125-S2: the interactive argv is exactly identityArgs, with no --permission-prompts", () => {
+  it("125-S2: the interactive argv is exactly identityArgs and its name, with no --permission-prompts", () => {
     const built = claudeHarness.buildInteractive(identity());
-    expect(built.args).toEqual(claudeHarness.identityArgs(identity()));
+    expect(built.args).toEqual([...claudeHarness.identityArgs(identity()), "--name", "dev-bot-mdden-as"]);
     expect(built.args).not.toContain("-p");
     expect(built.args).not.toContain("--output-format");
     expect(built.args).not.toContain("--max-turns");
@@ -134,7 +145,7 @@ describe("as: the identity, shared by both modes", () => {
 
   it("125-S4: both builders contain every member of identityArgs", () => {
     const shared = claudeHarness.identityArgs(identity());
-    const print = claudeHarness.build({ ...identity(), prompt: "Do it.", bounds: { maxTurns: 50, maxBudgetUsd: 5, wallClock: "30m" } });
+    const print = claudeHarness.build({ ...identity(), prompt: "Do it.", limits: {} });
     const interactive = claudeHarness.buildInteractive(identity());
     for (const member of shared) {
       expect(print.args).toContain(member);
@@ -144,22 +155,21 @@ describe("as: the identity, shared by both modes", () => {
 
   it("125-S4: the shared set appears contiguously in the print argv, so a flag cannot be dropped from between", () => {
     const shared = claudeHarness.identityArgs(identity());
-    const print = claudeHarness.build({ ...identity(), prompt: "Do it.", bounds: { maxTurns: 50, maxBudgetUsd: 5, wallClock: "30m" } });
+    const print = claudeHarness.build({ ...identity(), prompt: "Do it.", limits: {} });
     const at = print.args.indexOf(shared[0]);
     expect(print.args.slice(at, at + shared.length)).toEqual(shared);
   });
 
-  it("125-S3: the print argv still carries the instruction and both bounds, which the split moved nothing of", () => {
-    const bounds = { maxTurns: 7, maxBudgetUsd: 0.5, wallClock: "30m" };
-    const print = claudeHarness.build({ ...identity(), prompt: "Triage what landed.", bounds });
+  it("125-S3: the print argv still carries the instruction and the budget set on it, which the split moved nothing of", () => {
+    const limits = { maxBudgetUsd: 0.5, wallClock: "30m" };
+    const print = claudeHarness.build({ ...identity(), prompt: "Triage what landed.", limits });
     expect(print.args[0]).toBe("-p");
     expect(print.args[1]).toBe("Triage what landed.");
-    // The two bounds flags, which nothing else in the suite reads. 125-S2
-    // pins only their ABSENCE from the attended argv, and an absence cannot
-    // see them leaving the other mode: without this, dropping either from
-    // `build` leaves every case green while an unattended session — the one
-    // nobody is watching — runs with no ceiling on turns or spend.
-    expect(print.args[print.args.indexOf("--max-turns") + 1]).toBe("7");
+    // The budget flag, set here so it is present. 125-S2 pins only its
+    // ABSENCE from the attended argv, and an absence cannot see it leaving the
+    // other mode: without this, dropping it from `build` leaves every case
+    // green while an unattended session somebody gave a budget runs with none.
+    expect(print.args).not.toContain("--max-turns");
     expect(print.args[print.args.indexOf("--max-budget-usd") + 1]).toBe("0.5");
     expect(print.args[print.args.indexOf("--output-format") + 1]).toBe("json");
   });
@@ -341,6 +351,7 @@ describe("as: startup and the refusals", () => {
     expect(started.args).toEqual(
       claudeHarness.buildInteractive({
         session: { kind: "new", id: "9a7b0000-0000-4000-8000-000000000001" },
+        agent: "dev-bot-mdden",
         mcpConfigPath: mcpConfigPath("dev-bot-mdden"),
         cwd,
         harnessCredential: "sk-live",

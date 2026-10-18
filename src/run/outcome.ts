@@ -18,10 +18,16 @@
  *
  * The list rather than the union alone, because a presenter has to size a column
  * to the longest of them and a number written down beside the two most common
- * ones is wrong about the other four the day it is written. A kind added here
- * widens that column by being declared.
+ * ones is wrong about the rest the day it is written. A kind added here widens
+ * that column by being declared.
+ *
+ * **The three early endings are three kinds, because they mean three things**:
+ * `stopped` is the runner going away, `timed-out` is a time limit passing, and
+ * `killed` is a person judging this one session's work wrong. The run log is
+ * read later by people grepping `outcome`, and folding a kill into `stopped`
+ * would hide the one row a person most wants to find.
  */
-export const OUTCOME_KINDS = ["done", "failed", "timed-out", "stopped", "spawn-failed", "unreadable"] as const;
+export const OUTCOME_KINDS = ["done", "failed", "timed-out", "stopped", "killed", "spawn-failed", "unreadable"] as const;
 
 /** What became of one session. */
 export type OutcomeKind = (typeof OUTCOME_KINDS)[number];
@@ -39,7 +45,12 @@ export interface Outcome {
   /** What the harness said it took, which is not what the runner timed. */
   durationMs: number | null;
   exitCode: number | null;
-  /** For `timed-out`: whether SIGTERM sufficed, or SIGKILL was needed. */
+  /**
+   * For an early ending, which signal ended it: `term` when SIGTERM sufficed,
+   * `kill` when SIGKILL was needed or the platform has nothing gentler. Recorded
+   * in the run log, where it separates a session that went quietly — whose files
+   * are probably consistent — from one that did not.
+   */
   signal: "term" | "kill" | null;
   /**
    * The session was refused a tool the runner itself supplied.
@@ -204,12 +215,40 @@ export interface SessionEnd {
   stderr: string;
   exitCode: number | null;
   timedOut: boolean;
-  /** The runner was stopping and ended this session early. */
-  stopped: boolean;
+  /** Who ended this session early: the runner stopping, or a person killing it. */
+  stoppedBy: "runner" | "person" | null;
   /** Which signal ended the session, when one did. */
   signal: "term" | "kill" | null;
+  /** Whether it ran on Windows, where nothing is asked before a session is ended. */
+  windows: boolean;
   /** The variable the harness's credential came from, for the 401 sentence. */
   credentialVariable: string | null;
+}
+
+/**
+ * The last sentence of every killed or stopped session's message.
+ *
+ * **A session cut short must not read as though nothing happened**, whether a
+ * person killed it or the runner stopped under it. The session ran until it was
+ * ended, and the runner does not know what it wrote in that time — it does not
+ * look at the working tree, which is somebody's own checkout and holds their
+ * edits as well as the session's.
+ */
+export const MAY_HAVE_CHANGED_FILES = "It may have changed files before it stopped.";
+
+/**
+ * What to say about a session a person killed, by how it ended.
+ *
+ * The thirty seconds is the grace `execute.ts` gives every early ending on
+ * POSIX before SIGKILL; there is no grace on Windows, which is why that
+ * platform has a sentence of its own rather than a figure.
+ */
+function killedMessage(end: SessionEnd): string {
+  if (end.windows) return `You killed this session; on Windows it is ended at once. ${MAY_HAVE_CHANGED_FILES}`;
+  if (end.signal === "kill") {
+    return `You killed this session; it did not stop when asked and was ended after 30 s. ${MAY_HAVE_CHANGED_FILES}`;
+  }
+  return `You killed this session before it finished. ${MAY_HAVE_CHANGED_FILES}`;
 }
 
 /**
@@ -236,15 +275,24 @@ export function readOutcome(end: SessionEnd): Outcome {
 
   // A session the runner stopped is neither a failure nor a timeout: the work
   // was not refused and its wall clock had not run out. Its own kind, so a run
-  // log read later does not report a Ctrl-C as something the harness did.
-  if (end.stopped && !end.timedOut) {
+  // log read later does not report a Ctrl-C as something the harness did. A
+  // session a person killed is its own kind again, for the reason
+  // `OUTCOME_KINDS` gives.
+  //
+  // **On Windows nothing is asked before a session is ended**, so no sentence
+  // there may say the session *did not stop when asked*: `signal` reads `kill`
+  // because `taskkill /F` is the only way to end a tree, not because a harness
+  // ignored anything.
+  if (end.stoppedBy !== null && !end.timedOut) {
+    if (end.stoppedBy === "person") return { ...base, kind: "killed", message: killedMessage(end) };
     return {
       ...base,
       kind: "stopped",
-      message:
-        end.signal === "kill"
-          ? "The runner was stopping and this session did not stop when asked, so it was killed."
-          : "The runner was stopping, so this session was stopped before it finished.",
+      message: end.windows
+        ? `The runner was stopping, so this session was ended before it finished; on Windows that happens at once. ${MAY_HAVE_CHANGED_FILES}`
+        : end.signal === "kill"
+          ? `The runner was stopping and this session did not stop when asked, so it was killed. ${MAY_HAVE_CHANGED_FILES}`
+          : `The runner was stopping, so this session was stopped before it finished. ${MAY_HAVE_CHANGED_FILES}`,
     };
   }
 
@@ -252,8 +300,9 @@ export function readOutcome(end: SessionEnd): Outcome {
     return {
       ...base,
       kind: "timed-out",
-      message:
-        end.signal === "kill"
+      message: end.windows
+        ? "The session passed its wall clock and was ended; on Windows that happens at once."
+        : end.signal === "kill"
           ? "The session passed its wall clock and did not stop when asked, so it was killed."
           : "The session passed its wall clock and was stopped.",
     };

@@ -1,4 +1,4 @@
-// The one secret this program keeps: an agent's markdown-den connection key,
+// The one secret this program keeps: an agent's markdownbrain.ai connection key,
 // as the server minted it.
 //
 // It exists because `configure` now asks the server for the key rather than

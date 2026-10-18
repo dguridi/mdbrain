@@ -1,12 +1,17 @@
-// The in-flight record: one file per `run` session that has started and not yet
-// ended, under the state root.
+// The in-flight record: one file per `run` session that has started and can
+// still be picked up, under the state root.
 //
 // **What it is for is the one thing `runs.jsonl` cannot say.** The run log gets a
 // row when a session *ends*, so a runner that dies mid-session leaves nothing
 // behind it at all — and that is exactly the session a person would want back.
-// A file written when the harness starts and removed after the row is written is
-// therefore present for precisely the sessions no ending was recorded for, with
-// no log to fold and nothing to compare.
+// A file written when the harness starts is therefore present for every session
+// no ending was recorded for, with no log to fold and nothing to compare.
+//
+// **It is also kept past an ending that lost work.** After the row is written,
+// the record of a session that ended `done` or never spawned is removed, and the
+// record of any other ending is rewritten disowned, with the ending on it. A
+// stopped or failed session is then resumable after the runner that ran it has
+// gone, through the same picker and the same lock as one a crash left behind.
 //
 // **One file per session rather than rows in one file**, because the writers are
 // concurrent: a runner's parallel sessions, and a resume in another window. Two
@@ -24,6 +29,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { link, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { stateDir, type PathEnv } from "../config/paths.ts";
+import { OUTCOME_KINDS, type OutcomeKind } from "./outcome.ts";
 
 /** One session that started and has not ended, as the file holds it. */
 export interface InFlightRecord {
@@ -58,6 +64,21 @@ export interface InFlightRecord {
   harnessPid: number | null;
   /** How many times a person has picked this session up again. */
   resumes: number;
+  /**
+   * How the session ended, when its ending was written and it can still be
+   * resumed; null while it runs, and on a record whose ending was never
+   * written, which is what a crash leaves.
+   *
+   * **A record outlives a resumable ending**: one that ended `stopped`,
+   * `failed`, `timed-out`, `killed` or `unreadable` is kept, disowned, so the
+   * session can be picked up after the runner that ran it has gone. This is what
+   * lets the picker and the next run's note say *stopped* rather than *never
+   * ended* about it. A resume that fails leaves it as it was: the record still
+   * says how the run ended.
+   */
+  ended: OutcomeKind | null;
+  /** When that ending was written, for the age the picker draws; null exactly when `ended` is. */
+  endedAt: string | null;
 }
 
 /** Reading, writing and listing the records — an edge, so a test needs no disk. */
@@ -106,6 +127,11 @@ export function inFlightPath(claim: string, env?: PathEnv): string {
  *
  * Strict on every field, because a record decides which agent a transcript is
  * resumed as: a file that only half-parses is one whose agent cannot be trusted.
+ *
+ * **The ending is the exception, and reads as null rather than refusing the
+ * record** when it is missing, undated, or names an outcome this build does not
+ * know. It says nothing about whose session it is, and a record without one is
+ * still a session that can be resumed.
  */
 export function readRecord(value: unknown): InFlightRecord | null {
   if (typeof value !== "object" || value === null) return null;
@@ -117,6 +143,8 @@ export function readRecord(value: unknown): InFlightRecord | null {
   if (!(v.brain === null || typeof v.brain === "string")) return null;
   if (!(v.ownerPid === null || pid(v.ownerPid)) || !(v.harnessPid === null || pid(v.harnessPid))) return null;
   if (typeof v.resumes !== "number" || !Number.isInteger(v.resumes) || v.resumes < 0) return null;
+  const dated = text(v.endedAt) && !Number.isNaN(Date.parse(v.endedAt as string));
+  const ended = (OUTCOME_KINDS as readonly unknown[]).includes(v.ended) && dated ? (v.ended as OutcomeKind) : null;
   return {
     claim: v.claim as string,
     agentEntryId: v.agentEntryId as string,
@@ -128,6 +156,8 @@ export function readRecord(value: unknown): InFlightRecord | null {
     ownerPid: v.ownerPid as number | null,
     harnessPid: v.harnessPid as number | null,
     resumes: v.resumes as number,
+    ended,
+    endedAt: ended === null ? null : (v.endedAt as string),
   };
 }
 

@@ -6,7 +6,6 @@ import { claudeHarness, HARNESSES } from "../src/run/harness.ts";
 import { MCP_URL } from "../src/auth/project.ts";
 import {
   CONFIG_VERSION,
-  DEFAULT_BOUNDS,
   SESSION_CAP_HARD_MAX,
   durationMs,
   parseConfig,
@@ -53,7 +52,7 @@ const good = (over: Record<string, unknown> = {}) => ({
       harness: "claude",
       cwd,
       env: { harness: "ANTHROPIC_API_KEY", connectionKey: "MDBRAIN_KEY_DEV_BOT_MDDEN" },
-      bounds: { maxTurns: 50, maxBudgetUsd: 5, wallClock: "30m" },
+      limits: { maxBudgetUsd: 5, wallClock: "30m" },
     },
   },
   ...over,
@@ -74,18 +73,18 @@ describe("the config file's schema", () => {
     if (reading.kind !== "config") return;
     expect(reading.config.version).toBe(CONFIG_VERSION);
     expect(reading.config.sessionsPerHour).toBe(10);
-    expect(reading.config.agents["dev-bot-mdden"].bounds.wallClock).toBe("30m");
+    expect(reading.config.agents["dev-bot-mdden"].limits.wallClock).toBe("30m");
   });
 
-  it("fills the optional fields with their defaults, and leaves the ceiling to the server when absent", () => {
+  it("leaves the ceiling to the server and every limit unset when they are absent", () => {
     const { poll: _poll, sessionsPerHour: _cap, ...rest } = good();
     const reading = parseConfig(JSON.stringify(rest));
     expect(reading.kind).toBe("config");
     if (reading.kind !== "config") return;
     expect(reading.config.sessionsPerHour).toBeNull();
-    const { bounds: _b, ...entry } = good().agents["dev-bot-mdden"];
-    const withoutBounds = parseConfig(JSON.stringify(good({ agents: { "dev-bot-mdden": entry } })));
-    expect(withoutBounds.kind === "config" && withoutBounds.config.agents["dev-bot-mdden"].bounds).toEqual(DEFAULT_BOUNDS);
+    const { limits: _l, ...entry } = good().agents["dev-bot-mdden"];
+    const withoutLimits = parseConfig(JSON.stringify(good({ agents: { "dev-bot-mdden": entry } })));
+    expect(withoutLimits.kind === "config" && withoutLimits.config.agents["dev-bot-mdden"].limits).toEqual({});
   });
 
   it("105-S2: refuses a value that looks like a key where a variable's name belongs, and says where the key goes", () => {
@@ -104,7 +103,7 @@ describe("the config file's schema", () => {
   it("105-S4: refuses an unknown harness, a relative cwd, a unitless duration, a ceiling above the cap and an empty agents map, each by name", () => {
     expect(refused(agentWith({ harness: "codex" }))).toMatch(/harness names a harness this build does not have/);
     expect(refused(agentWith({ cwd: "checkout" }))).toMatch(/cwd must be an absolute path/);
-    expect(refused(agentWith({ bounds: { wallClock: "30" } }))).toMatch(/wallClock must be a duration with a unit/);
+    expect(refused(agentWith({ limits: { wallClock: "30" } }))).toMatch(/wallClock must be a duration with a unit/);
     expect(refused(good({ sessionsPerHour: SESSION_CAP_HARD_MAX + 1 }))).toMatch(/above the server's ceiling/);
     expect(refused(good({ agents: {} }))).toMatch(/at least one agent/);
   });
@@ -132,14 +131,14 @@ describe("the config file's schema", () => {
     expect(refused(agentWith({ env: { harness: "sk-ant-api03-abcdef", connectionKey: "MDBRAIN_KEY" } }))).toMatch(/looks like a key/);
   });
 
-  it("refuses a variable that is not a name, and a bounds value that is not a number", () => {
+  it("refuses a variable that is not a name, and a budget that is not a positive number", () => {
     expect(refused(agentWith({ env: { harness: "not a name", connectionKey: "OK" } }))).toMatch(/legal environment variable name/);
-    expect(refused(agentWith({ bounds: { maxTurns: 0 } }))).toMatch(/maxTurns/);
-    expect(refused(agentWith({ bounds: { maxBudgetUsd: -1 } }))).toMatch(/maxBudgetUsd/);
+    expect(refused(agentWith({ limits: { maxBudgetUsd: -1 } }))).toMatch(/maxBudgetUsd/);
+    expect(refused(agentWith({ limits: { maxBudgetUsd: "5" } }))).toMatch(/maxBudgetUsd/);
   });
 
   it("105-S5: tolerates a field it does not read, below one it does", () => {
-    const reading = parseConfig(JSON.stringify(agentWith({ colour: "blue", bounds: { ...good().agents["dev-bot-mdden"].bounds, nice: 10 } })));
+    const reading = parseConfig(JSON.stringify(agentWith({ colour: "blue", limits: { ...good().agents["dev-bot-mdden"].limits, nice: 10 } })));
     expect(reading.kind).toBe("config");
     const top = parseConfig(JSON.stringify(good({ theme: "dark" })));
     expect(top.kind).toBe("config");
@@ -653,5 +652,54 @@ describe("the connection key store", () => {
       }),
     );
     await expect(store.get("a-1")).rejects.toThrow("the keyring daemon is not running");
+  });
+});
+
+describe("177: limits are opt-in", () => {
+  const oldEntry = () => ({ ...good().agents["dev-bot-mdden"], limits: undefined, bounds: { maxTurns: 50, maxBudgetUsd: 5, wallClock: "30m" } });
+
+  it("177-S1: an old file loses every limit, the read does not fail, and the reading says the old key was there", () => {
+    const reading = parseConfig(JSON.stringify(good({ agents: { "dev-bot-mdden": oldEntry(), other: { ...oldEntry(), id: "other-id" } } })));
+    expect(reading.kind).toBe("config");
+    if (reading.kind !== "config") return;
+    for (const entry of Object.values(reading.config.agents)) expect(entry.limits).toEqual({});
+    expect(reading.oldLimits).toBe(true);
+    const fresh = parseConfig(JSON.stringify(good()));
+    expect(fresh.kind === "config" && fresh.oldLimits).toBe(false);
+  });
+
+  it("177-S1: an old key is read past even where its values would have been refused", () => {
+    const reading = parseConfig(JSON.stringify(agentWith({ bounds: { maxTurns: 0, wallClock: "30" } })));
+    expect(reading.kind).toBe("config");
+  });
+
+  it("177-S2: absent means none, for the key and for each field in it", () => {
+    const { limits: _l, ...bare } = good().agents["dev-bot-mdden"];
+    const none = parseConfig(JSON.stringify(good({ agents: { "dev-bot-mdden": bare } })));
+    expect(none.kind === "config" && none.config.agents["dev-bot-mdden"].limits).toEqual({});
+    const clock = parseConfig(JSON.stringify(agentWith({ limits: { wallClock: "2h" } })));
+    expect(clock.kind === "config" && clock.config.agents["dev-bot-mdden"].limits).toEqual({ wallClock: "2h" });
+  });
+
+  it("177-S3: only what is set is written, and nothing is written as bounds or maxTurns", () => {
+    const reading = parseConfig(
+      JSON.stringify(
+        good({
+          agents: {
+            none: { ...good().agents["dev-bot-mdden"], id: "n", limits: {} },
+            budget: { ...good().agents["dev-bot-mdden"], id: "b", limits: { maxBudgetUsd: 20 } },
+            both: { ...good().agents["dev-bot-mdden"], id: "x", limits: { maxBudgetUsd: 20, wallClock: "2h" } },
+          },
+        }),
+      ),
+    );
+    if (reading.kind !== "config") throw new Error(reading.message);
+    const text = serializeConfig(reading.config);
+    const written = JSON.parse(text).agents;
+    expect(written.none).not.toHaveProperty("limits");
+    expect(written.budget.limits).toEqual({ maxBudgetUsd: 20 });
+    expect(written.both.limits).toEqual({ maxBudgetUsd: 20, wallClock: "2h" });
+    expect(text).not.toContain("bounds");
+    expect(text).not.toContain("maxTurns");
   });
 });

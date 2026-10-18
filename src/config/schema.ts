@@ -38,12 +38,23 @@ export const SESSION_CAP_HARD_MAX = 10;
 export const KNOWN_HARNESSES = ["claude"] as const;
 export type HarnessId = (typeof KNOWN_HARNESSES)[number];
 
-/** The bounds one session runs under: two the harness enforces, one the runner does. */
-export interface Bounds {
-  maxTurns: number;
-  maxBudgetUsd: number;
-  /** A duration with a unit, `30m`; the runner's outer bound. */
-  wallClock: string;
+/**
+ * The limits one unattended session runs under, **each absent unless somebody
+ * set it**.
+ *
+ * Opt-in rather than defaulted, because a default limit is a limit nobody chose:
+ * a wall clock nobody set ends a session that is still doing real work, and a
+ * file that writes every default into every agent cannot tell a chosen value
+ * from an accepted one. So an absent field is *none* — the harness spends what
+ * the session spends, and the runner arms no timer — and a field present is a
+ * decision somebody made. There is no turn limit: a turn count ends a session
+ * that is still working, and bounds nothing the budget does not bound better.
+ */
+export interface Limits {
+  /** Dollars; the harness enforces it. */
+  maxBudgetUsd?: number;
+  /** A duration with a unit, `2h`; the runner enforces it. */
+  wallClock?: string;
 }
 
 /** One agent this machine runs. Keyed in the file by the agent's display name. */
@@ -87,14 +98,14 @@ export interface AgentEntry {
      */
     harness: string | null;
     /**
-     * The variable the agent's markdown-den connection key reaches the harness
+     * The variable the agent's markdownbrain.ai connection key reaches the harness
      * through. The name only: the value is minted by the server and kept in
      * this machine's key store, and `run` sets the variable in the child's
      * environment from there.
      */
     connectionKey: string;
   };
-  bounds: Bounds;
+  limits: Limits;
 }
 
 /** The whole file, as this build understands it. */
@@ -105,10 +116,16 @@ export interface Config {
   agents: Record<string, AgentEntry>;
 }
 
-/** What a read of the text produced: a config, or the sentence refusing it. */
-export type ConfigReading = { kind: "config"; config: Config } | { kind: "problem"; message: string };
-
-export const DEFAULT_BOUNDS: Bounds = { maxTurns: 50, maxBudgetUsd: 5, wallClock: "30m" };
+/**
+ * What a read of the text produced: a config, or the sentence refusing it.
+ *
+ * `oldLimits` says the text still holds an agent's `bounds`, the key an earlier
+ * build wrote every limit under. It is read past like any unknown key, and said
+ * out loud by `run`, because what it held — a turn count, a budget, a wall clock
+ * — stopped applying the moment this build read it, and a person who wrote one
+ * on purpose is owed knowing that.
+ */
+export type ConfigReading = { kind: "config"; config: Config; oldLimits: boolean } | { kind: "problem"; message: string };
 /**
  * How often `run` asks for work, as a fixed interval nobody sets.
  *
@@ -128,6 +145,19 @@ export const DEFAULT_BOUNDS: Bounds = { maxTurns: 50, maxBudgetUsd: 5, wallClock
  * becomes askable. The next poll is what finds it, and the next poll is this.
  */
 export const POLL_MS = 45 * 60_000;
+/** Whether any limit is set. */
+export function hasLimits(limits: Limits): boolean {
+  return limits.maxBudgetUsd !== undefined || limits.wallClock !== undefined;
+}
+
+/** The limits as written: the set fields only, in a stable order. */
+function writtenLimits(limits: Limits): Limits {
+  const out: Limits = {};
+  if (limits.maxBudgetUsd !== undefined) out.maxBudgetUsd = limits.maxBudgetUsd;
+  if (limits.wallClock !== undefined) out.wallClock = limits.wallClock;
+  return out;
+}
+
 /** The longest duration a timer can hold: past this, `setTimeout` fires at once rather than never. */
 export const MAX_DURATION_MS = 2_147_483_647;
 
@@ -165,7 +195,7 @@ export function isVariableName(text: string): boolean {
  * Whether a value is a secret rather than the name of one.
  *
  * The two prefixes are the two credentials a person is most likely to paste here
- * by mistake: an Anthropic key and a markdown-den connection key. Refusing them
+ * by mistake: an Anthropic key and a markdownbrain.ai connection key. Refusing them
  * by shape is what keeps the promise that nothing in this file is worth stealing.
  */
 export function looksLikeSecret(text: string): boolean {
@@ -179,18 +209,26 @@ function problem(message: string): ConfigReading {
   return { kind: "problem", message };
 }
 
-function readBounds(v: unknown, at: string): Bounds | string {
-  const raw = v === undefined ? {} : v;
-  if (!isRecord(raw)) return `${at}.bounds must be an object.`;
-  const maxTurns = raw.maxTurns === undefined ? DEFAULT_BOUNDS.maxTurns : raw.maxTurns;
-  const maxBudgetUsd = raw.maxBudgetUsd === undefined ? DEFAULT_BOUNDS.maxBudgetUsd : raw.maxBudgetUsd;
-  const wallClock = raw.wallClock === undefined ? DEFAULT_BOUNDS.wallClock : raw.wallClock;
-  if (!Number.isInteger(maxTurns) || (maxTurns as number) < 1) return `${at}.bounds.maxTurns must be a whole number of turns.`;
-  if (typeof maxBudgetUsd !== "number" || !(maxBudgetUsd > 0)) return `${at}.bounds.maxBudgetUsd must be a positive number of dollars.`;
-  if (typeof wallClock !== "string" || durationMs(wallClock) === null) {
-    return `${at}.bounds.wallClock must be a duration with a unit, such as 30m.`;
+/**
+ * An agent's `limits`, where **absent is none** — for the key and for each field
+ * in it. Nothing is filled in: a missing field is the honest record of a limit
+ * nobody set, and a default put back here would be a limit nobody chose.
+ */
+function readLimits(v: unknown, at: string): Limits | string {
+  if (v === undefined || v === null) return {};
+  if (!isRecord(v)) return `${at}.limits must be an object.`;
+  const limits: Limits = {};
+  if (v.maxBudgetUsd !== undefined && v.maxBudgetUsd !== null) {
+    if (typeof v.maxBudgetUsd !== "number" || !(v.maxBudgetUsd > 0)) return `${at}.limits.maxBudgetUsd must be a positive number of dollars.`;
+    limits.maxBudgetUsd = v.maxBudgetUsd;
   }
-  return { maxTurns: maxTurns as number, maxBudgetUsd, wallClock };
+  if (v.wallClock !== undefined && v.wallClock !== null) {
+    if (typeof v.wallClock !== "string" || durationMs(v.wallClock) === null) {
+      return `${at}.limits.wallClock must be a duration with a unit, such as 2h.`;
+    }
+    limits.wallClock = v.wallClock;
+  }
+  return limits;
 }
 
 function readVariable(v: unknown, at: string): string | { message: string } {
@@ -222,8 +260,12 @@ function readAgent(name: string, v: unknown): AgentEntry | string {
   }
   const connectionKey = readVariable(v.env.connectionKey, `${at}.env.connectionKey`);
   if (typeof connectionKey !== "string") return connectionKey.message;
-  const bounds = readBounds(v.bounds, at);
-  if (typeof bounds === "string") return bounds;
+  // An earlier build's `bounds` is not read: every limit it held is dropped
+  // here, and `parseConfig` reports that it was there. `limits` is a new key
+  // rather than the old one reinterpreted, because a `bounds` in a file on disk
+  // is a set of defaults nobody can tell from a choice.
+  const limits = readLimits(v.limits, at);
+  if (typeof limits === "string") return limits;
   if ("command" in v) return `${at}.command is not a field: the harness's command line is this program's, not the file's.`;
   // Absent is true, so a file written before the field existed keeps meaning
   // what it meant. A value that is not a boolean is refused rather than read as
@@ -234,7 +276,7 @@ function readAgent(name: string, v: unknown): AgentEntry | string {
     return `${at}.pollsWork must be true or false: true asks for this agent's work, false keeps its identity for \`mdbrain as\` and never polls it.`;
   }
   const pollsWork = v.pollsWork === undefined ? true : v.pollsWork;
-  return { id: v.id, harness: v.harness as HarnessId, pollsWork, cwd: v.cwd, env: { harness, connectionKey }, bounds };
+  return { id: v.id, harness: v.harness as HarnessId, pollsWork, cwd: v.cwd, env: { harness, connectionKey }, limits };
 }
 
 /**
@@ -282,13 +324,15 @@ export function parseConfig(text: string): ConfigReading {
     return problem("agents must name at least one agent this machine runs.");
   }
   const agents = newAgentMap();
+  let oldLimits = false;
   for (const [name, entry] of Object.entries(value.agents)) {
     if (name.trim() === "") return problem("An agent's name cannot be empty.");
     const read = readAgent(name, entry);
     if (typeof read === "string") return problem(read);
     agents[name] = read;
+    if (isRecord(entry) && entry.bounds !== undefined) oldLimits = true;
   }
-  return { kind: "config", config: { version: CONFIG_VERSION, sessionsPerHour, agents } };
+  return { kind: "config", config: { version: CONFIG_VERSION, sessionsPerHour, agents }, oldLimits };
 }
 
 /**
@@ -319,7 +363,10 @@ export function serializeConfig(config: Config): string {
       ...(entry.pollsWork ? {} : { pollsWork: false }),
       cwd: entry.cwd,
       env,
-      bounds: { maxTurns: entry.bounds.maxTurns, maxBudgetUsd: entry.bounds.maxBudgetUsd, wallClock: entry.bounds.wallClock },
+      // Written only for an agent that has one, and only the fields that are
+      // set: absent is none, so the file says a limit exactly where somebody
+      // chose one.
+      ...(hasLimits(entry.limits) ? { limits: writtenLimits(entry.limits) } : {}),
     };
   }
   const out: Record<string, unknown> = { version: config.version };

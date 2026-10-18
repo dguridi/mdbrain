@@ -6,13 +6,19 @@ import { render } from "ink-testing-library";
 import {
   agentChoices,
   agentDefaults,
+  agentRows,
+  agentSummary,
   assembleConfig,
+  changesLabel,
+  countChanges,
+  limitsLabel,
   carriedEntries,
   carriedOver,
   completePath,
   connectionKeyVariableFor,
   DRAFT_VERSION,
   idsToForget,
+  judgeBudget,
   judgeCeiling,
   judgeCwd,
   judgeDuration,
@@ -59,7 +65,7 @@ const existing = (): Config => ({
       pollsWork: true,
       cwd,
       env: { harness: "ANTHROPIC_API_KEY", connectionKey: "MDBRAIN_KEY_DEV_BOT_MDDEN" },
-      bounds: { maxTurns: 40, maxBudgetUsd: 3, wallClock: "20m" },
+      limits: { maxBudgetUsd: 3, wallClock: "20m" },
     },
   },
 });
@@ -71,7 +77,7 @@ const answersFor = (names: Array<[string, string]>): Answers => ({
     cwd,
     harnessVariable: "ANTHROPIC_API_KEY",
     connectionKeyVariable: connectionKeyVariableFor(name),
-    bounds: { maxTurns: 50, maxBudgetUsd: 5, wallClock: "30m" },
+    limits: {},
     pollsWork: true,
   })),
   sessionsPerHour: null,
@@ -244,7 +250,7 @@ describe("the defaults and the judgements", () => {
       cwd,
       harnessVariable: "ANTHROPIC_API_KEY",
       connectionKeyVariable: "MDBRAIN_KEY_DEV_BOT_MDDEN",
-      bounds: { maxTurns: 40, maxBudgetUsd: 3, wallClock: "20m" },
+      limits: { maxBudgetUsd: 3, wallClock: "20m" },
       pollsWork: true,
     });
     expect(agentDefaults("spec-warden", null, "/elsewhere").cwd).toBe("/elsewhere");
@@ -313,7 +319,7 @@ describe("the defaults and the judgements", () => {
     for (const [ceiling, wall] of [[4, "30m"], [null, "2h"], [10, "500h"]] as const) {
       const answers = answersFor([["dev-bot-mdden", "a-1"], ["spec-warden", "a-2"]]);
       answers.sessionsPerHour = ceiling;
-      for (const a of answers.agents) a.bounds = { ...a.bounds, wallClock: judgeDuration(wall).ok ? wall : "30m" };
+      for (const a of answers.agents) a.limits = judgeDuration(wall).ok ? { wallClock: wall } : {};
       const config = assembleConfig(answers);
       const reading = parseConfig(serializeConfig(config));
       expect(reading.kind === "config" && reading.config, `${ceiling} ${wall}`).toEqual(config);
@@ -360,7 +366,7 @@ describe("the defaults and the judgements", () => {
     expect(lines[0]).toBe("Configuration written to /c/config.json.");
     expect(lines).toContain(`    runs in ${cwd}`);
     expect(lines).toContain("    thinks with the key in ANTHROPIC_API_KEY");
-    expect(lines.some((l) => l.includes("requested from markdown-den and stored on this machine"))).toBe(true);
+    expect(lines.some((l) => l.includes("requested from markdownbrain.ai and stored on this machine"))).toBe(true);
     expect(lines.some((l) => l.includes("no longer in the roster"))).toBe(true);
     expect(lines.some((l) => l.includes("helper was dropped"))).toBe(true);
     expect(lines.some((l) => l.includes("removed /c/mcp/agent-old.json"))).toBe(true);
@@ -446,6 +452,50 @@ describe("the defaults and the judgements", () => {
   });
 });
 
+describe("177: the limit judges", () => {
+  it("177-S4: blank and none are answers to the budget and the wall clock, and mean none", () => {
+    for (const none of ["", "  ", "none", "None"]) {
+      expect(judgeBudget(none)).toEqual({ ok: true, value: null });
+      expect(judgeDuration(none)).toEqual({ ok: true, value: null });
+    }
+    expect(judgeBudget("20")).toEqual({ ok: true, value: 20 });
+    expect(judgeBudget("-1").ok).toBe(false);
+    expect(judgeDuration("2h")).toEqual({ ok: true, value: "2h" });
+    expect(judgeDuration("2").ok).toBe(false);
+  });
+
+  it("177: the limits read none, $20, 2h or $20 · 2h, and the menu line says no limits for a poller with none", () => {
+    expect(limitsLabel({})).toBe("none");
+    expect(limitsLabel({ maxBudgetUsd: 20 })).toBe("$20");
+    expect(limitsLabel({ wallClock: "2h" })).toBe("2h");
+    expect(limitsLabel({ maxBudgetUsd: 20, wallClock: "2h" })).toBe("$20 · 2h");
+    const agent = agentDefaults("dev-bot-mdden", null, cwd);
+    expect(agentSummary({ ...agent, limits: {} })).toBe(`polls · ${cwd} · no limits`);
+    expect(agentSummary({ ...agent, pollsWork: false })).toBe(`identity only · ${cwd}`);
+  });
+
+  it("177: changes are counted by setting, matched by id, with an added or removed agent as one each", () => {
+    const before = existing();
+    const same = assembleConfig({
+      agents: [{ name: "dev-bot-mdden", id: "a-1", cwd, harnessVariable: "ANTHROPIC_API_KEY", connectionKeyVariable: "MDBRAIN_KEY_DEV_BOT_MDDEN", limits: { maxBudgetUsd: 3, wallClock: "20m" }, pollsWork: true }],
+      sessionsPerHour: null,
+      dropped: [],
+    });
+    expect(countChanges(before, same)).toBe(0);
+    const moved = structuredClone(same);
+    moved.agents["dev-bot-mdden"].cwd = "/elsewhere";
+    moved.agents["dev-bot-mdden"].limits = {};
+    moved.sessionsPerHour = 4;
+    expect(countChanges(before, moved)).toBe(3);
+    const added = assembleConfig(answersFor([["dev-bot-mdden", "a-1"], ["spec-warden", "a-2"]]));
+    // a-1's limits differ from the fixture's, and a-2 is new.
+    expect(countChanges(before, added)).toBe(2);
+    expect(changesLabel(0)).toBe("no changes");
+    expect(changesLabel(1)).toBe("1 change");
+    expect(changesLabel(2)).toBe("2 changes");
+  });
+});
+
 describe("completing a directory", () => {
   const tree: Record<string, string[]> = {
     [cwd]: ["apps", "apple", "docs"],
@@ -476,7 +526,7 @@ describe("a configure that did not finish", () => {
       version: DRAFT_VERSION,
       chosen: ["a-1"],
       dropped: [],
-      agents: { "a-1": { id: "a-1", cwd, harnessVariable: null, bounds: { maxTurns: 7, maxBudgetUsd: 2, wallClock: "10m" } } },
+      agents: { "a-1": { id: "a-1", cwd, harnessVariable: null, limits: { maxBudgetUsd: 2, wallClock: "10m" } } },
       sessionsPerHour: 4,
     };
     expect(parseDraft(JSON.stringify(draft))).toEqual(draft);
@@ -486,7 +536,7 @@ describe("a configure that did not finish", () => {
     expect(parseDraft(JSON.stringify({ ...draft, version: 99 }))).toBeNull();
     // A field of the wrong shape is dropped rather than making the whole draft
     // unusable: a draft is a convenience, and half of one still helps.
-    const bent = parseDraft(JSON.stringify({ version: DRAFT_VERSION, chosen: "a-1", agents: { "a-1": { cwd: 7, bounds: "no" } } }));
+    const bent = parseDraft(JSON.stringify({ version: DRAFT_VERSION, chosen: "a-1", agents: { "a-1": { cwd: 7, limits: "no" } } }));
     expect(bent).toEqual({ version: DRAFT_VERSION, chosen: [], dropped: [], agents: { "a-1": { id: "a-1" } } });
   });
 });
@@ -588,7 +638,7 @@ describe("158: an agent deleted and created again under the same name", () => {
 
     const recreated = [{ name: "dev-bot-mdden", id: "a-1", previousId: "a-old" }];
     const declined = summaryLines(assembleConfig(answersFor([["spec-warden", "a-2"]])), report, [], [], {}, recreated).join("\n");
-    expect(declined).toContain("dev-bot-mdden was dropped: it was deleted and created again in markdown-den");
+    expect(declined).toContain("dev-bot-mdden was dropped: it was deleted and created again in markdownbrain.ai");
   });
 });
 
@@ -638,10 +688,11 @@ describe("the screen", () => {
     await tick();
     expect(lastFrame()).toContain("dev-bot-mdden (1 of 1)");
     expect(lastFrame()).toContain("Where does dev-bot-mdden run?");
-    for (const _question of ["cwd", "pays-for", "variable", "turns", "budget", "wall"]) {
+    for (const _question of ["cwd", "pays-for", "variable"]) {
       stdin.write("\r");
       await tick();
     }
+    // Nothing about limits: an agent starts with none, and they are set from the menu.
     expect(lastFrame()).toContain("Most sessions an hour");
     // No question follows it: the poll is a constant, so answering the ceiling
     // is what finishes the wizard.
@@ -662,7 +713,7 @@ describe("the screen", () => {
     expect(serializeConfig(assembleConfig(answers))).not.toContain("poll");
   });
 
-  it("125-S24: the work question follows the list, and an unmarked agent is asked no bounds", async () => {
+  it("125-S24: the work question follows the list, and an unmarked agent is asked only what reaches an attended session", async () => {
     let done: Answers | null = null;
     const { lastFrame, stdin } = render(configureScreen(plan(), (a) => { done = a; }));
     await tick();
@@ -691,15 +742,14 @@ describe("the screen", () => {
     stdin.write("\r");
     await tick();
 
-    // The first is asked all six questions.
+    // The first is asked all three questions.
     expect(lastFrame()).toContain("dev-bot-mdden (1 of 2)");
-    for (const _question of ["cwd", "pays-for", "variable", "turns", "budget", "wall"]) {
+    for (const _question of ["cwd", "pays-for", "variable"]) {
       stdin.write("\r");
       await tick();
     }
     expect(lastFrame()).toContain("spec-warden (2 of 2)");
-    // The second is asked the two that reach an attended session and none of the
-    // three that only bound a triggered one.
+    // The second is asked the same three, which all reach an attended session.
     stdin.write("\r"); // cwd
     await tick();
     expect(lastFrame()).toContain("What pays for spec-warden's thinking?");
@@ -707,15 +757,13 @@ describe("the screen", () => {
     await tick();
     stdin.write("\r"); // the variable
     await tick();
-    expect(lastFrame()).not.toContain("Most turns a session of spec-warden may take.");
     expect(lastFrame()).toContain("Most sessions an hour");
     stdin.write("\r");
     await tick();
 
     const answers = done as unknown as Answers;
     expect(answers.agents.map((a) => [a.name, a.pollsWork])).toEqual([["dev-bot-mdden", true], ["spec-warden", false]]);
-    // Defaulted rather than asked, so marking it later has something to offer.
-    expect(answers.agents[1].bounds).toEqual({ maxTurns: 50, maxBudgetUsd: 5, wallClock: "30m" });
+    expect(answers.agents[1].limits).toEqual({});
     expect(answers.agents[1].cwd).toBe(cwd);
   });
 
@@ -791,12 +839,10 @@ describe("the screen", () => {
     await tick();
     stdin.write("\r");
     await tick();
-    // Straight to the bounds: there is no variable to name.
-    expect(lastFrame()).toContain("Most turns a session of dev-bot-mdden may take.");
-    for (let i = 0; i < 5; i += 1) {
-      stdin.write("\r");
-      await tick();
-    }
+    // Straight to the ceiling: there is no variable to name.
+    expect(lastFrame()).toContain("Most sessions an hour");
+    stdin.write("\r");
+    await tick();
     expect((done as unknown as Answers).agents[0].harnessVariable).toBeNull();
   });
 
@@ -893,49 +939,50 @@ describe("the screen", () => {
       version: DRAFT_VERSION,
       chosen: ["a-2"],
       dropped: [],
-      agents: { "a-2": { id: "a-2", cwd, harnessVariable: null, bounds: { maxTurns: 9, maxBudgetUsd: 1, wallClock: "9m" } } },
+      agents: { "a-2": { id: "a-2", cwd, harnessVariable: null, limits: { maxBudgetUsd: 1, wallClock: "9m" } } },
       sessionsPerHour: 3,
     };
     const { lastFrame, stdin } = render(
       configureScreen(plan({ choices: agentChoices(roster, config), existing: config, draft }), (a) => { done = a; }),
     );
     await tick();
-    // The draft marked spec-warden, not the config's dev-bot-mdden.
-    stdin.write("\r");
-    await tick();
-    stdin.write("\r"); // the agents asked for work: the one the draft marked
-    await tick();
-    expect(lastFrame()).toContain("spec-warden (1 of 1)");
-    // Five per-agent questions rather than six: the draft says the machine's own
-    // account, so there is no variable to name.
-    for (let i = 0; i < 7; i += 1) {
+    // spec-warden is the draft's and not the config's, so its questions come
+    // first; taking each offered answer has to land the draft's values.
+    expect(lastFrame()).toContain("Where does spec-warden run?");
+    for (let i = 0; i < 10 && !lastFrame()!.includes("Save and leave"); i += 1) {
       stdin.write("\r");
       await tick();
     }
+    // The menu holds what the draft marked, spec-warden, not the config's dev-bot-mdden.
+    expect(lastFrame()).toContain("spec-warden");
+    expect(lastFrame()).not.toContain("dev-bot-mdden");
+    expect(lastFrame()).toContain("$1 · 9m");
+    // Down past Add or remove and Sessions an hour to Save and leave.
+    for (let i = 0; i < 3; i += 1) {
+      stdin.write(DOWN);
+      await tick();
+    }
+    stdin.write("\r");
+    await tick();
     const answers = done as unknown as Answers;
     expect(answers.agents[0].name).toBe("spec-warden");
     expect(answers.agents[0].harnessVariable).toBeNull();
-    expect(answers.agents[0].bounds).toEqual({ maxTurns: 9, maxBudgetUsd: 1, wallClock: "9m" });
+    expect(answers.agents[0].limits).toEqual({ maxBudgetUsd: 1, wallClock: "9m" });
     expect(answers.sessionsPerHour).toBe(3);
   });
 
-  it("carries a configured ceiling over on a re-run, so Enter keeps it rather than dropping it", async () => {
+  it("carries a configured ceiling over on a re-run, so saving the menu keeps it rather than dropping it", async () => {
     const config = existing();
     config.sessionsPerHour = 4;
     let done: Answers | null = null;
-    const { stdin } = render(configureScreen(plan({ choices: agentChoices(roster, config), existing: config }), (a) => { done = a; }));
+    const { lastFrame, stdin } = render(configureScreen(plan({ choices: agentChoices(roster, config), existing: config }), (a) => { done = a; }));
     await tick();
-    stdin.write("\r"); // the pre-selected entry, confirmed as is
-    await tick();
-    stdin.write("\r"); // and it keeps being asked for work
-    await tick();
-    for (let i = 0; i < 6; i++) { stdin.write("\r"); await tick(); }
-    stdin.write("\r"); // ceiling: Enter keeps 4
-    await tick();
-    stdin.write("\r"); // poll
+    expect(lastFrame()).toMatch(/Sessions an hour\s+4/);
+    for (let i = 0; i < 3; i++) { stdin.write(DOWN); await tick(); }
+    stdin.write("\r"); // Save and leave
     await tick();
     expect((done as unknown as Answers).sessionsPerHour).toBe(4);
-    expect((done as unknown as Answers).agents[0].bounds).toEqual({ maxTurns: 40, maxBudgetUsd: 3, wallClock: "20m" });
+    expect((done as unknown as Answers).agents[0].limits).toEqual({ maxBudgetUsd: 3, wallClock: "20m" });
   });
 
   it("105-S16: offers a rename before the list; yes keeps the entry under the new name, no drops it and says so", async () => {
@@ -950,18 +997,17 @@ describe("the screen", () => {
     expect(kept.lastFrame()).toContain("answering no drops it");
     kept.stdin.write("\r");
     await tick();
-    expect(kept.lastFrame()).toContain("Which agents does this machine run?");
-    kept.stdin.write("\r"); // still marked, so it goes on to the work question
-    await tick();
-    kept.stdin.write("\r"); // and it is still asked for work
-    await tick();
-    expect(kept.lastFrame()).toContain("dev-bot-mdden (1 of 1)");
+    // Kept, so the menu opens with the entry under its new name.
+    expect(kept.lastFrame()).toContain("Save and leave");
+    expect(kept.lastFrame()).toMatch(/› dev-bot-mdden\s+polls/);
+    expect(kept.lastFrame()).toContain("1 change");
 
     let done: Answers | null = null;
     const dropped = render(configureScreen(renamedPlan, (a) => { done = a; }));
     await tick();
     dropped.stdin.write("n");
     await tick();
+    // Nothing configured is left to put on a menu, so it is the walk's list.
     expect(dropped.lastFrame()).toContain("Which agents does this machine run?");
     // No longer marked; mark the second agent instead and go through.
     dropped.stdin.write("\u001b[B"); // down
@@ -987,13 +1033,17 @@ describe("the screen", () => {
     expect(lastFrame()).toContain("over to the new one?");
     stdin.write("\r");
     await tick();
-    expect(lastFrame()).toContain("Which agents does this machine run?");
+    expect(lastFrame()).toContain("Save and leave");
     expect(lastFrame()).not.toContain("no longer in the roster");
-    for (let i = 0; i < 10 && done === null; i++) { stdin.write("\r"); await tick(); }
+    // The carry-over is a change the file will show, so it is counted.
+    expect(lastFrame()).toContain("1 change");
+    for (let i = 0; i < 3; i++) { stdin.write(DOWN); await tick(); }
+    stdin.write("\r");
+    await tick();
     const answers = done as unknown as Answers;
     expect(answers.agents.map((a) => [a.name, a.id])).toEqual([["dev-bot-mdden", "a-1"]]);
     expect(answers.agents[0].cwd).toBe(cwd);
-    expect(answers.agents[0].bounds).toEqual({ maxTurns: 40, maxBudgetUsd: 3, wallClock: "20m" });
+    expect(answers.agents[0].limits).toEqual({ maxBudgetUsd: 3, wallClock: "20m" });
     expect(answers.notCarried).toEqual([]);
   });
 
@@ -1009,6 +1059,429 @@ describe("the screen", () => {
     stdin.write("\r");
     await tick();
     expect(lastFrame()).toContain("Pick at least one agent");
+  });
+  const ESC = "\u001b";
+  const UP = "\u001b[A";
+  const other = process.platform === "win32" ? "C:\\work\\other" : "/work/other";
+  const menuPlan = (config: Config = existing(), over: Partial<ScreenPlan> = {}) =>
+    plan({ choices: agentChoices(roster, config), existing: config, isDirectory: (p) => p === cwd || p === other, ...over });
+  /** Two agents, the second identity-only, so the menu has both kinds of line. */
+  const twoAgents = (): Config => {
+    const config = existing();
+    config.agents["spec-warden"] = { ...config.agents["dev-bot-mdden"], id: "a-2", pollsWork: false, env: { harness: null, connectionKey: "MDBRAIN_KEY_SPEC_WARDEN" }, limits: {} };
+    return config;
+  };
+
+  it("177-S11: the walk asks nothing about limits, and the saved agent has none", async () => {
+    let done: Answers | null = null;
+    const { lastFrame, stdin } = render(configureScreen(plan(), (a) => { done = a; }));
+    await tick();
+    stdin.write(" ");
+    await tick();
+    stdin.write("\r");
+    await tick();
+    stdin.write("\r"); // polls
+    await tick();
+    const asked: string[] = [];
+    while (done === null && asked.length < 6) {
+      asked.push(lastFrame() ?? "");
+      stdin.write("\r");
+      await tick();
+    }
+    expect(asked.join("\n")).not.toMatch(/dollars|Longest a session|turns|[Ll]imit/);
+    const answers = done as unknown as Answers;
+    expect(answers.agents[0].limits).toEqual({});
+    expect(JSON.parse(serializeConfig(assembleConfig(answers))).agents["dev-bot-mdden"]).not.toHaveProperty("limits");
+  });
+
+  it("177-S12: a config opens the menu: every agent with its summary, then the three rows", async () => {
+    const { lastFrame } = render(configureScreen(menuPlan(twoAgents()), () => {}));
+    await tick();
+    const frame = lastFrame() ?? "";
+    expect(frame).not.toContain("Which agents does this machine run?");
+    expect(frame).toMatch(/› dev-bot-mdden\s+polls · .*checkout · \$3 · 20m/);
+    expect(frame).toMatch(/spec-warden\s+identity only · /);
+    const order = ["dev-bot-mdden", "spec-warden", "Add or remove agents…", "Sessions an hour", "Save and leave"].map((s) => frame.indexOf(s));
+    expect(order.every((at) => at >= 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    expect(frame).toMatch(/Sessions an hour\s+server's ceiling \(10\)/);
+    expect(frame).toMatch(/Save and leave\s+no changes/);
+  });
+
+  it("177-S13: one value, one edit: a new directory changes only that agent's cwd, and the menu counts 1 change", async () => {
+    let done: Answers | null = null;
+    const { lastFrame, stdin } = render(configureScreen(menuPlan(twoAgents()), (a) => { done = a; }));
+    await tick();
+    stdin.write("\r"); // open dev-bot-mdden
+    await tick();
+    expect(lastFrame()).toMatch(/› Directory\s+/);
+    stdin.write("\r"); // Directory
+    await tick();
+    expect(lastFrame()).toContain("Where does dev-bot-mdden run?");
+    stdin.write(backspaces(cwd.length));
+    await tick();
+    for (const c of other) stdin.write(c);
+    await tick();
+    stdin.write("\r");
+    await tick();
+    expect((lastFrame() ?? "").split("\n").some((line) => line.includes("Directory") && line.includes(other))).toBe(true);
+    stdin.write(ESC);
+    await tick();
+    expect(lastFrame()).toMatch(/Save and leave\s+1 change/);
+    for (let i = 0; i < 4; i++) { stdin.write(DOWN); await tick(); }
+    stdin.write("\r");
+    await tick();
+    const answers = done as unknown as Answers;
+    const after = assembleConfig(answers);
+    expect(after.agents["dev-bot-mdden"]).toEqual({ ...twoAgents().agents["dev-bot-mdden"], cwd: other });
+    expect(after.agents["spec-warden"]).toEqual(twoAgents().agents["spec-warden"]);
+  });
+
+  it("177-S14: a polling agent has exactly one row about limits, reading none; an identity-only agent has none", () => {
+    const polling = agentDefaults("dev-bot-mdden", { ...existing().agents["dev-bot-mdden"], limits: {} }, cwd);
+    const rows = agentRows(polling);
+    expect(rows.filter((r) => r.kind === "limits")).toEqual([{ kind: "limits", label: "Limits", value: "none" }]);
+    expect(rows.map((r) => r.label)).toEqual(["Directory", "Pays with", "Key variable", "Polls for work", "Limits"]);
+    expect(agentRows({ ...polling, pollsWork: false }).some((r) => r.kind === "limits")).toBe(false);
+    expect(agentRows({ ...polling, harnessVariable: null }).some((r) => r.kind === "variable")).toBe(false);
+  });
+
+  it("177-S15: setting the wall clock from the menu reads 2h and saves only that limit", async () => {
+    const config = existing();
+    config.agents["dev-bot-mdden"].limits = {};
+    let done: Answers | null = null;
+    const { lastFrame, stdin } = render(configureScreen(menuPlan(config), (a) => { done = a; }));
+    await tick();
+    stdin.write("\r"); // open the agent
+    await tick();
+    for (let i = 0; i < 4; i++) { stdin.write(DOWN); await tick(); } // to Limits
+    expect(lastFrame()).toMatch(/› Limits\s+none/);
+    stdin.write("\r");
+    await tick();
+    expect(lastFrame()).toContain("Most dollars a session of dev-bot-mdden may spend. Blank for none.");
+    stdin.write("\r"); // budget left blank
+    await tick();
+    expect(lastFrame()).toContain("Longest a session of dev-bot-mdden may run");
+    for (const c of "2h") stdin.write(c);
+    await tick();
+    stdin.write("\r");
+    await tick();
+    expect(lastFrame()).toMatch(/› Limits\s+2h/);
+    stdin.write(ESC);
+    await tick();
+    expect(lastFrame()).toMatch(/dev-bot-mdden\s+polls · .* · 2h/);
+    for (let i = 0; i < 3; i++) { stdin.write(DOWN); await tick(); }
+    stdin.write("\r");
+    await tick();
+    const saved = JSON.parse(serializeConfig(assembleConfig(done as unknown as Answers)));
+    expect(saved.agents["dev-bot-mdden"].limits).toEqual({ wallClock: "2h" });
+  });
+
+  it("177-S19: openAt naming a recreated agent by its old id opens that agent's rows once it is carried over", async () => {
+    // `mdbrain agents` hands over the id in the file, which for a recreated
+    // entry is the deleted agent's, while the screen already reads the new one.
+    const config = existing();
+    config.agents["dev-bot-mdden"] = { ...config.agents["dev-bot-mdden"], id: "a-old" };
+    const choices = agentChoices(roster, config);
+    const { lastFrame, stdin } = render(configureScreen(plan({ choices, existing: carriedOver(config, choices.recreated), openAt: "a-old" }), () => {}));
+    await tick();
+    stdin.write("y");
+    await tick();
+    expect(lastFrame()).toContain("Esc back to the menu");
+    expect(lastFrame()).toMatch(/› Directory\s+/);
+  });
+
+  it("177-S16: Esc goes back one level, and asks before leaving changes unsaved; only y leaves", async () => {
+    let done: Answers | null = null;
+    let unchanged = false;
+    const screen = render(configureScreen(menuPlan(), (a) => { done = a; }, () => { unchanged = true; }));
+    await tick();
+    screen.stdin.write("\r");
+    await tick();
+    expect(screen.lastFrame()).toContain("Esc back to the menu");
+    screen.stdin.write(ESC);
+    await tick();
+    expect(screen.lastFrame()).toContain("Save and leave");
+    // A change: the ceiling, from the menu.
+    screen.stdin.write(DOWN);
+    await tick();
+    screen.stdin.write(DOWN);
+    await tick();
+    screen.stdin.write("\r");
+    await tick();
+    for (const c of "4") screen.stdin.write(c);
+    await tick();
+    screen.stdin.write("\r");
+    await tick();
+    expect(screen.lastFrame()).toMatch(/Save and leave\s+1 change/);
+    screen.stdin.write(ESC);
+    await tick();
+    expect(screen.lastFrame()).toContain("Leave without saving 1 change? y to leave, any other key to stay.");
+    screen.stdin.write("n");
+    await tick();
+    expect(screen.lastFrame()).toContain("Save and leave");
+    expect(screen.lastFrame()).not.toContain("Leave without saving");
+    screen.stdin.write(ESC);
+    // An Esc followed too quickly by y reads as one Meta-y, so it is given time to land alone.
+    await tick();
+    await tick();
+    screen.stdin.write("y");
+    await tick();
+    expect(done).toBeNull();
+    expect(unchanged).toBe(false);
+
+    // With nothing changed, Esc simply leaves, and says so.
+    const quiet = render(configureScreen(menuPlan(), (a) => { done = a; }, () => { unchanged = true; }));
+    await tick();
+    quiet.stdin.write(ESC);
+    await tick();
+    expect(unchanged).toBe(true);
+    expect(done).toBeNull();
+  });
+
+  it("177-S18: the menu's Directory row refuses a directory that does not exist with the walk's own sentence", async () => {
+    const { lastFrame, stdin } = render(configureScreen(menuPlan(), () => {}));
+    await tick();
+    stdin.write("\r");
+    await tick();
+    stdin.write("\r");
+    await tick();
+    stdin.write(backspaces(cwd.length));
+    await tick();
+    for (const c of "/nowhere") stdin.write(c);
+    await tick();
+    stdin.write("\r");
+    await tick();
+    const walk = judgeCwd("/nowhere", cwd, () => false);
+    expect(!walk.ok && walk.problem).toBe("/nowhere is not a directory that exists.");
+    expect(lastFrame()).toContain("/nowhere is not a directory that exists.");
+    // Still editing, with what was typed, as the walk does.
+    expect(lastFrame()).toContain("Where does dev-bot-mdden run?");
+  });
+
+  it("177-S12: Add or remove agents… adds one, walks only its questions, and comes back to the menu with it", async () => {
+    let done: Answers | null = null;
+    const { lastFrame, stdin } = render(configureScreen(menuPlan(), (a) => { done = a; }));
+    await tick();
+    stdin.write(DOWN);
+    await tick();
+    stdin.write("\r"); // Add or remove agents…
+    await tick();
+    expect(lastFrame()).toContain("Which agents does this machine run?");
+    stdin.write(DOWN);
+    await tick();
+    stdin.write(" "); // mark spec-warden too
+    await tick();
+    stdin.write("\r");
+    await tick();
+    stdin.write("\r"); // both poll
+    await tick();
+    expect(lastFrame()).toContain("Where does spec-warden run?");
+    for (let i = 0; i < 3; i++) { stdin.write("\r"); await tick(); }
+    expect(lastFrame()).toContain("Save and leave");
+    expect(lastFrame()).toMatch(/spec-warden\s+polls · .* · no limits/);
+    expect(lastFrame()).toMatch(/Save and leave\s+1 change/);
+    stdin.write(UP);
+    await tick();
+    for (let i = 0; i < 4; i++) { stdin.write(DOWN); await tick(); }
+    stdin.write("\r");
+    await tick();
+    const answers = done as unknown as Answers;
+    expect(answers.agents.map((a) => a.name)).toEqual(["dev-bot-mdden", "spec-warden"]);
+    expect(answers.agents[0].limits).toEqual({ maxBudgetUsd: 3, wallClock: "20m" });
+  });
+
+  it("177-S19: openAt opens the menu on that agent's rows", async () => {
+    const { lastFrame } = render(configureScreen(menuPlan(twoAgents(), { openAt: "a-2" }), () => {}));
+    await tick();
+    expect(lastFrame()).toContain("Esc back to the menu");
+    expect(lastFrame()).toMatch(/spec-warden\n.*› Directory/);
+  });
+  it("177-S16: leaving changes unsaved with y tells the command they were discarded, which Ctrl-C does not", async () => {
+    let discarded = false;
+    const screen = render(configureScreen(menuPlan(), () => {}, () => {}, () => { discarded = true; }));
+    await tick();
+    for (let i = 0; i < 2; i++) { screen.stdin.write(DOWN); await tick(); }
+    screen.stdin.write("\r");
+    await tick();
+    screen.stdin.write("4");
+    await tick();
+    screen.stdin.write("\r");
+    await tick();
+    screen.stdin.write(ESC);
+    // An Esc followed too quickly by y reads as one Meta-y, so it is given time to land alone.
+    await tick();
+    await tick();
+    screen.stdin.write("y");
+    await tick();
+    expect(discarded).toBe(true);
+  });
+
+  it("177-S16: Esc inside Add or remove agents… goes back to the menu as it was", async () => {
+    let done: Answers | null = null;
+    const { lastFrame, stdin } = render(configureScreen(menuPlan(), (a) => { done = a; }));
+    await tick();
+    stdin.write(DOWN);
+    await tick();
+    stdin.write("\r");
+    await tick();
+    stdin.write(DOWN);
+    await tick();
+    stdin.write(" ");
+    await tick();
+    stdin.write("\r"); // on to the pollers
+    await tick();
+    expect(lastFrame()).toContain("Which of them poll for work?");
+    stdin.write(ESC);
+    await tick();
+    expect(lastFrame()).toContain("Save and leave");
+    expect(lastFrame()).not.toContain("spec-warden");
+    expect(lastFrame()).toMatch(/Save and leave\s+no changes/);
+    for (let i = 0; i < 2; i++) { stdin.write(DOWN); await tick(); }
+    stdin.write("\r");
+    await tick();
+    expect((done as unknown as Answers).agents.map((a) => a.name)).toEqual(["dev-bot-mdden"]);
+  });
+
+  it("177-S22: Esc on the key variable after switching Pays with to a key leaves the agent on the account", async () => {
+    const config = existing();
+    config.agents["dev-bot-mdden"].env = { harness: null, connectionKey: "MDBRAIN_KEY_DEV_BOT_MDDEN" };
+    let done: Answers | null = null;
+    const { lastFrame, stdin } = render(configureScreen(menuPlan(config, { env: { MDBRAIN_KEY_DEV_BOT_MDDEN: "set" } }), (a) => { done = a; }));
+    await tick();
+    stdin.write("\r"); // open the agent
+    await tick();
+    stdin.write(DOWN); // Pays with
+    await tick();
+    stdin.write("\r");
+    await tick();
+    stdin.write(DOWN); // the API key option
+    await tick();
+    stdin.write("\r");
+    await tick();
+    expect(lastFrame()).toContain("Which environment variable holds dev-bot-mdden's harness credential?");
+    stdin.write(ESC);
+    await tick();
+    expect(lastFrame()).toMatch(/› Pays with\s+this machine's own Claude Code account/);
+    expect(lastFrame()).not.toContain("Key variable");
+    stdin.write(ESC);
+    await tick();
+    expect(lastFrame()).toMatch(/Save and leave\s+no changes/);
+    stdin.write(ESC);
+    await tick();
+    expect(done).toBeNull();
+  });
+
+  it("177-S22: switching Pays with to a key is kept once its variable is named, and counts as 1 change", async () => {
+    const config = existing();
+    config.agents["dev-bot-mdden"].env = { harness: null, connectionKey: "MDBRAIN_KEY_DEV_BOT_MDDEN" };
+    let done: Answers | null = null;
+    const { lastFrame, stdin } = render(
+      configureScreen(menuPlan(config, { env: { MDBRAIN_KEY_DEV_BOT_MDDEN: "set", ANTHROPIC_API_KEY: "set" } }), (a) => { done = a; }),
+    );
+    await tick();
+    stdin.write("\r");
+    await tick();
+    stdin.write(DOWN);
+    await tick();
+    stdin.write("\r");
+    await tick();
+    stdin.write(DOWN);
+    await tick();
+    stdin.write("\r");
+    await tick();
+    stdin.write("\r"); // the variable offered
+    await tick();
+    expect(lastFrame()).toMatch(/Key variable\s+ANTHROPIC_API_KEY/);
+    stdin.write(ESC);
+    await tick();
+    expect(lastFrame()).toMatch(/Save and leave\s+1 change/);
+    for (let i = 0; i < 3; i += 1) { stdin.write(DOWN); await tick(); }
+    stdin.write("\r");
+    await tick();
+    expect((done as unknown as Answers).agents[0].harnessVariable).toBe("ANTHROPIC_API_KEY");
+  });
+
+  it("177-S23: an agent only a restarted draft chose is asked its questions before the menu, and Esc leaves it off", async () => {
+    const draft: ConfigureDraft = { version: DRAFT_VERSION, chosen: ["a-1", "a-2"], pollers: ["a-1", "a-2"], agents: {}, dropped: [] };
+    let done: Answers | null = null;
+    const { lastFrame, stdin } = render(configureScreen(menuPlan(existing(), { draft }), (a) => { done = a; }));
+    await tick();
+    expect(lastFrame()).toContain("spec-warden (new agent)");
+    expect(lastFrame()).toContain("Where does spec-warden run?");
+    stdin.write(ESC);
+    await tick();
+    expect(lastFrame()).toMatch(/Save and leave\s+no changes/);
+    expect(lastFrame()).not.toContain("spec-warden");
+    stdin.write(ESC);
+    await tick();
+    expect(done).toBeNull();
+  });
+
+  it("177-S24: Esc on a draft's agent that replaced every configured one goes back to the list, never to an empty menu", async () => {
+    const config = existing();
+    const draft: ConfigureDraft = { version: DRAFT_VERSION, chosen: ["a-2"], dropped: [], agents: {} };
+    let done: Answers | null = null;
+    const { lastFrame, stdin } = render(
+      configureScreen(plan({ choices: agentChoices(roster, config), existing: config, draft }), (a) => { done = a; }),
+    );
+    await tick();
+    expect(lastFrame()).toContain("Where does spec-warden run?");
+    stdin.write(ESC);
+    await tick();
+    // An empty menu here would offer *Save and leave* with `agents: []`, a file
+    // every command refuses, and lose dev-bot-mdden's key on this machine.
+    expect(lastFrame()).not.toContain("Save and leave");
+    expect(lastFrame()).toContain("Which agents does this machine run?");
+    expect(lastFrame()).toContain("Pick at least one agent");
+    stdin.write(ESC);
+    await tick();
+    expect(lastFrame()).toContain("Which agents does this machine run?");
+    expect(done).toBeNull();
+    // The draft's mark is still on the list, so Enter walks spec-warden again.
+    stdin.write("\r");
+    await tick();
+    for (let i = 0; i < 10 && !lastFrame()!.includes("Save and leave"); i += 1) {
+      stdin.write("\r");
+      await tick();
+    }
+    expect(lastFrame()).toContain("Save and leave");
+    expect(lastFrame()).toContain("spec-warden");
+  });
+
+  it("177-S12: a configured agent deleted from the roster is named on the menu and dropped by saving", async () => {
+    const config = existing();
+    config.agents["vanished-bot"] = { ...config.agents["dev-bot-mdden"], id: "a-gone" };
+    let done: Answers | null = null;
+    const { lastFrame, stdin } = render(configureScreen(menuPlan(config), (a) => { done = a; }));
+    await tick();
+    expect(lastFrame()).toContain("vanished-bot is no longer in the roster, so saving drops it.");
+    expect(lastFrame()).toMatch(/Save and leave\s+1 change/);
+    for (let i = 0; i < 3; i++) { stdin.write(DOWN); await tick(); }
+    stdin.write("\r");
+    await tick();
+    expect((done as unknown as Answers).agents.map((a) => a.name)).toEqual(["dev-bot-mdden"]);
+  });
+
+  it("177: a save the screen cannot show — old limits, --new-keys — still counts, so Esc asks", async () => {
+    let unchanged = false;
+    const { lastFrame, stdin } = render(configureScreen(menuPlan(existing(), { pending: 1 }), () => {}, () => { unchanged = true; }));
+    await tick();
+    expect(lastFrame()).toMatch(/Save and leave\s+1 change/);
+    stdin.write(ESC);
+    await tick();
+    expect(unchanged).toBe(false);
+    expect(lastFrame()).toContain("Leave without saving 1 change?");
+  });
+
+  it("177: a draft that blanked the ceiling keeps it blank on the menu, rather than the config's", async () => {
+    const config = existing();
+    config.sessionsPerHour = 5;
+    const draft: ConfigureDraft = { version: DRAFT_VERSION, chosen: ["a-1"], dropped: [], agents: {}, sessionsPerHour: null };
+    const { lastFrame } = render(configureScreen(menuPlan(config, { draft }), () => {}));
+    await tick();
+    expect(lastFrame()).toMatch(/Sessions an hour\s+server's ceiling \(10\)/);
+    expect(lastFrame()).toMatch(/Save and leave\s+1 change/);
   });
 });
 
@@ -1194,7 +1667,7 @@ describe("the command", () => {
     expect(text).not.toContain("smd_agent");
     expect(text).toContain("MDBRAIN_KEY_DEV_BOT_MDDEN");
     expect(readFileSync(mcpConfigPath("dev-bot-mdden"), "utf8")).not.toContain("smd_agent");
-    expect(out.some((l) => l.includes("requested from markdown-den and stored on this machine"))).toBe(true);
+    expect(out.some((l) => l.includes("requested from markdownbrain.ai and stored on this machine"))).toBe(true);
   });
 
   it("105-S50: a key already on this machine is kept rather than a second one minted", async () => {
@@ -1296,7 +1769,7 @@ describe("the command", () => {
     );
     expect(code).toBe(1);
     expect(err[0]).toMatch(/^No agents yet in markdownbrain\.ai, quiet org/);
-    expect(err[0]).toMatch(/Create one in markdown-den first/);
+    expect(err[0]).toMatch(/Create one in markdownbrain.ai first/);
     expect(err[0]).not.toMatch(/you own/);
   });
 
@@ -1502,7 +1975,7 @@ describe("the command", () => {
     expect(code).toBe(0);
     expect(store.held.get("a-1")).toBe("smd_agent_abcdef01_minted");
     expect(out.join("\n")).toContain(
-      "replacing the one that was here; that key (smd_agent_ab12cd34…) is still live in markdown-den: revoke it on the agent's page",
+      "replacing the one that was here; that key (smd_agent_ab12cd34…) is still live in markdownbrain.ai: revoke it on the agent's page",
     );
   });
 
@@ -1582,7 +2055,7 @@ describe("the command", () => {
     expect(store.held.has("a-2")).toBe(false);
     expect(revoked).toEqual([]);
     expect(out.join("\n")).toContain(
-      "spec-warden is no longer configured here: the key smd_agent_bbbbbbbb… is still live in markdown-den; revoke it on the agent's page if nothing else uses it.",
+      "spec-warden is no longer configured here: the key smd_agent_bbbbbbbb… is still live in markdownbrain.ai; revoke it on the agent's page if nothing else uses it.",
     );
   });
 
@@ -1623,5 +2096,110 @@ describe("the command", () => {
     expect(said).toContain("the server would not mint a new key");
     expect(said).not.toContain(jwt);
     expect(said).toContain("[redacted]");
+  });
+
+  it("177-S17: saving the menu writes the file once and mints the key of the agent it added", async () => {
+    validSession();
+    const was = existing();
+    was.agents["old-bot"] = { ...was.agents["dev-bot-mdden"], id: "a-3" };
+    delete was.agents["dev-bot-mdden"];
+    mkdirSync(join(root, "config"), { recursive: true });
+    writeFileSync(configPath(), serializeConfig(was));
+    let asked: ScreenPlan | null = null;
+    const { out, context } = io();
+    const code = await withFetch(rosterReply, () =>
+      runConfigure(
+        deps({
+          ask: async (plan) => {
+            asked = plan;
+            return answersFor([["dev-bot-mdden", "a-1"]]);
+          },
+        }),
+        context,
+      ),
+    );
+    expect(code).toBe(0);
+    expect((asked as unknown as ScreenPlan).existing).not.toBeNull();
+    expect(out.filter((line) => line.startsWith("Configuration written to"))).toHaveLength(1);
+    expect(out.join("\n")).toContain("connection key requested from markdownbrain.ai and stored on this machine");
+    const written = parseConfig(readFileSync(configPath(), "utf8"));
+    expect(written.kind === "config" && Object.keys(written.config.agents)).toEqual(["dev-bot-mdden"]);
+  });
+
+  it("177: a menu left with nothing changed writes nothing and exits 0; openAt reaches the screen", async () => {
+    validSession();
+    mkdirSync(join(root, "config"), { recursive: true });
+    const text = serializeConfig(existing());
+    writeFileSync(configPath(), text);
+    let opened: string | undefined;
+    const { out, context } = io();
+    const code = await withFetch(rosterReply, () =>
+      runConfigure(
+        deps({
+          ask: async (plan) => {
+            opened = plan.openAt;
+            return "unchanged";
+          },
+        }),
+        context,
+        { openAt: "a-1" },
+      ),
+    );
+    expect(code).toBe(0);
+    expect(opened).toBe("a-1");
+    expect(out.join("\n")).toContain("Nothing changed, so nothing was written.");
+    expect(readFileSync(configPath(), "utf8")).toBe(text);
+  });
+  it("177-S16: changes discarded with y are forgotten, so the next run does not offer them again", async () => {
+    validSession();
+    mkdirSync(join(root, "config"), { recursive: true });
+    writeFileSync(configPath(), serializeConfig(existing()));
+    writeFileSync(draftPath(), JSON.stringify({ version: DRAFT_VERSION, chosen: ["a-1"], dropped: [], agents: {}, sessionsPerHour: 4 }));
+    const { err, context } = io();
+    const code = await withFetch(rosterReply, () => runConfigure(deps({ ask: async () => "discarded" }), context));
+    expect(code).toBe(1);
+    expect(err.join("\n")).toContain("the changes were left unsaved");
+    expect(existsSync(draftPath())).toBe(false);
+  });
+
+  it("177: a file still holding old limits, and --new-keys, each count as a change the menu has to save", async () => {
+    validSession();
+    mkdirSync(join(root, "config"), { recursive: true });
+    const old = JSON.parse(serializeConfig(existing()));
+    old.agents["dev-bot-mdden"].bounds = { maxTurns: 50, maxBudgetUsd: 5, wallClock: "30m" };
+    writeFileSync(configPath(), JSON.stringify(old));
+    let pending: number | undefined;
+    const { context } = io();
+    await withFetch(rosterReply, () =>
+      runConfigure(deps({ ask: async (plan) => { pending = plan.pending; return "unchanged"; } }), { ...context, flags: { "new-keys": true } }),
+    );
+    expect(pending).toBe(2);
+  });
+
+  it("177-S21: leaving a menu with nothing changed still mints the key of a configured agent this machine is missing", async () => {
+    validSession();
+    mkdirSync(join(root, "config"), { recursive: true });
+    const text = serializeConfig(existing());
+    writeFileSync(configPath(), text);
+    const store = memoryKeyStore();
+    const { out, context } = io();
+    const code = await withFetch(rosterReply, () => runConfigure(deps({ openKeyStore: async () => store, ask: async () => "unchanged" }), context));
+    expect(code).toBe(0);
+    expect(store.held.get("a-1")).toBe("smd_agent_abcdef01_minted");
+    expect(out.join("\n")).toContain("Nothing changed, so nothing was written.");
+    expect(out.join("\n")).toContain("dev-bot-mdden: connection key requested from markdownbrain.ai and stored on this machine");
+    expect(readFileSync(configPath(), "utf8")).toBe(text);
+  });
+
+  it("177-S21: leaving a menu with nothing changed keeps a key already held and says nothing about it", async () => {
+    validSession();
+    mkdirSync(join(root, "config"), { recursive: true });
+    writeFileSync(configPath(), serializeConfig(existing()));
+    const store = memoryKeyStore({ "a-1": "smd_agent_00000000_held" });
+    const { out, context } = io();
+    const code = await withFetch(rosterReply, () => runConfigure(deps({ openKeyStore: async () => store, ask: async () => "unchanged" }), context));
+    expect(code).toBe(0);
+    expect(store.held.get("a-1")).toBe("smd_agent_00000000_held");
+    expect(out.join("\n")).not.toContain("connection key");
   });
 });

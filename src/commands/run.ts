@@ -32,21 +32,34 @@ import { existsSync } from "node:fs";
 import type { CommandContext, CommandSpec } from "../cli.ts";
 import { askForCount, askToStart, AuthError, claimWork, listAgents, listWorkspaceNames, signalBrains } from "../auth/api.ts";
 import { signInAgainMessage } from "../auth/session.ts";
-import { durationMs, POLL_MS, type AgentEntry, type Config } from "../config/schema.ts";
+import { durationMs, POLL_MS, type AgentEntry, type Config, type HarnessId } from "../config/schema.ts";
 import { loadConfig, writeMcpConfig } from "../config/store.ts";
-import { configPath } from "../config/paths.ts";
+import { configPath, currentEnv } from "../config/paths.ts";
 import { keyStorageLine, openConnectionKeyStore, type ConnectionKeyStore } from "../config/secrets.ts";
 import { holdConnectionKeys, type HeldKey } from "../run/connection-keys.ts";
 import { readWork, type WorkUnit } from "../work/instruction.ts";
-import { answerPollNow, CLAIM_LIMIT, placeWork, planStartup, renamedAgents, rosterView, summaryLines, tickPlan, type RosterView, type Startup } from "../run/loop.ts";
+import {
+  answerPollNow,
+  CLAIM_LIMIT,
+  NO_LIMIT_NOTE_MS,
+  noLimitNote,
+  placeWork,
+  planStartup,
+  renamedAgents,
+  rosterView,
+  summaryLines,
+  tickPlan,
+  type RosterView,
+  type Startup,
+} from "../run/loop.ts";
 import { credentialsCollide, harnessFor } from "../run/harness.ts";
-import { runSession, type StopRegistry } from "../run/execute.ts";
-import { diskInFlight, processAlive, type InFlightStore } from "../run/inflight.ts";
+import { runSession, type Stopper, type StopRegistry } from "../run/execute.ts";
+import { diskInFlight, processAlive, type InFlightRecord, type InFlightStore } from "../run/inflight.ts";
 import { leftBehindNote } from "../resume/rows.ts";
 import { prepareResume, resumeSessionDefaults, type PreparedResume, type ResumeTarget } from "./resume.ts";
 import { readOutcome, type Outcome } from "../run/outcome.ts";
 import { renderPrompt } from "../run/prompt.ts";
-import { appendRun, logRow, runLogPath } from "../run/log.ts";
+import { appendRun, logRow, parseRunLog, readRunLog, runLogPath, type RecoveredUsage } from "../run/log.ts";
 import {
   appendDiagnosis,
   redactSecrets,
@@ -59,10 +72,10 @@ import {
   type RefusedCall,
   type RefusedRow,
 } from "../run/diagnosis.ts";
-import { dayLine, plainPresenter, type Presenter, type RunEvent } from "../run/present.ts";
+import { dayLine, plainPresenter, shortClaim, type Presenter, type RunEvent } from "../run/present.ts";
 import { livePresenter } from "../run/screen.ts";
-import type { ResumeRequest, ViewRequest } from "../run/keys.ts";
-import { resumableOutcome } from "../run/view.ts";
+import type { KillRequest, ResumeRequest, ViewRequest } from "../run/keys.ts";
+import { restoredRecent, resumableOutcome, type RecentRun } from "../run/view.ts";
 import { desiredPresence } from "../run/presence.ts";
 import { presenceLink, silentLink, type AgentIdentity, type PresenceLink, type PresenceLinkOptions } from "../run/realtime.ts";
 import { socketUrl } from "../run/channel.ts";
@@ -169,11 +182,23 @@ export interface RunDeps {
   /** Appends one row to the run log. */
   recordRun: typeof appendRun;
   /**
+   * What an ended session spent, read back from its harness's own record, for
+   * a session whose outcome carries no cost. An edge because it reads files
+   * the harness wrote under the person's home, which a test must not.
+   */
+  recoverUsage: (harness: HarnessId, claim: string, from: Date, to: Date) => Promise<RecoveredUsage | null>;
+  /**
    * The in-flight records: one written when a session's harness has started,
    * removed once its row is in the run log, so a session whose ending was never
    * recorded is exactly a session with a record.
    */
   inFlight: InFlightStore;
+  /**
+   * The run log's whole text, or nothing when there is none — read once at
+   * start-up, for the recent runs the view opens with. An edge for the reason
+   * `recordRun` is one: a test must not read the person's own log.
+   */
+  readRunLog: () => Promise<string>;
   /** Whether a pid is a live process, which is what tells a running session from a lost one. */
   isAlive: (pid: number) => boolean;
   /** This process, named in every record it writes as the session's owner. */
@@ -305,7 +330,9 @@ const defaultDeps: RunDeps = {
   writeMcpFile: writeMcpConfig,
   startSession: runSession,
   recordRun: appendRun,
+  recoverUsage: (harness, claim, from, to) => harnessFor(harness).recoverUsage?.(claim, from, to, currentEnv()) ?? Promise.resolve(null),
   inFlight: diskInFlight,
+  readRunLog: () => readRunLog(),
   isAlive: processAlive,
   pid: process.pid,
   // Built per call, because `resume.ts` reaches this module again through
@@ -333,6 +360,12 @@ interface AgentWork {
    * belongs to a particular roster and the flag alone does not say which one.
    */
   workspace: string | null;
+  /**
+   * The claim of the unit being run, or null when nothing is — what a kill
+   * request's agent is checked against, so a request naming a session this
+   * agent is not running is refused rather than acted on.
+   */
+  claim: string | null;
   queue: WorkUnit[];
 }
 
@@ -438,7 +471,42 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
     startup.asking.map((agent) => config.agents[agent].id),
   );
 
-  const presenter: Presenter = deps.isTTY ? livePresenter(out, deps.now) : plainPresenter(out, deps.now);
+  // **Read before anything is drawn, and read once.** The records serve both the
+  // start-up note and which restored runs offer `r`, and the log is what those
+  // runs are drawn from. Either one unreadable is silent: both are a courtesy,
+  // and the run does not depend on them.
+  let records: InFlightRecord[] | null = null;
+  try {
+    records = await deps.inFlight.list();
+  } catch {
+    records = null;
+  }
+  // **Only a record whose config entry is still under its own name can make a
+  // restored run resumable.** `r` resolves the row's agent by name, and a name
+  // deleted and made again belongs to a different agent, which must never be
+  // handed another agent's transcript. The picker, which resolves by entry id,
+  // still offers such a session.
+  const ownRecords = (records ?? []).filter((record) => config.agents[record.agent]?.id === record.agentEntryId);
+  // Only for the live view: the plain presenter, which is a log of this
+  // process, says nothing of earlier runs, so reading the log for it would be
+  // work thrown away on every start under a service manager or a cron.
+  let restored: RecentRun[] = [];
+  if (deps.isTTY) {
+    try {
+      restored = restoredRecent(parseRunLog(await deps.readRunLog()), ownRecords);
+    } catch {
+      restored = [];
+    }
+  }
+  /**
+   * The claims `r` resumes from a record on disk, which another window may
+   * dismiss or finish meanwhile: a restored run's, and one this process kept
+   * after an ending that cut it short.
+   */
+  const recordedClaims = new Set(restored.filter((run) => run.resumable).map((run) => run.claim));
+
+  // The restored runs are the live view's starting state rather than events.
+  const presenter: Presenter = deps.isTTY ? livePresenter(out, deps.now, restored) : plainPresenter(out, deps.now);
   // Every event is stamped once, here, and the same stamp is what the log prints
   // and what the screen remembers — so a row and a line cannot disagree about
   // when something happened.
@@ -475,19 +543,16 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
   // keychain branch is news to nobody and cost a line on every start; it is
   // still said by `configure`, where somebody is asking rather than being told.
   const keyStorage = keyStore.backend.kind === "keychain" ? null : keyStorageLine(keyStore.backend);
-  say({ kind: "summary", lines: summaryLines(startup, runLogPath(), keyStorage) });
+  say({ kind: "summary", lines: summaryLines(startup, runLogPath(), keyStorage, loaded.oldLimits === true) });
 
-  // **What a crash left behind is said, and nothing is done about it.** A session
-  // with a record and no live process is one whose ending was never written, and
-  // the person is told where to pick it up. Resuming it here would be the
-  // unattended resume that is ruled out, and re-running its claim would be
-  // delivering a unit twice. A list that cannot be read says nothing: this is a
-  // courtesy, and the run does not depend on it.
-  try {
-    const left = leftBehindNote(await deps.inFlight.list(), (pid) => pid !== deps.pid && deps.isAlive(pid));
+  // **What can be picked up is said, and nothing is done about it.** A session
+  // with a record and no live process is one a crash left behind or one kept
+  // after an ending that cut it short, and the person is told where to pick it
+  // up. Resuming it here would be the unattended resume that is ruled out, and
+  // re-running its claim would be delivering a unit twice.
+  if (records !== null) {
+    const left = leftBehindNote(records, (pid) => pid !== deps.pid && deps.isAlive(pid));
     if (left !== null) say({ kind: "note", message: left });
-  } catch {
-    // Unreadable is silent, for the reason above.
   }
 
   // Declared before the connection rather than beside the loop's other flags,
@@ -617,7 +682,7 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
   }
 
   const work = new Map<string, AgentWork>();
-  for (const agent of startup.asking) work.set(agent, { running: false, workspace: null, queue: [] });
+  for (const agent of startup.asking) work.set(agent, { running: false, workspace: null, claim: null, queue: [] });
   /**
    * Tell the connection who should be present, read off the running flags.
    *
@@ -705,10 +770,23 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
   // signal never arrives — on Windows because each has a console of its own
   // instead. Without this the runner would exit while its harness
   // sessions carried on with no terminal and nobody watching.
-  const stoppers = new Set<() => void>();
-  const onSessionStop: StopRegistry = (stopper) => {
-    stoppers.add(stopper);
-    return () => stoppers.delete(stopper);
+  //
+  // **Kept under the claim of the session each one ends**, which is what lets a
+  // person end one session while every other keeps running: shutdown fires
+  // them all, and a kill looks one up by the name its request carries.
+  const stoppers = new Map<string, Stopper>();
+  /**
+   * The claims a kill has fired for, until their sessions end — so a second kill
+   * of one session is refused with a sentence rather than met by the silent
+   * no-op a stopper that already fired would give.
+   */
+  const killed = new Set<string>();
+  /** The registry one session is handed: its stopper is kept under its own claim. */
+  const sessionStopFor = (claim: string): StopRegistry => (stopper) => {
+    stoppers.set(claim, stopper);
+    return () => {
+      if (stoppers.get(claim) === stopper) stoppers.delete(claim);
+    };
   };
   let anyFailed = false;
   /** How many sessions this process started, so a stop row reads as a history rather than a list. */
@@ -719,6 +797,14 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
    * not carry. Bounded, because the view itself remembers only a handful.
    */
   const resumable = new Map<string, { workspace: string; brain: string | null; cwd: string }>();
+  // **A restored run that offers `r` is resumed through the same branch as a
+  // live one**, so its claim goes into the same map, from the record that made
+  // it resumable — which holds exactly what a run ending in this process puts
+  // there. Only the restored runs, which are at most the view's own handful.
+  for (const run of restored) {
+    const record = run.resumable ? ownRecords.find((candidate) => candidate.claim === run.claim) : undefined;
+    if (record !== undefined) resumable.set(run.claim, { workspace: record.workspace, brain: record.brain, cwd: record.cwd });
+  }
   /** Whether a resume is being prepared or is running, so a second `r` is refused. */
   let resuming = false;
   /**
@@ -739,6 +825,7 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
     const state = work.get(agent)!;
     state.running = true;
     state.workspace = unit.instruction.workspace;
+    state.claim = unit.instruction.claim;
     settlePresence();
     sessionsStarted += 1;
     say({
@@ -782,21 +869,36 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
     // never spawned leaves no record offering a transcript that does not exist.
     // Held as a promise, because the removal below has to come after it however
     // quickly the session ends.
-    const inFlight: { written: Promise<boolean> | null } = { written: null };
+    const inFlight: { written: Promise<boolean> | null; record: InFlightRecord | null } = { written: null, record: null };
+    // Whether the harness started at all, which is whether a transcript of this
+    // session can exist for its cost to be read from.
+    let spawned = false;
+    // **Armed only for an agent with no wall clock, and fired at most once.** A
+    // session with a limit ends at it, so there is nothing to warn about; one
+    // without has nothing but this to say it is still going.
+    let noLimitTimer: ReturnType<typeof setTimeout> | null = null;
     const onSpawned = (harnessPid: number | undefined) => {
+      spawned = true;
+      if (entry.limits.wallClock === undefined) {
+        noLimitTimer = setTimeout(() => say({ kind: "note", message: noLimitNote(agent, claim) }), NO_LIMIT_NOTE_MS);
+        noLimitTimer.unref?.();
+      }
+      inFlight.record = {
+        claim,
+        agentEntryId: entry.id,
+        agent,
+        workspace: unit.instruction.workspace,
+        brain,
+        cwd: entry.cwd,
+        startedAt: deps.now().toISOString(),
+        ownerPid: deps.pid,
+        harnessPid: harnessPid ?? null,
+        resumes: 0,
+        ended: null,
+        endedAt: null,
+      };
       inFlight.written = deps.inFlight
-        .write({
-          claim,
-          agentEntryId: entry.id,
-          agent,
-          workspace: unit.instruction.workspace,
-          brain,
-          cwd: entry.cwd,
-          startedAt: deps.now().toISOString(),
-          ownerPid: deps.pid,
-          harnessPid: harnessPid ?? null,
-          resumes: 0,
-        })
+        .write(inFlight.record)
         .then(
           () => true,
           (cause: unknown) => {
@@ -809,28 +911,62 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
     };
     let outcome: Outcome;
     try {
-      outcome = await oneSession(deps, heldKey, mcpFiles, entry, unit, onSessionStop, onSpawned);
+      outcome = await oneSession(deps, heldKey, mcpFiles, entry, unit, sessionStopFor(claim), onSpawned);
     } catch (cause) {
       outcome = spawnFailed(`the session could not be run: ${(cause as Error).message}`);
     }
+    if (noLimitTimer !== null) clearTimeout(noLimitTimer);
     const endedAt = deps.now();
     const elapsed = endedAt.getTime() - startedAt.getTime();
 
+    // **A session cut short still spent money.** A stop, a time-out or a kill
+    // ends the harness before it prints the result its cost is read from, so
+    // the cost is read back from its transcript instead, now, while the
+    // transcript exists and is final. Keyed on the missing number rather than
+    // on the outcome, so any ending without a reported cost is covered. A
+    // failure to read leaves the row with no cost.
+    let recovered: RecoveredUsage | null = null;
+    if (spawned && outcome.costUsd === null) {
+      try {
+        recovered = await deps.recoverUsage(entry.harness, claim, startedAt, endedAt);
+      } catch {
+        recovered = null;
+      }
+    }
+
     try {
-      await deps.recordRun(logRow(unit, outcome, startedAt, endedAt));
+      await deps.recordRun(logRow(unit, outcome, startedAt, endedAt, recovered));
     } catch (cause) {
       // The work happened. Losing the record of it is smaller than reporting an
       // outcome that did not occur, so this is a note rather than a failure.
       say({ kind: "note", message: `The run log could not be written: ${(cause as Error).message}` });
     }
-    // **After the row, whatever the outcome.** The ending is recorded now, so the
-    // session is no longer in flight; a failed one is resumed from the view while
-    // this runner lives, by the claim the view already holds.
-    if (inFlight.written !== null && (await inFlight.written)) {
-      try {
-        await deps.inFlight.remove(claim);
-      } catch (cause) {
-        say({ kind: "note", message: `The in-flight record could not be removed: ${(cause as Error).message}` });
+    // **After the row, whatever the outcome, and whether or not the row was
+    // written.** A session that finished, or never ran, has nothing to pick up,
+    // so its record goes. Any other ending cut a session short, so its record is
+    // kept, **disowned** — nothing runs it now — with its ending on it: that is
+    // what keeps it resumable once this runner has gone, by `mdbrain resume` and
+    // by the next run's view. A disowned record is the shape a resume that ended
+    // badly already leaves, so no reader of the records meets a new state.
+    //
+    // On a stop this is inside the wait for every session, so a stop leaves its
+    // sessions' records kept. A second interrupt exits at once, and a session
+    // whose ending was not yet written keeps the record it had, owned by a dead
+    // process, which every reader already takes to mean *never ended*.
+    if (inFlight.written !== null && inFlight.record !== null && (await inFlight.written)) {
+      if (resumableOutcome(outcome.kind)) {
+        try {
+          await deps.inFlight.write({ ...inFlight.record, ownerPid: null, harnessPid: null, ended: outcome.kind, endedAt: endedAt.toISOString() });
+          recordedClaims.add(claim);
+        } catch (cause) {
+          say({ kind: "note", message: `The in-flight record could not be kept: ${(cause as Error).message}` });
+        }
+      } else {
+        try {
+          await deps.inFlight.remove(claim);
+        } catch (cause) {
+          say({ kind: "note", message: `The in-flight record could not be removed: ${(cause as Error).message}` });
+        }
       }
     }
     if (resumableOutcome(outcome.kind)) {
@@ -839,7 +975,10 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
       if (resumable.size > RESUMABLE_REMEMBERED) resumable.delete(resumable.keys().next().value!);
     }
 
-    if (outcome.kind === "done" || outcome.kind === "stopped") {
+    // **Only `done` is `done`.** Every other ending goes out as `failed`, which
+    // already names its kind, so a stopped or killed session reads as what it
+    // was on both presenters rather than as a session that finished.
+    if (outcome.kind === "done") {
       say({
         kind: "done",
         agent,
@@ -850,7 +989,9 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
         message: outcome.message,
       });
     } else {
-      anyFailed = true;
+      // A stop and a kill are somebody's decision rather than the work going
+      // wrong, so neither turns a `--once` exit code red.
+      if (outcome.kind !== "stopped" && outcome.kind !== "killed") anyFailed = true;
       say({ kind: "failed", agent, claim: unit.instruction.claim, outcome: outcome.kind, ms: elapsed, message: outcome.message });
     }
 
@@ -881,10 +1022,23 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
 
     state.running = false;
     state.workspace = null;
+    state.claim = null;
+    killed.delete(claim);
     settlePresence();
     // No retry, on any outcome. The claim is already spent, and a second attempt
     // would be a promise the layer above cannot honour.
     const next = state.queue.shift();
+    // **A kill does not hold the queue: the next unit starts in this same turn,
+    // as after any ending.** What stops that reading as the kill failing is
+    // this sentence, said before the next unit's `start` so both presenters
+    // read the kill and then the queue moving on.
+    if (outcome.kind === "killed") {
+      const moving = next !== undefined && !stop.stopped;
+      say({
+        kind: "note",
+        message: `killed ${agent}'s session (claim ${shortClaim(claim)})${moving ? "; starting its next queued unit" : ""}`,
+      });
+    }
     if (next && !stop.stopped) {
       await startUnit(agent, entry, next);
       return;
@@ -1074,7 +1228,7 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
     // a frame can fail, and the one thing this handler has to do cannot sit
     // behind it. Each session insists after its own grace; the wait below is
     // what gives them it.
-    for (const stopper of [...stoppers]) stopper();
+    for (const stopper of [...stoppers.values()]) stopper("stop");
     // The version check is the one outstanding request nothing is waiting on,
     // and a person who pressed Ctrl-C is owed a prompt rather than a lookup.
     abortVersionCheck();
@@ -1165,6 +1319,27 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
     }
     resuming = true;
     try {
+      // **A run whose record was kept is resumed from that record, so the record
+      // has to still be there.** A kept record is listed by `mdbrain resume` in
+      // every other window, so another window may since have finished or
+      // dismissed it, whether it was restored at start-up or kept by this
+      // process; resuming then would pick up a session nobody is missing, and a
+      // failure would write the dismissed record back. A run whose record could
+      // not be kept is resumed from what this process holds.
+      if (recordedClaims.has(request.claim)) {
+        let still = false;
+        try {
+          // Existence only: one another window is resuming right now is still
+          // recorded, and `prepareResume` refuses it in its own words.
+          still = (await deps.inFlight.list()).some((record) => record.claim === request.claim);
+        } catch {
+          still = false;
+        }
+        if (!still) {
+          note(`${request.agent}'s run ${request.claim.slice(0, 4)}… is no longer recorded on this machine, so there is nothing to resume.`);
+          return;
+        }
+      }
       const prepared = await deps.prepareResume({ agent: request.agent, entry, claim: request.claim, ...known }, note);
       // Asked again on the far side of the checks, which can take seconds: a
       // runner that began stopping meanwhile has no terminal to give back.
@@ -1194,6 +1369,40 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
   };
 
   /**
+   * A kill the person confirmed in the view: one session ended, every other left
+   * running.
+   *
+   * **The request is a name, and this is where it is resolved.** The claim is
+   * looked up in this runner's own registry and the agent checked against what
+   * it is running, so the view says what the person asked for and the loop
+   * decides — exactly the rule a poll and a resume keep. **Every refusal is a
+   * sentence**, because a key that seems to do nothing is a key a person
+   * concludes is broken; the first is the race between the `y` and the session
+   * ending on its own, which a late stopper would otherwise meet in silence.
+   *
+   * Nothing is said when it is accepted: the session's own ending is the answer,
+   * and the sentence that goes with it is said when that ending lands.
+   */
+  const onKill = (request: KillRequest) => {
+    const note = (message: string) => say({ kind: "note", message });
+    const stopper = stoppers.get(request.claim);
+    if (stopper === undefined || work.get(request.agent)?.claim !== request.claim) {
+      note("That session had already finished.");
+      return;
+    }
+    if (stop.stopped) {
+      note("The runner is stopping and is already ending every session.");
+      return;
+    }
+    if (killed.has(request.claim)) {
+      note("That session is already ending.");
+      return;
+    }
+    killed.add(request.claim);
+    stopper("kill");
+  };
+
+  /**
    * What a keypress asks for, answered here rather than in the view.
    *
    * **Stopping is the same path a signal takes**, which is not a tidiness: the
@@ -1208,11 +1417,15 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
    * thing that polls, claims and starts unattended work.
    *
    * **A resume is handed on, not decided here either**: it goes to `onResume`,
-   * whose checks are `mdbrain resume`'s own.
+   * whose checks are `mdbrain resume`'s own. **So is a kill**, to `onKill`.
    */
   const onRequest = (request: ViewRequest) => {
     if (request === "quit") {
       onStop();
+      return;
+    }
+    if (typeof request === "object" && request.kind === "kill") {
+      onKill(request);
       return;
     }
     if (typeof request === "object") {
@@ -1842,9 +2055,10 @@ async function oneSession(
     // The field is general because an attended session has no claim to name
     // itself after; this is the call site where it is a claim id.
     session: { kind: "new", id: unit.instruction.claim },
+    agent,
     mcpConfigPath: mcpFile,
     cwd: entry.cwd,
-    bounds: entry.bounds,
+    limits: entry.limits,
     harnessCredential,
     connectionKeyVariable: entry.env.connectionKey,
     connectionKey,
@@ -1855,7 +2069,9 @@ async function oneSession(
     {
       spawnable,
       cwd: entry.cwd,
-      wallClockMs: durationMs(entry.bounds.wallClock)!,
+      // Null when none was set, and then no timer is armed: the reader refused
+      // any wall clock that is not a duration, so a set one always converts.
+      wallClockMs: entry.limits.wallClock === undefined ? null : durationMs(entry.limits.wallClock)!,
       onStop,
       onSpawned,
     },
@@ -1870,8 +2086,9 @@ async function oneSession(
     stderr: ending.stderr,
     exitCode: ending.exitCode,
     timedOut: ending.timedOut,
-    stopped: ending.stopped,
+    stoppedBy: ending.stoppedBy,
     signal: ending.signal,
+    windows: ending.windows,
     credentialVariable: entry.env.harness,
   });
 }

@@ -58,6 +58,7 @@ import {
   assembleConfig,
   carriedEntries,
   carriedOver,
+  connectionKeyLine,
   idsToForget,
   keychainGrantLine,
   NOTHING_TO_MANAGE,
@@ -69,7 +70,7 @@ import {
   type Answers,
   type KeyOutcome,
 } from "../configure/questions.ts";
-import { askOnScreen, type ScreenPlan } from "../configure/screen.ts";
+import { askOnScreen, type ScreenPlan, type ScreenResult } from "../configure/screen.ts";
 import { login } from "./login.ts";
 import { readySession } from "./session.ts";
 
@@ -77,8 +78,8 @@ import { readySession } from "./session.ts";
 export interface ConfigureDeps {
   /** Whether a person is at the terminal. */
   isTTY: boolean;
-  /** Draws the questions and answers with everything asked, or null when the person left. */
-  ask: (plan: ScreenPlan) => Promise<Answers | null>;
+  /** Draws the questions and answers with everything asked, `unchanged` for a menu left untouched, or null when the person left. */
+  ask: (plan: ScreenPlan) => Promise<ScreenResult>;
   /** Runs the login flow, answering its exit code. */
   loginNow: (context: CommandContext) => Promise<number>;
   env: Record<string, string | undefined>;
@@ -109,8 +110,25 @@ export function noTerminalMessage(path: string): string {
  */
 export function nothingYetMessage(organizations: string[]): string {
   return organizations.length > 0
-    ? `No agents yet in ${organizations.join(", ")}, so there is nothing to configure. Create one in markdown-den first.`
-    : "No agents are visible to this account, so there is nothing to configure. Create one in markdown-den first.";
+    ? `No agents yet in ${organizations.join(", ")}, so there is nothing to configure. Create one in markdownbrain.ai first.`
+    : "No agents are visible to this account, so there is nothing to configure. Create one in markdownbrain.ai first.";
+}
+
+/**
+ * The key store, opened with the keychain's grant line said first.
+ *
+ * Said before the first key is touched, because the line is about a dialog the
+ * store's reads and writes raise, which is answered before anything printed
+ * after it.
+ */
+async function openKeyStoreSaying(deps: ConfigureDeps, out: (line: string) => void): Promise<ConnectionKeyStore> {
+  const store = await deps.openKeyStore();
+  const grant = keychainGrantLine(store.backend, deps.platform);
+  if (grant !== null) {
+    out(grant);
+    out("");
+  }
+  return store;
 }
 
 /**
@@ -183,6 +201,15 @@ async function ensureConnectionKeys(
   return outcomes;
 }
 
+/** How a caller other than the command line opens configure. */
+export interface ConfigureOptions {
+  /**
+   * The id of the agent whose rows the menu opens on — what `e` in `mdbrain
+   * agents` hands over, so editing one agent starts at that agent.
+   */
+  openAt?: string;
+}
+
 /** The flag that mints again for an agent this machine already holds a key for. */
 const NEW_KEYS_FLAG = "new-keys";
 
@@ -195,7 +222,7 @@ const NEW_KEYS_FLAG = "new-keys";
  * last question is answered — except the draft, which is written as the answers
  * are given so that quitting part-way costs keystrokes rather than work.
  */
-export async function runConfigure(deps: ConfigureDeps, context: CommandContext): Promise<number> {
+export async function runConfigure(deps: ConfigureDeps, context: CommandContext, options: ConfigureOptions = {}): Promise<number> {
   const { out, err } = context;
   if (!deps.isTTY) {
     err(noTerminalMessage(configPath()));
@@ -266,7 +293,13 @@ export async function runConfigure(deps: ConfigureDeps, context: CommandContext)
   if (loaded.kind === "problem") out(`The configuration at ${configPath()} was refused (${loaded.message}), so this starts from nothing.`);
   const existing = loaded.kind === "config" ? loaded.config : null;
   const draft = await loadingDraft;
-  if (draft) out("Picking up the answers a configure that did not finish left behind; every question is asked again, offering them.");
+  if (draft) {
+    out(
+      existing
+        ? "Picking up the answers a configure that did not finish left behind; they are on the menu as unsaved changes."
+        : "Picking up the answers a configure that did not finish left behind; every question is asked again, offering them.",
+    );
+  }
 
   const choices = agentChoices(roster, existing, stillVisible);
   const plan: ScreenPlan = {
@@ -284,23 +317,48 @@ export async function runConfigure(deps: ConfigureDeps, context: CommandContext)
     // Fire and forget: a draft that cannot be written must not interrupt a
     // question, and the next read simply finds nothing to offer.
     record: (d) => void saveDraft(d),
+    ...(options.openAt === undefined ? {} : { openAt: options.openAt }),
+    // What a save would do that no answer shows: rewrite a file whose old limits
+    // are no longer read, and mint when `--new-keys` asked for it.
+    pending: (loaded.kind === "config" && loaded.oldLimits === true ? 1 : 0) + (context.flags[NEW_KEYS_FLAG] === true ? 1 : 0),
   };
 
   const answers = await deps.ask(plan);
+  if (answers === "unchanged") {
+    // Leaving a menu with nothing changed is an ordinary way out, not a
+    // cancellation: the file on disk is already what the person wants.
+    await clearDraft().catch(() => {});
+    out("Nothing changed, so nothing was written.");
+    // Still minted, because every save mints what this machine is missing and
+    // the walk always ended in one: the messages that send a person here for a
+    // key rely on it, and a person sent here for a key who finds nothing to
+    // change leaves this way. Done on the way out rather than counted on the
+    // menu, so the key store is touched only once the person has decided, as
+    // it is on a save. Only what changed is said.
+    if (existing !== null) {
+      const store = await openKeyStoreSaying(deps, out);
+      const agents = Object.entries(existing.agents).map(([name, entry]) => ({ name, id: entry.id }));
+      const keys = await ensureConnectionKeys(store, session.accessToken, agents, false);
+      for (const [name, entry] of Object.entries(existing.agents)) {
+        const outcome = keys[name];
+        if (outcome !== undefined && outcome.kind !== "held") out(`  ${name}: ${connectionKeyLine(outcome, entry.env.connectionKey, name)}`);
+      }
+    }
+    return 0;
+  }
+  if (answers === "discarded") {
+    // Said no to on purpose, so not offered again: a draft kept here would put
+    // the changes just thrown away back on the next run's menu.
+    await clearDraft().catch(() => {});
+    err("Nothing written: the changes were left unsaved.");
+    return 1;
+  }
   if (!answers) {
     err("Nothing written.");
     return 1;
   }
 
-  const store = await deps.openKeyStore();
-  // Said before the first key is touched, because this is about a dialog that is
-  // raised by the reads and writes on the next line and answered before anything
-  // below it is printed.
-  const grant = keychainGrantLine(store.backend, deps.platform);
-  if (grant !== null) {
-    out(grant);
-    out("");
-  }
+  const store = await openKeyStoreSaying(deps, out);
   const carried = new Set(carriedEntries(choices.recreated, answers).map((r) => r.id));
   const keys = await ensureConnectionKeys(store, session.accessToken, answers.agents, context.flags[NEW_KEYS_FLAG] === true, carried);
 
@@ -319,7 +377,7 @@ export async function runConfigure(deps: ConfigureDeps, context: CommandContext)
     // that has already landed; it is unreachable either way.
     //
     // **Forgetting is not revoking**, and for an agent that still exists the key
-    // forgotten here is still live in markdown-den. It is not revoked from here —
+    // forgotten here is still live in markdownbrain.ai. It is not revoked from here —
     // unmarking an agent in this list is not the decision to retire its key that
     // `mdbrain agents remove` is — but it is named, because once this machine
     // has forgotten it nothing here can name it again.
@@ -376,6 +434,29 @@ function listDirectory(path: string): string[] {
   }
 }
 
+/** The dependencies on the real terminal, network and key store. */
+const liveDeps = (): ConfigureDeps => ({
+  isTTY: process.stdin.isTTY === true && process.stdout.isTTY === true,
+  ask: askOnScreen,
+  loginNow: (ctx) => login.run(ctx),
+  env: process.env,
+  currentDirectory: process.cwd(),
+  isDirectory,
+  listDirectory,
+  openKeyStore: () => openConnectionKeyStore(),
+  platform: process.platform,
+});
+
+/**
+ * Configure, opened at one agent's rows on the menu: what `e` in `mdbrain
+ * agents` hands over to. No flags reach it, so it is the plain command — no
+ * login flags to forward and no `--new-keys`, since editing a setting is not
+ * the decision to mint.
+ */
+export function configureAt(openAt: string, context: CommandContext): Promise<number> {
+  return runConfigure(liveDeps(), { ...context, positional: [], flags: {} }, { openAt });
+}
+
 export const configure: CommandSpec = {
   name: "configure",
   summary: "choose which agents this machine runs, and how each is started",
@@ -390,19 +471,6 @@ export const configure: CommandSpec = {
     { name: NEW_KEYS_FLAG, summary: "mint new connection keys, revoking any this machine already holds" },
   ],
   run(context) {
-    return runConfigure(
-      {
-        isTTY: process.stdin.isTTY === true && process.stdout.isTTY === true,
-        ask: askOnScreen,
-        loginNow: (ctx) => login.run(ctx),
-        env: process.env,
-        currentDirectory: process.cwd(),
-        isDirectory,
-        listDirectory,
-        openKeyStore: () => openConnectionKeyStore(),
-        platform: process.platform,
-      },
-      context,
-    );
+    return runConfigure(liveDeps(), context);
   },
 };

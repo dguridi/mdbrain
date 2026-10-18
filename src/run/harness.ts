@@ -14,6 +14,22 @@
 // `command` field, which is the only other place a session could be pointed
 // somewhere else by editing text.
 //
+// **One channel crosses the wall, and it is left on Claude Code's default on
+// purpose.** Claude Code lets the sessions one OS user runs on a machine message
+// each other. With no `crossSessionInbound` set, a session delivers a message
+// whose sender is in the same permission-mode class as itself, and holds the
+// rest for review, which in an unattended session means they are never read.
+// The class is whether a session asks before it acts: `default` and `auto` are
+// both in it, so a person's ordinary session reaches a runner session, and a
+// sender that bypasses permission prompts is the one held. Nothing here sets it,
+// to accept or to refuse. A delivered message carries text from
+// one identity to another with no RLS check and no record in the brain, so a
+// peer could ask an agent to repeat what its private folder holds. That is
+// accepted, because a message reaches nothing the receiver's own role cannot,
+// and the brain stays the channel that is durable and recorded. What this file
+// adds is a name: each session is named after its agent, so a sender listing its
+// peers can tell which bot it is addressing.
+//
 // **The session is also granted that one server's tools, and nothing else.**
 // Supplying a server and withholding permission to call it is the same as
 // supplying nothing: an unattended session has nobody to ask, so it stops at
@@ -30,12 +46,14 @@
 // asking a person for something: either the action is approved, or the session
 // is told nobody can answer and carries on without it.
 //
-// **Two kinds of session are built here, and they differ in exactly one thing.**
-// An identity — who a session is and what it may reach — is the same whether a
-// person is watching or not, so it is one function, `identityArgs`, that both
-// builders spread. What an unattended session adds on top is an instruction and
-// the bounds on it; an attended session adds nothing at all, because the bounds
-// are what having nobody watching is made of and a person ends their own session.
+// **Two kinds of session are built here, and they share their identity.** Who a
+// session is and what it may reach is the same whether a person is watching or
+// not, so it is one function, `identityArgs`, that both builders spread. What an
+// unattended session adds on top is an instruction and whatever limits were set
+// on it; an attended session adds none, because a limit is what having nobody
+// watching is made of and a person ends their own session. Each also adds its
+// own name, which differs by mode on purpose (`<agent>` and `<agent>-as`) and so
+// is not part of the shared half.
 // Keeping the shared half a function rather than a discipline is the whole point:
 // a flag can then only reach one mode by being added to that mode deliberately,
 // in a diff that says so.
@@ -45,8 +63,12 @@
 // process.
 
 import { MCP_SERVER_NAME, MCP_URL } from "../auth/project.ts";
-import type { Bounds, HarnessId } from "../config/schema.ts";
+import type { HarnessId, Limits } from "../config/schema.ts";
 import { readOutcome, type Outcome, type SessionEnd } from "./outcome.ts";
+import type { PathEnv } from "../config/paths.ts";
+import type { RecoveredUsage } from "./log.ts";
+import { priceUsage } from "./price.ts";
+import { claudeProjectsDir, readTranscriptUsage } from "./transcript.ts";
 
 /**
  * Who a session is and what it may reach — the same in both modes.
@@ -72,6 +94,13 @@ export interface Identity {
    * builder can carry one flag while its caller meant the other.
    */
   session: SessionName;
+  /**
+   * The agent's name as this machine's configuration keys it, which is its
+   * display name in the brain as of the last `mdbrain configure`. Each builder
+   * names its session after it in its own way, which is why it is read there and
+   * not in `identityArgs`.
+   */
+  agent: string;
   /** The per-agent MCP file, which names the connection key's variable. */
   mcpConfigPath: string;
   cwd: string;
@@ -95,11 +124,11 @@ export interface SessionName {
 }
 
 /**
- * An unattended session: an identity, an instruction, and the bounds on it.
+ * An unattended session: an identity, an instruction, and the limits set on it.
  *
- * The two added fields are exactly what having nobody watching is made of — a
+ * The added fields are exactly what having nobody watching is made of — a
  * session nobody asked for needs to be told what to do, and one nobody is
- * watching needs an outer edge.
+ * watching may have been given an outer edge.
  */
 export interface Invocation extends Identity {
   /**
@@ -111,7 +140,8 @@ export interface Invocation extends Identity {
   session: SessionName & { kind: "new" };
   /** The instruction's prompt, byte for byte. Nothing is prepended or appended. */
   prompt: string;
-  bounds: Bounds;
+  /** Only the budget is read here; the wall clock is the runner's, armed in `execute.ts`. */
+  limits: Limits;
 }
 
 /** What to spawn. */
@@ -147,9 +177,22 @@ export interface HarnessSpec {
    */
   identityArgs(identity: Identity): string[];
   build(input: Invocation): Spawnable;
-  /** An attended session: the identity, and deliberately nothing else. */
+  /** An attended session: the identity and its name, and deliberately nothing else. */
   buildInteractive(identity: Identity): Spawnable;
   readOutcome(end: SessionEnd): Outcome;
+  /**
+   * What an ended session spent, read from the harness's own record of it,
+   * for when its outcome carries no cost. Optional because it reads a file
+   * format that is the harness's, not the protocol's; a harness without one
+   * leaves such a row's cost empty.
+   *
+   * @param claim the session's id, which is also its transcript's name
+   * @param from when the session started; anything earlier is not its spend
+   * @param to when it ended; anything later belongs to a resume of it
+   * @param env where to look, for the harness's config directory
+   * @returns the recovered usage, or null when nothing of the session was found
+   */
+  recoverUsage?(claim: string, from: Date, to: Date, env: PathEnv): Promise<RecoveredUsage | null>;
 }
 
 /**
@@ -186,7 +229,7 @@ export function childEnvironment(input: Identity, credentialVariable: string): R
  * Whether an entry points both credentials at one variable.
  *
  * Refused rather than resolved, because either resolution is wrong: the harness
- * would be handed a markdown-den connection key as its model credential, or the
+ * would be handed a markdownbrain.ai connection key as its model credential, or the
  * MCP file's `${VAR}` would expand to an Anthropic key. `configure` never writes
  * this, but `config.json` is a first-class hand-written input and the schema
  * cannot see it — the harness's own variable name is this module's, not the
@@ -245,7 +288,7 @@ export const claudeHarness: HarnessSpec = {
       // attended session starts in-process servers of Claude Code's that this
       // flag does not reach and no flag bounds on its own, so the tool surface a
       // person sees in an attended session is wider than an unattended one's.
-      // The identity wall still holds — none of them is a second markdown-den
+      // The identity wall still holds — none of them is a second markdownbrain.ai
       // connection — but *the bot can do exactly this much* is not a question an
       // attended session answers on its own.
       "--strict-mcp-config",
@@ -309,6 +352,11 @@ export const claudeHarness: HarnessSpec = {
         "-p",
         input.prompt,
         ...claudeHarness.identityArgs(input),
+        // Named after the agent, so a session listing its peers sees which bot
+        // this is. Left to itself Claude Code names a session after its working
+        // directory, which every agent sharing one checkout would share.
+        "--name",
+        input.agent,
         // **What an unattended session does when it is refused anyway.** Without
         // this a refusal is still a refusal, but the session is not told why, and
         // it ends its turn asking a person to approve something — which is how
@@ -330,10 +378,12 @@ export const claudeHarness: HarnessSpec = {
         // about progress, precisely because nothing is said until this arrives.
         "--output-format",
         "json",
-        "--max-turns",
-        String(input.bounds.maxTurns),
-        "--max-budget-usd",
-        String(input.bounds.maxBudgetUsd),
+        // **Only when one was set.** Without it the harness spends what the
+        // session spends: nothing extra on a subscription, and on an API key what
+        // the person chose by not setting one. There is no `--max-turns`: a turn
+        // count ends a session that is still working, and bounds nothing the
+        // budget does not bound better.
+        ...(input.limits.maxBudgetUsd === undefined ? [] : ["--max-budget-usd", String(input.limits.maxBudgetUsd)]),
       ],
       env: childEnvironment(input, claudeHarness.credentialVariable),
     };
@@ -342,19 +392,34 @@ export const claudeHarness: HarnessSpec = {
   buildInteractive(identity) {
     return {
       command: "claude",
-      // **The identity and nothing else**, which is the whole of what an
-      // attended session is. No `-p`, so the harness draws its own screen and
-      // reads its own keys; no `--output-format`, because there is no result
-      // object to parse; and none of the three bounds, because every one of them
-      // is either print-gated at the harness or enforced by the runner's own
-      // wall clock, and an attended session has neither. It is not bounded here:
-      // the person ends it.
-      args: claudeHarness.identityArgs(identity),
+      // **The identity and a name, and nothing else**, which is the whole of
+      // what an attended session is. No `-p`, so the harness draws its own
+      // screen and reads its own keys; no `--output-format`, because there is no
+      // result object to parse; and no limit, because the budget is print-gated
+      // at the harness and the wall clock is the runner's own, and an attended
+      // session has neither. It is not bounded
+      // here: the person ends it.
+      //
+      // **The name is `<agent>-as`, not the agent's own**, and that is why it is
+      // set here rather than in the shared set. `-as` marks a session a person
+      // is sitting at, and a resumed run is one too, whoever started its
+      // transcript. Such a session can run beside the agent's unattended one,
+      // and a peer choosing whom to message by name should not take the person's
+      // session for the bot's.
+      args: [...claudeHarness.identityArgs(identity), "--name", `${identity.agent}-as`],
       env: childEnvironment(identity, claudeHarness.credentialVariable),
     };
   },
 
   readOutcome,
+
+  async recoverUsage(claim, from, to, env) {
+    const usage = await readTranscriptUsage(claudeProjectsDir(env), claim, from, to);
+    if (usage === null || usage.messages === 0) return null;
+    // The harness's own turn count is its tool calls plus the closing reply,
+    // which is how it is reported here; a call cut off mid-way still counts.
+    return { costUsd: priceUsage(usage.byModel), turns: usage.mainMessages > 0 ? usage.toolUses + 1 : null, byModel: usage.byModel };
+  },
 };
 
 /** Every harness this build has, by the id the config names. */

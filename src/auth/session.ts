@@ -124,7 +124,7 @@ export const REFRESH_REFUSED_MESSAGE =
  * @param detail what went wrong, as the failure described itself
  */
 export function refreshUnreachableMessage(detail: string): string {
-  return `Could not reach markdown-den to refresh your session: ${detail}. The session has not ended — try again when the connection is back.`;
+  return `Could not reach markdownbrain.ai to refresh your session: ${detail}. The session has not ended — try again when the connection is back.`;
 }
 
 /**
@@ -200,7 +200,7 @@ export function sessionNotAcceptedMessage(retry: string): string {
   // half of a pair. The advice is still *try again before concluding anything*,
   // which is the part that generalises.
   if (retry === LOGIN_COMMAND) {
-    return `markdown-den refused the first call made with the session it just handed over, and one refusal is not always about the session. Run \`${LOGIN_COMMAND}\` again; if it is refused a second time, the account it handed over is not one this server will accept.`;
+    return `markdownbrain.ai refused the first call made with the session it just handed over, and one refusal is not always about the session. Run \`${LOGIN_COMMAND}\` again; if it is refused a second time, the account it handed over is not one this server will accept.`;
   }
-  return `markdown-den refused this request, and that may not be about your session: the same stored session is often accepted on the very next attempt. Run \`${retry}\` again first; run \`${LOGIN_COMMAND}\` only if the refusal repeats, which is the case that usually means the session has genuinely ended.`;
+  return `markdownbrain.ai refused this request, and that may not be about your session: the same stored session is often accepted on the very next attempt. Run \`${retry}\` again first; run \`${LOGIN_COMMAND}\` only if the refusal repeats, which is the case that usually means the session has genuinely ended.`;
 }

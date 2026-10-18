@@ -8,10 +8,13 @@
 //
 // **It reads nothing and writes nothing beyond the configuration.** No file, no
 // state on disk, no call of its own. The recent-runs list is what this process
-// has seen since it started, held in memory, and it is gone when the process
-// exits — `runs.jsonl` is the durable record and this never reads it back, since
-// a view that read the log would be a second reader of the runner's own output
-// and the two could disagree.
+// has seen since it started, held in memory, **on top of the list the last run
+// closed with**: the runner reads `runs.jsonl` once at start-up, keeps its last
+// rows, and hands them here as the starting state ({@link restoredRecent}), so a person who
+// stops and restarts the runner sees the runs they last saw. That is a value
+// handed in rather than a read made here, and it is not an event: the plain
+// output is a log of this process, and replaying old runs into it would make
+// every grep of it count them twice.
 //
 // **What redraws, and on what.** Every value here changes only when an event
 // says so; `applyEvent` is the whole of that. Two things on screen move without
@@ -30,22 +33,35 @@
 // wall clock is what ends one of those, and the spinner was never watching it.
 
 import type { OutcomeKind } from "./outcome.ts";
+import type { InFlightRecord } from "./inflight.ts";
+import type { LoggedRun } from "./log.ts";
 import type { ConnectionState, ListeningState } from "./channel.ts";
 import type { RunEvent, RunPhase } from "./present.ts";
 import type { ScreenAction } from "./keys.ts";
 import { versionNoticeText } from "../upgrade/notice.ts";
 
-/** How many finished sessions the view remembers. Memory only, and never read back. */
+/**
+ * How many finished sessions the view remembers, and how many a new run opens
+ * with from the run log — the same number, so the list restored is the list the
+ * person last saw, and no longer.
+ */
 export const RECENT_LIMIT = 5;
 
 /**
- * The outcomes whose session can be picked up again: a harness ran, and its
- * ending was lost or went wrong.
+ * The outcomes whose session can be picked up again: a harness ran, and was cut
+ * short or went wrong.
  *
- * Not `done` or `stopped`, which lost nothing, and not `spawn-failed`, which
- * never ran and so left no transcript to resume.
+ * Not `done`, which lost nothing, and not `spawn-failed`, which never ran and so
+ * left no transcript to resume. **`stopped` is in**: a stop is orderly, but it
+ * ends a session wherever it is, mid tool call included. **`killed` is in**,
+ * though a person ended it on purpose: a resume is the only recovery from a kill
+ * pressed on the wrong row. Either is still a second keypress of its own —
+ * nothing resumes by itself.
+ *
+ * It is also what decides whether a session's in-flight record outlives its
+ * ending, so a resumable session stays resumable once its runner has gone.
  */
-export const RESUMABLE_OUTCOMES: readonly OutcomeKind[] = ["failed", "timed-out", "unreadable"];
+export const RESUMABLE_OUTCOMES: readonly OutcomeKind[] = ["stopped", "failed", "timed-out", "killed", "unreadable"];
 
 /** Whether a finished run's session can be resumed. */
 export function resumableOutcome(outcome: OutcomeKind): boolean {
@@ -66,6 +82,16 @@ export interface AgentRow {
   note: string | null;
   /** Units waiting behind the one that is running. */
   queued: number;
+  /**
+   * The claim of the session running for this agent, or null when none is.
+   *
+   * Kept off the `start` event, which always carried it. An agent runs at most
+   * one session at a time, so a running row and a running session are the same
+   * thing — and the claim is what lets the row be picked, and a kill name it.
+   */
+  claim: string | null;
+  /** When that session started, as its `start` event was stamped; null when none is running. */
+  startedAt: Date | null;
 }
 
 /** One finished session, as the view remembers it. */
@@ -89,9 +115,20 @@ export interface RecentRun {
    * **The envelope's moment rather than a clock read here**, which is what keeps
    * this reducer clockless: the runner stamps every event once, the plain log
    * prints that stamp, and the screen remembers it — so a row on screen and a
-   * line in the log cannot come to disagree about when a run finished.
+   * line in the log cannot come to disagree about when a run finished. A run
+   * restored from the log carries the row's own `endedAt`.
    */
   at: Date;
+  /**
+   * Whether `r` can pick this run's session up again.
+   *
+   * The outcome alone for a run this process saw end, since this process holds
+   * what a resume needs. For a run restored from the log it is the outcome
+   * **and** a disowned record for its claim on this machine, because the record
+   * is what a resume goes from: a failed row whose record was dismissed, or
+   * never kept, offers no `r` it would only refuse.
+   */
+  resumable: boolean;
 }
 
 /**
@@ -156,6 +193,45 @@ export interface ViewState {
    * has been said, which is not the same as nothing being wrong.
    */
   listening: { state: ListeningState; held: number; total: number } | null;
+}
+
+/**
+ * The recent runs a new run opens with: the last {@link RECENT_LIMIT} rows of the
+ * run log, newest first, `done` ones included.
+ *
+ * **Every agent's rows, not only the ones this run asks for.** The list being
+ * restored is the one the person last saw, and the log is this machine's, shared
+ * by every runner on it.
+ *
+ * **Two sources, because they hold two different things.** The log is what the
+ * rows say; it cannot be resumed from, since it carries neither the config entry
+ * a session belongs to nor the directory it ran in. The records can be, but hold
+ * nothing for a `done` run. So a row offers `r` only when its outcome is
+ * resumable and a disowned record with a resumable ending is held for its claim.
+ *
+ * @param rows the log's parseable rows, oldest first, as the file holds them
+ * @param records the in-flight records a restored row may be resumed from; the
+ *   runner passes only those still under their own agent's entry
+ */
+export function restoredRecent(rows: readonly LoggedRun[], records: readonly InFlightRecord[]): RecentRun[] {
+  const kept = new Set(
+    records
+      .filter((record) => record.ownerPid === null && record.harnessPid === null && record.ended !== null && resumableOutcome(record.ended))
+      .map((record) => record.claim),
+  );
+  return rows
+    .slice(-RECENT_LIMIT)
+    .reverse()
+    .map((row) => ({
+      agent: row.agent,
+      outcome: row.outcome,
+      ms: Date.parse(row.endedAt) - Date.parse(row.startedAt),
+      costUsd: row.costUsd,
+      message: row.message,
+      claim: row.claim,
+      at: new Date(row.endedAt),
+      resumable: resumableOutcome(row.outcome) && kept.has(row.claim),
+    }));
 }
 
 /** A view that has seen nothing yet. */
@@ -240,7 +316,7 @@ function withRow(state: ViewState, agent: string, change: (row: AgentRow) => Age
   });
   // An event about an agent the view has not been told about is still drawn:
   // silence about an agent is the one thing this roster exists to prevent.
-  if (!found) agents.push(change({ agent, state: "idle", note: null, queued: 0 }));
+  if (!found) agents.push(change({ agent, state: "idle", note: null, queued: 0, claim: null, startedAt: null }));
   return { ...state, agents };
 }
 
@@ -278,22 +354,33 @@ export function applyEvent(state: ViewState, event: RunEvent, at: Date): ViewSta
     case "queued":
       return withRow(state, event.agent, (row) => ({ ...row, queued: event.depth }));
     case "start":
-      return withRow(state, event.agent, (row) => ({ ...row, state: "running", note: workingLine(event, at) }));
+      return withRow(state, event.agent, (row) => ({
+        ...row,
+        state: "running",
+        note: workingLine(event, at),
+        claim: event.claim,
+        startedAt: at,
+      }));
     case "done": {
       const next = withRow(state, event.agent, (row) => ({
         ...row,
         state: "idle",
         note: null,
         queued: Math.max(0, row.queued - 1),
+        claim: null,
+        startedAt: null,
       }));
       const run: RecentRun = {
         agent: event.agent,
+        // The one outcome this event is sent for: every other ending, a stop
+        // and a kill included, arrives as `failed`, which names its own kind.
         outcome: "done",
         ms: event.ms,
         costUsd: event.costUsd,
         message: event.message,
         claim: event.claim,
         at,
+        resumable: false,
       };
       return { ...next, recent: [run, ...next.recent].slice(0, RECENT_LIMIT) };
     }
@@ -303,11 +390,22 @@ export function applyEvent(state: ViewState, event: RunEvent, at: Date): ViewSta
         state: "idle",
         note: event.message,
         queued: Math.max(0, row.queued - 1),
+        claim: null,
+        startedAt: null,
       }));
       return {
         ...next,
         recent: [
-          { agent: event.agent, outcome: event.outcome, ms: event.ms, costUsd: null, message: event.message, claim: event.claim, at },
+          {
+            agent: event.agent,
+            outcome: event.outcome,
+            ms: event.ms,
+            costUsd: null,
+            message: event.message,
+            claim: event.claim,
+            at,
+            resumable: resumableOutcome(event.outcome),
+          },
           ...next.recent,
         ].slice(0, RECENT_LIMIT),
       };
@@ -344,15 +442,21 @@ export function applyEvent(state: ViewState, event: RunEvent, at: Date): ViewSta
 }
 
 /**
- * Which recent run the person is looking at, **named by its claim** rather than
+ * Which session the person is looking at, **named by its claim** rather than
  * by its position.
  *
- * The list grows from the top: a session that ends pushes everything down one,
- * so an index held across an event silently comes to mean a different run. The
- * claim is the run's own name, is already carried, and is the same id the run
- * log's row is keyed on — so a selection either resolves to the run it was made
- * against or, once that run has fallen off the end of the window, to nothing.
- * Nothing is the honest answer there; a neighbour would be a quiet substitution.
+ * The lists move under the cursor: a session that ends leaves the running rows
+ * and pushes every recent run down one, so an index held across an event
+ * silently comes to mean a different session. The claim is the session's own
+ * name, is already carried, and is the same id the run log's row is keyed on —
+ * so a selection either resolves to the session it was made against or, once
+ * that run has fallen off the end of the window, to nothing. Nothing is the
+ * honest answer there; a neighbour would be a quiet substitution.
+ *
+ * **It follows a session across its ending.** A running session that ends
+ * becomes the newest recent run under the same claim, so the cursor that was on
+ * the running row is now on the finished run, and the keys offered change with
+ * it rather than the cursor jumping to whatever took the row's place.
  */
 export type Selection = string | null;
 
@@ -363,22 +467,73 @@ export function selectedRun(recent: readonly RecentRun[], selection: Selection):
 }
 
 /**
+ * The session the cursor is on: a running agent's row, or a finished run.
+ *
+ * `ending` on a running one is the screen's to say — it is set once the person
+ * has confirmed a kill and until the session's ending lands — because nothing the
+ * runner emits says a session is being ended. It is what stops `k` being offered
+ * twice for one session.
+ */
+export type PickedSession =
+  | { kind: "running"; row: AgentRow & { claim: string }; ending: boolean }
+  | { kind: "recent"; run: RecentRun };
+
+/** Whether a row is a session the cursor can rest on. */
+function isRunningSession(row: AgentRow): row is AgentRow & { claim: string } {
+  return row.state === "running" && row.claim !== null;
+}
+
+/**
+ * Every claim the cursor can rest on, in the order it walks them: the running
+ * sessions first, in the roster's order, then the recent runs, newest first.
+ *
+ * One cursor over the two lists rather than one each, because both are already
+ * on screen and a second cursor would be a second thing to learn.
+ */
+export function cursorClaims(state: Pick<ViewState, "agents" | "recent">): string[] {
+  return [...state.agents.filter(isRunningSession).map((row) => row.claim), ...state.recent.map((run) => run.claim)];
+}
+
+/**
+ * The session the cursor is on, or null when it is on none or on one that is gone.
+ *
+ * A running session is looked for first: a claim is never in both lists at
+ * once, since the reducer clears a row's claim in the same event that adds its
+ * recent run.
+ *
+ * @param ending the claims the person has confirmed a kill for
+ */
+export function pickedSession(
+  state: Pick<ViewState, "agents" | "recent">,
+  selection: Selection,
+  ending: ReadonlySet<string> = new Set(),
+): PickedSession | null {
+  if (selection === null) return null;
+  const row = state.agents.filter(isRunningSession).find((candidate) => candidate.claim === selection);
+  if (row !== undefined) return { kind: "running", row, ending: ending.has(row.claim) };
+  const run = selectedRun(state.recent, selection);
+  return run === null ? null : { kind: "recent", run };
+}
+
+/**
  * The cursor after one key.
  *
- * `older` from nothing lands on the newest run, which is what a person pressing
- * down on a list they are not yet in means. `newer` off the top leaves the list
+ * `older` from nothing lands on the first session — the top running row, or
+ * the newest run when nothing is running — which is what a person pressing down
+ * on a list they are not yet in means. `newer` off the top leaves the list
  * rather than sticking to the first row: the way out of a detail view should not
  * require knowing that a second key exists.
  */
-export function moveSelection(recent: readonly RecentRun[], selection: Selection, action: ScreenAction): Selection {
-  if (action === "clear" || recent.length === 0) return null;
-  const current = recent.findIndex((run) => run.claim === selection);
+export function moveSelection(state: Pick<ViewState, "agents" | "recent">, selection: Selection, action: ScreenAction): Selection {
+  const claims = cursorClaims(state);
+  if (action === "clear" || claims.length === 0) return null;
+  const current = selection === null ? -1 : claims.indexOf(selection);
   if (action === "older") {
-    if (current === -1) return recent[0].claim;
-    return recent[Math.min(current + 1, recent.length - 1)].claim;
+    if (current === -1) return claims[0];
+    return claims[Math.min(current + 1, claims.length - 1)];
   }
   if (current <= 0) return null;
-  return recent[current - 1].claim;
+  return claims[current - 1];
 }
 
 /** How much of a harness's own words the detail shows before pointing at the log. */

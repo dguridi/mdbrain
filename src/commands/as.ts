@@ -131,7 +131,7 @@ export const defaultAttendedDeps: AttendedDeps = {
 
 /** The refusal for a key the server would not take, naming the command that explains it. */
 export function refusedKeyMessage(agent: string): string {
-  return `markdown-den refuses ${agent}'s connection key. \`mdbrain agents check ${agent}\` says why.`;
+  return `markdownbrain.ai refuses ${agent}'s connection key. \`mdbrain agents check ${agent}\` says why.`;
 }
 
 /**
@@ -228,6 +228,7 @@ export async function runAs(deps: AsDeps, context: CommandContext): Promise<numb
 
   const spawnable = ready.spec.buildInteractive({
     session: { kind: "new", id: deps.newSessionId() },
+    agent,
     mcpConfigPath: mcpConfigPath(agent),
     cwd: entry.cwd,
     harnessCredential: ready.harnessCredential,
@@ -293,7 +294,7 @@ export async function prepareAttended(
   }
 
   // Refused before the key is read rather than after, because either resolution
-  // of the collision is wrong: the harness would be handed a markdown-den
+  // of the collision is wrong: the harness would be handed a markdownbrain.ai
   // connection key as its model credential, or the MCP file's `${VAR}` would
   // expand to an Anthropic key.
   if (credentialsCollide(spec, entry.env.connectionKey)) {

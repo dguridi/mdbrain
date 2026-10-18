@@ -75,7 +75,7 @@ export function holdReason(
   // entry looks healthy by every name on screen, and its sessions would each be
   // refused by the server one unit at a time.
   if (!roster.ids.has(entry.id) && roster.names.has(agent)) {
-    return "its agent was deleted in markdown-den, and an agent of the same name now has a new id: run mdbrain configure.";
+    return "its agent was deleted in markdownbrain.ai, and an agent of the same name now has a new id: run mdbrain configure.";
   }
   if (!roster.ids.has(entry.id) || !roster.names.has(agent)) {
     return "it is not in the roster this account can see; it is configured here and will receive no work.";
@@ -196,9 +196,13 @@ export function renamedAgents(config: Config, roster: ReadonlyMap<string, string
  * @param keyStorage where the connection keys are held, or null to say nothing.
  *   The caller decides: it is said on the file fallback and kept back on the
  *   keychain, so the notice lands where it is news.
+ * @param oldLimits whether config.json still holds the limits an earlier build
+ *   wrote. Said on every start until `configure` rewrites the file, because
+ *   `run` never writes the config, and the sentence is true until then.
  */
-export function summaryLines(startup: Startup, runLogPath: string, keyStorage: string | null): string[] {
+export function summaryLines(startup: Startup, runLogPath: string, keyStorage: string | null, oldLimits = false): string[] {
   const lines: string[] = [RUN_TITLE];
+  if (oldLimits) lines.push(`  ${OLD_LIMITS_LINE}`);
   if (startup.asking.length === 0) {
     lines.push(
       startup.held.length === 0
@@ -217,6 +221,37 @@ export function summaryLines(startup: Startup, runLogPath: string, keyStorage: s
   lines.push(`  Run log: ${runLogPath}`);
   if (keyStorage !== null) lines.push(keyStorage);
   return lines;
+}
+
+/**
+ * What `run` says about a file still holding an earlier build's limits.
+ *
+ * Every one of them was dropped when the file was read — a turn count, a budget
+ * and a wall clock alike, chosen or defaulted, since the file cannot tell the
+ * two apart — so the sentence says what is true now and names the one command
+ * that makes it stop being said.
+ */
+export const OLD_LIMITS_LINE =
+  "config.json still has limits written by an earlier mdbrain. They are no longer read, so no agent has a turn, budget or time limit. `mdbrain configure` rewrites the file without them.";
+
+/**
+ * How long a session with no time limit runs before `run` says so: two hours.
+ *
+ * Long enough to be rare — on the machine this was measured on, 4 sessions in
+ * 585 ran past it, and the 99th percentile was 100 minutes — and short enough
+ * that a session hung with nothing to end it shows up the same afternoon. With no
+ * wall clock, a hang holds its agent's queue for as long as `run` is up, and this
+ * note is what turns that from a silent stall into a visible one.
+ */
+export const NO_LIMIT_NOTE_MS = 2 * 3_600_000;
+
+/**
+ * The note for a session of an agent with no wall clock that has run
+ * {@link NO_LIMIT_NOTE_MS}. Said once per session: a person who has decided to
+ * leave it running does not need telling again.
+ */
+export function noLimitNote(agent: string, claim: string): string {
+  return `${agent}'s session (claim ${claim.slice(0, 4)}…) has run ${NO_LIMIT_NOTE_MS / 3_600_000}h with no time limit set.`;
 }
 
 /** Which agents a tick asks for, and which it skips because one is already running. */

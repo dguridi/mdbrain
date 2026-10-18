@@ -15,7 +15,7 @@
 
 import { createElement as h, useEffect, useRef, useState, type ReactElement } from "react";
 import { Box, Text, render, useApp, useInput } from "ink";
-import { browserActionFor, browserHints } from "./keys.ts";
+import { browserActionFor, browserHints, type BrowserAction } from "./keys.ts";
 import { verdictBadge, verdictSentence, type Verdict } from "./verdict.ts";
 
 /** The gutter colour, shared with the other screens so one program looks like one program. */
@@ -48,6 +48,18 @@ export interface BrowserPlan {
   removePlan: (name: string) => string[];
   renew: (name: string) => Promise<ActionResult>;
   remove: (name: string) => Promise<ActionResult>;
+  /**
+   * Whether `e` is offered for an agent: only one this machine has configured,
+   * since configure's menu has nothing to open for any other. Absent offers it
+   * for none.
+   */
+  canEdit?: (name: string) => boolean;
+  /**
+   * Records that the person asked to edit an agent. The browser leaves at once,
+   * and the command opens configure's menu at that agent; the browser is not
+   * drawn again, because the person is in configure now and leaves from there.
+   */
+  edit?: (name: string) => void;
 }
 
 type Mode =
@@ -124,13 +136,17 @@ function AgentsBrowser({ plan }: { plan: BrowserPlan }): ReactElement {
         else setMode({ kind: "browse" });
         return;
       }
-      const action = browserActionFor(input, key);
-      if (action === "quit") return exit();
       const picked = rows[cursor];
+      const action = browserActionFor(input, key, offeredFor(picked));
+      if (action === "quit") return exit();
       if (action === "up") setCursor((c) => Math.max(0, c - 1));
       else if (action === "down") setCursor((c) => Math.min(rows.length - 1, c + 1));
       else if (picked === undefined) return;
       else if (action === "check") check(picked.name);
+      else if (action === "edit") {
+        plan.edit?.(picked.name);
+        exit();
+      }
       else if (action === "renew" || action === "remove") {
         setNotice([]);
         setMode({ kind: "confirm", action, name: picked.name });
@@ -138,6 +154,11 @@ function AgentsBrowser({ plan }: { plan: BrowserPlan }): ReactElement {
     },
 
   );
+
+  /** `e` only for a configured agent; every other key for every agent. */
+  function offeredFor(row: BrowserRow | undefined): (action: BrowserAction) => boolean {
+    return (action) => action !== "edit" || (row !== undefined && plan.canEdit?.(row.name) === true);
+  }
 
   const width = Math.max(8, ...rows.map((r) => r.name.length));
   const list = rows.length === 0
@@ -184,7 +205,7 @@ function AgentsBrowser({ plan }: { plan: BrowserPlan }): ReactElement {
   } else if (mode.kind === "working") {
     footer = h(Text, { color: "yellow" }, mode.what);
   } else {
-    footer = h(Text, { dimColor: true }, browserHints());
+    footer = h(Text, { dimColor: true }, browserHints(offeredFor(picked)));
   }
 
   return h(

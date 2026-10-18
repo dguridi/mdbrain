@@ -18,9 +18,17 @@ import {
   type PollNowState,
 } from "../src/run/loop.ts";
 import { childEnvironment, claudeHarness, harnessFor, type Invocation } from "../src/run/harness.ts";
-import { OUTCOME_KINDS, UNREADABLE_OUTCOME_MESSAGE, readOutcome, resultObject, type OutcomeKind, type SessionEnd } from "../src/run/outcome.ts";
+import {
+  MAY_HAVE_CHANGED_FILES,
+  OUTCOME_KINDS,
+  UNREADABLE_OUTCOME_MESSAGE,
+  readOutcome,
+  resultObject,
+  type OutcomeKind,
+  type SessionEnd,
+} from "../src/run/outcome.ts";
 import { holdConnectionKeys } from "../src/run/connection-keys.ts";
-import { logRow, rowText } from "../src/run/log.ts";
+import { logRow, parseRunLog, readRunLog, rowText } from "../src/run/log.ts";
 import { SIGNAL_DEBOUNCE_MS, SIGNAL_MIN_GAP_MS } from "../src/run/signal.ts";
 import { agoText, clockText, costText, dayLine, durationText, plainLine, plainPresenter, RUN_TITLE, shortClaim, type RunEvent } from "../src/run/present.ts";
 import { VERSION } from "../src/version.ts";
@@ -31,9 +39,12 @@ import {
   MESSAGE_PREVIEW_LIMIT,
   RECENT_LIMIT,
   applyEvent,
+  cursorClaims,
   emptyView,
   messagePreview,
   moveSelection,
+  pickedSession,
+  restoredRecent,
   selectedRun,
   waitedText,
 } from "../src/run/view.ts";
@@ -42,7 +53,10 @@ import {
   ACTIVE_COLOR,
   connectionRow,
   countdownText,
+  ENDING_BY_YOU,
   FAILED_COLOR,
+  KILL_OUTRUN,
+  killQuestion,
   LIVE_COLOR,
   liveScreenFor,
   liveView,
@@ -70,29 +84,34 @@ const captured = vi.hoisted(() => ({
   terminal: [] as string[],
   /** Called when the view takes the terminal back, so a test can act just after. */
   onResume: null as (() => void) | null,
+  /** The recent runs the view was handed to open with. */
+  initial: [] as import("../src/run/view.ts").RecentRun[],
 }));
 
 vi.mock("../src/run/screen.ts", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/run/screen.ts")>();
   return {
     ...actual,
-    livePresenter: () => ({
-      present(event: import("../src/run/present.ts").RunEvent) {
-        captured.events.push(event);
-      },
-      listen(handler: (request: import("../src/run/keys.ts").ViewRequest) => void) {
-        captured.handler = handler;
-      },
-      suspend() {
-        captured.terminal.push("suspend");
-        return Promise.resolve();
-      },
-      resume() {
-        captured.terminal.push("resume");
-        captured.onResume?.();
-      },
-      stop: () => Promise.resolve(),
-    }),
+    livePresenter: (_out: unknown, _now: unknown, recent: readonly import("../src/run/view.ts").RecentRun[] = []) => {
+      captured.initial = [...recent];
+      return {
+        present(event: import("../src/run/present.ts").RunEvent) {
+          captured.events.push(event);
+        },
+        listen(handler: (request: import("../src/run/keys.ts").ViewRequest) => void) {
+          captured.handler = handler;
+        },
+        suspend() {
+          captured.terminal.push("suspend");
+          return Promise.resolve();
+        },
+        resume() {
+          captured.terminal.push("resume");
+          captured.onResume?.();
+        },
+        stop: () => Promise.resolve(),
+      };
+    },
   };
 });
 
@@ -101,6 +120,7 @@ beforeEach(() => {
   captured.events = [];
   captured.terminal = [];
   captured.onResume = null;
+  captured.initial = [];
 });
 
 const entry = (over: Record<string, unknown> = {}) => ({
@@ -109,7 +129,7 @@ const entry = (over: Record<string, unknown> = {}) => ({
   pollsWork: true,
   cwd,
   env: { harness: "ANTHROPIC_API_KEY" as string | null, connectionKey: "MDBRAIN_KEY_DEV_BOT_MDDEN" },
-  bounds: { maxTurns: 50, maxBudgetUsd: 5, wallClock: "30m" },
+  limits: {},
   ...over,
 });
 
@@ -133,9 +153,10 @@ const unit = (agent = "dev-bot-mdden", claim = "c1f0", seq = 8412, over: Partial
 const invocation = (over: Partial<Invocation> = {}): Invocation => ({
   prompt: "Triage what landed.",
   session: { kind: "new", id: "3f2a0000-0000-4000-8000-000000000000" },
+  agent: "dev-bot-mdden",
   mcpConfigPath: "/cfg/mcp/dev-bot-mdden.json",
   cwd,
-  bounds: { maxTurns: 50, maxBudgetUsd: 5, wallClock: "30m" },
+  limits: {},
   harnessCredential: "sk-live",
   connectionKeyVariable: "MDBRAIN_KEY_DEV_BOT_MDDEN",
   connectionKey: "smd_agent_deadbeef_secret",
@@ -148,7 +169,8 @@ const ending = (over: Partial<SessionEnd> = {}): SessionEnd => ({
   stderr: "",
   exitCode: 0,
   timedOut: false,
-  stopped: false,
+  stoppedBy: null,
+  windows: false,
   signal: null,
   credentialVariable: "ANTHROPIC_API_KEY",
   ...over,
@@ -210,7 +232,7 @@ describe("run: startup", () => {
     );
     expect(plan.asking).toEqual([]);
     expect(plan.held).toEqual([
-      { agent: "dev-bot", reason: "its agent was deleted in markdown-den, and an agent of the same name now has a new id: run mdbrain configure." },
+      { agent: "dev-bot", reason: "its agent was deleted in markdownbrain.ai, and an agent of the same name now has a new id: run mdbrain configure." },
     ]);
 
     // A rename is still held the way it always was: the id is there, the name is not.
@@ -358,6 +380,21 @@ describe("run: the tick", () => {
 });
 
 describe("run: the session's invocation", () => {
+  it("names an unattended session after its agent, once, and not as an attended one", () => {
+    const built = claudeHarness.build(invocation({ agent: "Field Notes" }));
+    const names = built.args.filter((_, i) => built.args[i - 1] === "--name");
+    expect(names).toEqual(["Field Notes"]);
+  });
+
+  it("sets no cross-session inbound policy in either mode, so the harness's own default holds", () => {
+    for (const built of [claudeHarness.build(invocation()), claudeHarness.buildInteractive(invocation())]) {
+      expect(built.args.join(" ")).not.toContain("crossSessionInbound");
+      expect(built.args).not.toContain("--settings");
+      expect(built.args).not.toContain("--setting-sources");
+      expect(Object.keys(built.env).filter((name) => /CROSS_SESSION/i.test(name))).toEqual([]);
+    }
+  });
+
   it("105-S31: the argv carries the four flags and never --bare", () => {
     const built = claudeHarness.build(invocation());
     expect(built.command).toBe("claude");
@@ -407,8 +444,8 @@ describe("run: the session's invocation", () => {
   });
 
   it("105-S31: the flags are there whatever the configuration says", () => {
-    for (const bounds of [{ maxTurns: 1, maxBudgetUsd: 0.01, wallClock: "1m" }, { maxTurns: 999, maxBudgetUsd: 100, wallClock: "2h" }]) {
-      const built = claudeHarness.build(invocation({ bounds }));
+    for (const limits of [{}, { maxBudgetUsd: 0.01, wallClock: "1m" }, { maxBudgetUsd: 100, wallClock: "2h" }]) {
+      const built = claudeHarness.build(invocation({ limits }));
       expect(built.args).toContain("--strict-mcp-config");
       expect(built.args).toContain("--mcp-config");
     }
@@ -868,12 +905,13 @@ async function drive(over: Partial<import("../src/commands/run.ts").RunDeps> = {
     writeMcpFile: async (agent) => mcpConfigPath(agent),
     startSession: async (request) => {
       spawned.push(request.spawnable);
-      return { stdout: good(), stderr: "", exitCode: 0, timedOut: false, stopped: false, signal: null, spawnProblem: null };
+      return { stdout: good(), stderr: "", exitCode: 0, timedOut: false, stoppedBy: null, windows: false, signal: null, spawnProblem: null };
     },
     recordRun: async (row) => {
       rows.push(row);
       inFlightLog.push(`row ${(row as { claim: string }).claim}`);
     },
+    recoverUsage: async () => null,
     recordDiagnosis: async (row) => {
       notes.push(row);
     },
@@ -891,6 +929,7 @@ async function drive(over: Partial<import("../src/commands/run.ts").RunDeps> = {
       nameHarness: async () => {},
       unlock: async () => {},
     },
+    readRunLog: async () => "",
     isAlive: () => false,
     pid: 4410,
     prepareResume: async (target) => {
@@ -1092,7 +1131,8 @@ describe("run: the command, driven end to end", () => {
       stderr: "",
       exitCode: 1,
       timedOut: false,
-      stopped: false,
+      stoppedBy: null,
+      windows: false,
       signal: null,
       spawnProblem: null,
     }));
@@ -1123,7 +1163,8 @@ describe("run: the command, driven end to end", () => {
         stderr: "",
         exitCode: null,
         timedOut: false,
-        stopped: false,
+        stoppedBy: null,
+        windows: false,
         signal: null,
         spawnProblem: "spawn claude ENOENT",
       }),
@@ -1151,7 +1192,7 @@ describe("run: the command, driven end to end", () => {
       startSession: async (request) => {
         sessions += 1;
         if (sessions === 1) throw new Error("the spawner came apart");
-        return { stdout: good(), stderr: "", exitCode: 0, timedOut: false, stopped: false, signal: null, spawnProblem: null };
+        return { stdout: good(), stderr: "", exitCode: 0, timedOut: false, stoppedBy: null, windows: false, signal: null, spawnProblem: null };
       },
     });
     // The second unit ran, which is the whole property: the queue behind a unit
@@ -1204,7 +1245,8 @@ describe("run: the command, driven end to end", () => {
         stderr: "",
         exitCode: 1,
         timedOut: false,
-        stopped: false,
+        stoppedBy: null,
+        windows: false,
         signal: null,
         spawnProblem: null,
       }),
@@ -1285,7 +1327,7 @@ describe("run: the command, driven end to end", () => {
         },
         startSession: async () => {
           await held;
-          return { stdout: good(), stderr: "", exitCode: 0, timedOut: false, stopped: false, signal: null, spawnProblem: null };
+          return { stdout: good(), stderr: "", exitCode: 0, timedOut: false, stoppedBy: null, windows: false, signal: null, spawnProblem: null };
         },
       },
       { once: false },
@@ -1552,6 +1594,14 @@ describe("run: the command, driven end to end", () => {
     expect(spawned.spawned[0].env.MDBRAIN_KEY_DEV_BOT_MDDEN).toBe("smd_agent_deadbeef_secret");
   });
 
+  it("the session a tick spawns is named after the agent its work was claimed for", async () => {
+    // The builder cases hand `build` the agent themselves, so only a driven tick
+    // can see which name the call site passes it.
+    const started = await drive();
+    const args = started.spawned[0].args;
+    expect(args.filter((_, i) => args[i - 1] === "--name")).toEqual(["dev-bot-mdden"]);
+  });
+
   it("105-S30: `run` names no endpoint that stamps a check-in", () => {
     // The first caller that could stamp one by accident. The two routes it
     // reaches are the count and the claim, and neither resolves an agent
@@ -1592,7 +1642,7 @@ describe("run: the live view", () => {
 
   it("105-S54: an agent idle, then running, then idle again reflects each transition", () => {
     const idle = feed([{ kind: "configured", agent: "dev-bot-mdden" }]);
-    expect(idle.agents).toEqual([{ agent: "dev-bot-mdden", state: "idle", note: null, queued: 0 }]);
+    expect(idle.agents).toEqual([{ agent: "dev-bot-mdden", state: "idle", note: null, queued: 0, claim: null, startedAt: null }]);
 
     const running = applyEvent(idle, {
       kind: "start",
@@ -1651,7 +1701,7 @@ describe("run: the live view", () => {
     expect(drawn).toContain("held — B_KEY is not set.");
   });
 
-  it("105-S56: the recent-runs list starts empty, holds finished sessions newest first, and survives nothing", () => {
+  it("105-S56: the recent-runs list starts empty, holds finished sessions newest first, and reads nothing off disk itself", () => {
     expect(emptyView.recent).toEqual([]);
 
     const view = feed([
@@ -1668,13 +1718,13 @@ describe("run: the live view", () => {
     ]);
     expect(many.recent).toHaveLength(RECENT_LIMIT);
 
-    // And it is never read back off disk. Asserted against what the module can
-    // reach rather than against the words in it: the header says `runs.jsonl` in
-    // order to explain that it never reads it, so a search for the name would
-    // fail on the comment that states the property.
+    // The runner reads the log and hands the view its rows; the view never reads
+    // it. Asserted against what the module can reach rather than against the
+    // words in it, since the header names `runs.jsonl` to explain this. A type
+    // from the log is not a reach.
     const source = readFileSync(fileURLToPath(new URL("../src/run/view.ts", import.meta.url)), "utf8");
     const imports = source.match(/^import .*$/gm) ?? [];
-    expect(imports.some((line) => /node:fs|\/log\.ts/.test(line))).toBe(false);
+    expect(imports.some((line) => /node:fs/.test(line) || (/\/log\.ts/.test(line) && !line.startsWith("import type ")))).toBe(false);
     expect(source).not.toMatch(/\b(readFile|readFileSync|appendRun|runLogPath)\s*\(/);
   });
 
@@ -1746,12 +1796,12 @@ describe("run: the live view", () => {
 
 describe("run: what the review found", () => {
   it("a session the runner stopped is its own outcome, not a failure and not a timeout", () => {
-    const term = readOutcome(ending({ stopped: true, signal: "term" }));
+    const term = readOutcome(ending({ stoppedBy: "runner", signal: "term" }));
     expect(term.kind).toBe("stopped");
     expect(term.message).toContain("stopped before it finished");
-    expect(readOutcome(ending({ stopped: true, signal: "kill" })).message).toContain("killed");
+    expect(readOutcome(ending({ stoppedBy: "runner", signal: "kill" })).message).toContain("killed");
     // A wall clock that fired wins: it is the more specific fact.
-    expect(readOutcome(ending({ stopped: true, timedOut: true, signal: "term" })).kind).toBe("timed-out");
+    expect(readOutcome(ending({ stoppedBy: "runner", timedOut: true, signal: "term" })).kind).toBe("timed-out");
   });
 
   it("105-S29: a refused session ends `run` with spec 96's sentence rather than being retried forever", async () => {
@@ -1826,7 +1876,7 @@ describe("run: what the review found", () => {
   it("105-S40: stopping asks every running session to stop rather than waiting out its wall clock", async () => {
     const { runSession } = await import("../src/run/execute.ts");
     const { spawn } = await import("node:child_process");
-    const stoppers = new Set<() => void>();
+    const stoppers = new Set<import("../src/run/execute.ts").Stopper>();
     const running = runSession(
       {
         spawnable: {
@@ -1846,9 +1896,9 @@ describe("run: what the review found", () => {
       },
       { spawn, isWindows: process.platform === "win32" },
     );
-    for (const stopper of [...stoppers]) stopper();
+    for (const stopper of [...stoppers]) stopper("stop");
     const ended = await running;
-    expect(ended.stopped).toBe(true);
+    expect(ended.stoppedBy).toBe("runner");
     expect(ended.timedOut).toBe(false);
     expect(ended.signal).not.toBeNull();
     // Unregistered on settle, so a stopped session leaves nothing behind.
@@ -1934,7 +1984,7 @@ describe("run: the origin the app is reached at", () => {
     const checkedIn = JSON.parse(readFileSync(fileURLToPath(new URL("../../../.mcp.json", import.meta.url)), "utf8")) as {
       mcpServers: Record<string, { url: string }>;
     };
-    expect(checkedIn.mcpServers["markdown-den"]?.url).toBe(MCP_URL);
+    expect(checkedIn.mcpServers["markdownbrain"]?.url).toBe(MCP_URL);
   });
 
   it("a redirect on an app call is reported as a wrong address, never as a refused session", async () => {
@@ -2060,7 +2110,7 @@ describe("run: the countdown and the keys", () => {
     const hinted = keyHints().join(" ");
     for (const binding of KEY_BINDINGS) expect(hinted).toContain(binding.label);
     expect(keyHints()).toContain("q or ctrl-c — stop");
-    expect(keyHints()).toContain("↑ or ↓ — pick a recent run");
+    expect(keyHints()).toContain("↑ or ↓ — pick a session");
     expect(render(liveView(emptyView, frame())).lastFrame()).toContain("p — poll now");
     // A terminal whose stdin cannot be put in raw mode reads none of them, and
     // offering a key nothing is listening for is worse than offering none.
@@ -2248,7 +2298,7 @@ describe("run: the message a run left behind", () => {
     const view = twoRuns();
     // Down from nothing lands on the newest, which is what pressing down on a
     // list you are not yet in means.
-    const first = moveSelection(view.recent, null, "older");
+    const first = moveSelection(view, null, "older");
     expect(first).toBe("c2");
     expect(selectedRun(view.recent, first)!.message).toContain("no credential");
 
@@ -2257,16 +2307,16 @@ describe("run: the message a run left behind", () => {
     expect(after.recent[0].claim).toBe("c3");
     expect(selectedRun(after.recent, first)!.claim).toBe("c2");
 
-    expect(moveSelection(view.recent, "c2", "older")).toBe("c1");
+    expect(moveSelection(view, "c2", "older")).toBe("c1");
     // The oldest is the end of the list rather than a wrap.
-    expect(moveSelection(view.recent, "c1", "older")).toBe("c1");
+    expect(moveSelection(view, "c1", "older")).toBe("c1");
     // Up off the top leaves the list, so closing needs no second key learnt.
-    expect(moveSelection(view.recent, "c2", "newer")).toBeNull();
-    expect(moveSelection(view.recent, "c1", "clear")).toBeNull();
+    expect(moveSelection(view, "c2", "newer")).toBeNull();
+    expect(moveSelection(view, "c1", "clear")).toBeNull();
     // A selected run that has fallen out of the window resolves to nothing
     // rather than to whatever now sits at its index.
     expect(selectedRun(view.recent, "gone")).toBeNull();
-    expect(moveSelection([], null, "older")).toBeNull();
+    expect(moveSelection(emptyView, null, "older")).toBeNull();
   });
 
   it("105-S68: the picked run stays picked when a new run arrives above it, on the real screen", async () => {
@@ -2776,7 +2826,7 @@ describe("run: the in-`run` version notice", () => {
         count: async () => ({ waiting: 1, capped: false }),
         startSession: async () => {
           await grace;
-          return { stdout: good(), stderr: "", exitCode: 0, timedOut: false, stopped: false, signal: null, spawnProblem: null };
+          return { stdout: good(), stderr: "", exitCode: 0, timedOut: false, stoppedBy: null, windows: false, signal: null, spawnProblem: null };
         },
         lookupLatest: (given) =>
           new Promise<string | null>((resolve, reject) => {
@@ -4183,7 +4233,8 @@ describe("run: the connection key is read once for the run, not once for the uni
           stderr: "",
           exitCode: 0,
           timedOut: false,
-          stopped: false,
+          stoppedBy: null,
+          windows: false,
           signal: null,
           spawnProblem: null,
         };
@@ -4214,7 +4265,8 @@ describe("run: the connection key is read once for the run, not once for the uni
           stderr: "",
           exitCode: 0,
           timedOut: false,
-          stopped: false,
+          stoppedBy: null,
+          windows: false,
           signal: null,
           spawnProblem: null,
         };
@@ -4243,7 +4295,8 @@ describe("run: the connection key is read once for the run, not once for the uni
           stderr: "",
           exitCode: null,
           timedOut: false,
-          stopped: false,
+          stoppedBy: null,
+          windows: false,
           signal: null,
           spawnProblem: sessions.length === 1 ? "the harness could not be started" : null,
         };
@@ -4289,7 +4342,8 @@ describe("run: the connection key is read once for the run, not once for the uni
         stderr: "",
         exitCode: 0,
         timedOut: false,
-        stopped: false,
+        stoppedBy: null,
+        windows: false,
         signal: null,
         spawnProblem: null,
       }),
@@ -4366,7 +4420,8 @@ describe("run: the console window closing", () => {
     stderr: "",
     exitCode: null,
     timedOut: false,
-    stopped: true,
+    stoppedBy: "runner",
+    windows: true,
     signal: "kill",
     spawnProblem: null,
   });
@@ -4439,7 +4494,7 @@ describe("run: the console window closing", () => {
       isWindows: false,
       startSession: async () => {
         during = process.listenerCount("SIGHUP");
-        return { stdout: good(), stderr: "", exitCode: 0, timedOut: false, stopped: false, signal: null, spawnProblem: null };
+        return { stdout: good(), stderr: "", exitCode: 0, timedOut: false, stoppedBy: null, windows: false, signal: null, spawnProblem: null };
       },
     });
     expect(result.code).toBe(0);
@@ -4467,7 +4522,7 @@ describe("run: the MCP file is the binary's own", () => {
           const args = request.spawnable.args;
           pointedAt = args[args.indexOf("--mcp-config") + 1];
           found = readFileSync(pointedAt, "utf8");
-          return { stdout: good(), stderr: "", exitCode: 0, timedOut: false, stopped: false, signal: null, spawnProblem: null };
+          return { stdout: good(), stderr: "", exitCode: 0, timedOut: false, stoppedBy: null, windows: false, signal: null, spawnProblem: null };
         },
       });
       expect(ran.rows[0]).toMatchObject({ outcome: "done" });
@@ -4539,10 +4594,10 @@ describe("run: the in-flight record a session leaves while it runs", () => {
       // One turn for the write the spawn started.
       await new Promise((resolve) => setTimeout(resolve, 0));
       during.push([...records.values()]);
-      return { stdout: good(), stderr: "", exitCode: 0, timedOut: false, stopped: false, signal: null, spawnProblem: null, ...over };
+      return { stdout: good(), stderr: "", exitCode: 0, timedOut: false, stoppedBy: null, windows: false, signal: null, spawnProblem: null, ...over };
     };
 
-  it("163-S1: the record exists while the session runs, names the entry and both pids, and goes after the row, on any outcome", async () => {
+  it("163-S1: the record exists while the session runs, names the entry and both pids, and after the row goes only for an outcome that cannot be resumed", async () => {
     for (const over of [{}, { stdout: "", stderr: "boom", exitCode: 1 }]) {
       const { records, log, inFlight, recordRun } = store();
       const during: InFlightRecord[][] = [];
@@ -4561,9 +4616,14 @@ describe("run: the in-flight record a session leaves while it runs", () => {
           resumes: 0,
         }),
       ]);
-      // The ending is in the run log before the record says the session is over.
-      expect(log).toEqual(["write c1f0", "row c1f0", "remove c1f0"]);
-      expect(records.size).toBe(0);
+      // The ending is in the run log before the record says how it ended.
+      if ("exitCode" in over) {
+        expect(log).toEqual(["write c1f0", "row c1f0", "write c1f0"]);
+        expect(records.get("c1f0")).toEqual(expect.objectContaining({ ownerPid: null, harnessPid: null, ended: "failed" }));
+      } else {
+        expect(log).toEqual(["write c1f0", "row c1f0", "remove c1f0"]);
+        expect(records.size).toBe(0);
+      }
     }
   });
 
@@ -4572,7 +4632,7 @@ describe("run: the in-flight record a session leaves while it runs", () => {
     await drive({
       inFlight,
       recordRun,
-      startSession: async () => ({ stdout: "", stderr: "", exitCode: null, timedOut: false, stopped: false, signal: null, spawnProblem: "spawn claude ENOENT" }),
+      startSession: async () => ({ stdout: "", stderr: "", exitCode: null, timedOut: false, stoppedBy: null, windows: false, signal: null, spawnProblem: "spawn claude ENOENT" }),
     });
     expect(log).toEqual(["row c1f0"]);
   });
@@ -4621,6 +4681,8 @@ describe("run: the in-flight record a session leaves while it runs", () => {
       ownerPid: 999,
       harnessPid: null,
       resumes: 0,
+      ended: null,
+      endedAt: null,
     };
     const crashed = await drive({
       inFlight: { write: async () => {}, remove: async () => {}, list: async () => [left], lock: async () => null, nameHarness: async () => {}, unlock: async () => {} },
@@ -4645,22 +4707,24 @@ describe("run: the in-flight record a session leaves while it runs", () => {
 describe("run: r on a failed run", () => {
   const feed = (events: RunEvent[]) => events.reduce((state, event) => applyEvent(state, event, AT), emptyView);
   const press = (over: Partial<KeyModifiers> = {}): KeyModifiers => ({ ctrl: false, upArrow: false, downArrow: false, escape: false, ...over });
-  const recent = (outcome: OutcomeKind) =>
-    feed([
+  const recent = (outcome: OutcomeKind) => ({
+    kind: "recent" as const,
+    run: feed([
       { kind: "configured", agent: "a" },
-      outcome === "done" || outcome === "stopped"
+      outcome === "done"
         ? { kind: "done", agent: "a", claim: "c9", ms: 1000, costUsd: 0.1, turns: 1, message: "Finished." }
         : { kind: "failed", agent: "a", claim: "c9", outcome, ms: 1000, message: "It went wrong." },
-    ]).recent[0];
+    ]).recent[0],
+  });
 
-  it("163-S18: r is offered and taken only for a run whose harness ran and lost its ending", () => {
-    for (const outcome of ["failed", "timed-out", "unreadable"] as const) {
+  it("163-S18: r is offered and taken only for a run whose harness ran and was cut short, a stop included", () => {
+    for (const outcome of ["stopped", "failed", "timed-out", "killed", "unreadable"] as const) {
       const run = recent(outcome);
       expect(actionForKey("r", press(), run)).toEqual({ to: "resume" });
       expect(keyHints(run)).toContain("r — resume this run");
     }
-    for (const outcome of ["done", "stopped", "spawn-failed"] as const) {
-      const run = { ...recent(outcome), outcome };
+    for (const outcome of ["done", "spawn-failed"] as const) {
+      const run = recent(outcome);
       expect(actionForKey("r", press(), run)).toBeNull();
       expect(keyHints(run).join(" ")).not.toContain("resume");
     }
@@ -4721,7 +4785,7 @@ describe("run: r on a failed run", () => {
           return { work: [unit()], refused: [] };
         },
         // The unit fails, which is what makes it resumable from the view.
-        startSession: async () => ({ stdout: "", stderr: "boom", exitCode: 1, timedOut: false, stopped: false, signal: null, spawnProblem: null }),
+        startSession: async () => ({ stdout: "", stderr: "boom", exitCode: 1, timedOut: false, stoppedBy: null, windows: false, signal: null, spawnProblem: null }),
         prepareResume: async (target) => {
           order.push(`prepare ${target.agent} ${target.claim} ${target.workspace} ${target.cwd}`);
           return {
@@ -4783,7 +4847,7 @@ describe("run: r on a failed run", () => {
           claimed = true;
           return { work: [unit()], refused: [] };
         },
-        startSession: async () => ({ stdout: "", stderr: "boom", exitCode: 1, timedOut: false, stopped: false, signal: null, spawnProblem: null }),
+        startSession: async () => ({ stdout: "", stderr: "boom", exitCode: 1, timedOut: false, stoppedBy: null, windows: false, signal: null, spawnProblem: null }),
         prepareResume: async () => ({
           cancel: async () => {
             order.push("cancel");
@@ -4825,7 +4889,7 @@ describe("run: r on a failed run", () => {
           claimed = true;
           return { work: [unit()], refused: [] };
         },
-        startSession: async () => ({ stdout: "", stderr: "boom", exitCode: 1, timedOut: false, stopped: false, signal: null, spawnProblem: null }),
+        startSession: async () => ({ stdout: "", stderr: "boom", exitCode: 1, timedOut: false, stoppedBy: null, windows: false, signal: null, spawnProblem: null }),
         prepareResume: async () => {
           // The stop lands while the checks are still running.
           process.emit("SIGTERM", "SIGTERM");
@@ -4852,4 +4916,1234 @@ describe("run: r on a failed run", () => {
     expect(order).toEqual(["cancel"]);
     expect(captured.terminal).toEqual([]);
   });
+});
+
+describe("run: killing one running session", () => {
+  type RunDeps = import("../src/commands/run.ts").RunDeps;
+  type SessionEnding = import("../src/run/execute.ts").SessionEnding;
+  type StopReason = import("../src/run/execute.ts").StopReason;
+
+  const A = "3f2a0000-0000-4000-8000-00000000000a";
+  const B = "77e00000-0000-4000-8000-00000000000b";
+  const NOW = new Date(2026, 8, 4, 12, 4, 1).getTime();
+  const DOWN = "\u001b[B";
+  const ESC = "\u001b";
+  const feed = (events: RunEvent[], at: Date = AT) => events.reduce((state, event) => applyEvent(state, event, at), emptyView);
+  const press = (over: Partial<KeyModifiers> = {}): KeyModifiers => ({ ctrl: false, upArrow: false, downArrow: false, escape: false, ...over });
+  const start = (agent: string, claim: string): RunEvent => ({
+    kind: "start",
+    agent,
+    claim,
+    unitKind: "file-arrived",
+    seq: 8412,
+    workspace: "01-ideas",
+    file: "01-ideas/37-a-doctor-command.md",
+    brain: "markdown brain",
+    recordedAt: AT.toISOString(),
+  });
+  const settle = async () => {
+    for (let i = 0; i < 4; i += 1) await new Promise((r) => setTimeout(r, 25));
+  };
+  const until = async (done: () => boolean) => {
+    for (let i = 0; i < 400 && !done(); i += 1) await new Promise((r) => setTimeout(r, 5));
+    expect(done()).toBe(true);
+  };
+  const two = {
+    loadConfiguration: async () => ({
+      kind: "config" as const,
+      config: config({ "dev-bot-mdden": entry(), "spec-warden": entry({ id: "agent-2" }) }),
+    }),
+    roster: async () => [
+      { id: "agent-1", org_id: "o", display_name: "dev-bot-mdden", status: "active", bot_user_id: "u-agent-1" },
+      { id: "agent-2", org_id: "o", display_name: "spec-warden", status: "active", bot_user_id: "u-agent-2" },
+    ],
+  };
+
+  /**
+   * Sessions that run until they are stopped or finished by hand. A stopper ends
+   * its session a moment later rather than at once, as a real grace does, so a
+   * request can land while a session is ending.
+   */
+  const stoppable = () => {
+    const live = new Map<string, { reasons: StopReason[]; finish: () => void }>();
+    const startSession: RunDeps["startSession"] = (request) =>
+      new Promise<SessionEnding>((resolve) => {
+        const args = request.spawnable.args;
+        const claim = args[args.indexOf("--session-id") + 1];
+        const reasons: StopReason[] = [];
+        const ended = (over: Partial<SessionEnding>) =>
+          resolve({ stdout: "", stderr: "", exitCode: null, timedOut: false, stoppedBy: null, windows: false, signal: null, spawnProblem: null, ...over });
+        request.onStop?.((reason) => {
+          reasons.push(reason);
+          if (reasons.length > 1) return;
+          setTimeout(() => ended({ stoppedBy: reason === "kill" ? "person" : "runner", signal: "term" }), 10);
+        });
+        live.set(claim, { reasons, finish: () => ended({ stdout: good(), exitCode: 0 }) });
+      });
+    return { live, startSession };
+  };
+  const notes = () => captured.events.flatMap((e) => (e.kind === "note" ? [e.message] : []));
+  const ended = (claim: string) => captured.events.find((e) => (e.kind === "failed" || e.kind === "done") && e.claim === claim);
+
+  it("167-S1: a kill reaches only the stopper kept under its claim, with `kill`, and the other session keeps running", async () => {
+    const { live, startSession } = stoppable();
+    const running = drive({ ...two, isTTY: true, claim: async () => ({ work: [unit("dev-bot-mdden", A), unit("spec-warden", B)], refused: [] }), startSession });
+    await until(() => live.size === 2);
+    captured.handler!({ kind: "kill", agent: "dev-bot-mdden", claim: A });
+    expect(live.get(A)!.reasons).toEqual(["kill"]);
+    expect(live.get(B)!.reasons).toEqual([]);
+    await until(() => ended(A) !== undefined);
+    expect(ended(B)).toBeUndefined();
+    live.get(B)!.finish();
+    const driven = await running;
+    expect(driven.rows.map((row) => [(row as { claim: string }).claim, (row as { outcome: string }).outcome])).toEqual([
+      [A, "killed"],
+      [B, "done"],
+    ]);
+  });
+
+  it("167-S2: stopping the runner fires every stopper with `stop`, and both sessions end as `stopped`", async () => {
+    const { live, startSession } = stoppable();
+    const running = drive({ ...two, isTTY: true, claim: async () => ({ work: [unit("dev-bot-mdden", A), unit("spec-warden", B)], refused: [] }), startSession });
+    await until(() => live.size === 2);
+    process.emit("SIGTERM", "SIGTERM");
+    const driven = await running;
+    expect(live.get(A)!.reasons).toEqual(["stop"]);
+    expect(live.get(B)!.reasons).toEqual(["stop"]);
+    expect(driven.rows.map((row) => (row as { outcome: string }).outcome)).toEqual(["stopped", "stopped"]);
+  });
+
+  it("167-S3: a running row carries the claim its start named, and gives it up when the session ends either way", () => {
+    const running = feed([{ kind: "configured", agent: "a" }, start("a", A)]);
+    expect(running.agents[0]).toMatchObject({ state: "running", claim: A, startedAt: AT });
+    const failed = applyEvent(running, { kind: "failed", agent: "a", claim: A, outcome: "killed", ms: 1000, message: "You killed it." }, AT);
+    expect(failed.agents[0]).toMatchObject({ claim: null, startedAt: null });
+    const done = applyEvent(running, { kind: "done", agent: "a", claim: A, ms: 1000, costUsd: 0.1, turns: 1, message: "Done." }, AT);
+    expect(done.agents[0]).toMatchObject({ claim: null, startedAt: null });
+  });
+
+  it("167-S4: the cursor walks the running session first, then the recent runs", () => {
+    const view = feed([
+      { kind: "configured", agent: "a" },
+      { kind: "configured", agent: "b" },
+      { kind: "done", agent: "b", claim: "c1", ms: 1000, costUsd: 0.1, turns: 1, message: "Done." },
+      { kind: "failed", agent: "b", claim: "c2", outcome: "failed", ms: 1000, message: "No." },
+      start("a", A),
+    ]);
+    expect(cursorClaims(view)).toEqual([A, "c2", "c1"]);
+    const first = moveSelection(view, null, "older");
+    expect(first).toBe(A);
+    expect(pickedSession(view, first)).toMatchObject({ kind: "running", row: { agent: "a", claim: A } });
+    const second = moveSelection(view, first, "older");
+    expect(second).toBe("c2");
+    expect(moveSelection(view, second, "older")).toBe("c1");
+    expect(moveSelection(view, first, "newer")).toBeNull();
+  });
+
+  it("167-S5: the cursor stays on a session that ends, now on its run; k goes, and r comes if the outcome is resumable", () => {
+    const view = feed([{ kind: "configured", agent: "a" }, start("a", A)]);
+    const selection = moveSelection(view, null, "older");
+    expect(actionForKey("k", press(), pickedSession(view, selection))).toEqual({ to: "kill" });
+
+    const killed = applyEvent(view, { kind: "failed", agent: "a", claim: A, outcome: "killed", ms: 1000, message: "You killed it." }, AT);
+    const after = pickedSession(killed, selection);
+    expect(after).toMatchObject({ kind: "recent", run: { claim: A, outcome: "killed" } });
+    expect(actionForKey("k", press(), after)).toBeNull();
+    expect(actionForKey("r", press(), after)).toEqual({ to: "resume" });
+
+    const finished = applyEvent(view, { kind: "done", agent: "a", claim: A, ms: 1000, costUsd: 0.1, turns: 1, message: "Done." }, AT);
+    const done = pickedSession(finished, selection);
+    expect(done).toMatchObject({ kind: "recent", run: { claim: A, outcome: "done" } });
+    expect(actionForKey("r", press(), done)).toBeNull();
+  });
+
+  it("167-S6: k is neither drawn nor matched unless a running session that is not ending is picked", () => {
+    const view = feed([
+      { kind: "configured", agent: "a" },
+      { kind: "failed", agent: "a", claim: "c1", outcome: "failed", ms: 1000, message: "No." },
+      start("a", A),
+    ]);
+    for (const picked of [null, pickedSession(view, "c1")]) {
+      expect(actionForKey("k", press(), picked)).toBeNull();
+      expect(keyHints(picked).join(" ")).not.toContain("kill");
+    }
+    const running = pickedSession(view, A);
+    expect(keyHints(running)).toContain("k — kill this session");
+    const ending = pickedSession(view, A, new Set([A]));
+    expect(actionForKey("k", press(), ending)).toBeNull();
+    expect(keyHints(ending).join(" ")).not.toContain("kill");
+    expect(render(liveView(view, { now: NOW, keysActive: true, selection: null })).lastFrame()).not.toContain("kill this session");
+  });
+
+  it("167-S7: only y confirms; n, esc, k and p each close the question, send nothing, and esc leaves the cursor where it was", async () => {
+    const asked: ViewRequest[] = [];
+    const view = feed([{ kind: "configured", agent: "a" }, start("a", A)]);
+    const { lastFrame, stdin } = render(liveScreenFor(view, (request) => asked.push(request)));
+    await settle();
+    stdin.write(DOWN);
+    await settle();
+    for (const answer of ["n", ESC, "k", "p"]) {
+      stdin.write("k");
+      await settle();
+      expect(lastFrame() ?? "").toContain("y to kill, any other key to keep it.");
+      stdin.write(answer);
+      await settle();
+      expect(asked).toEqual([]);
+      expect(lastFrame() ?? "").not.toContain("y to kill");
+      expect(lastFrame() ?? "").toContain("The session you picked");
+    }
+    // Ctrl-C keeps the session as well, and still stops the runner.
+    stdin.write("k");
+    await settle();
+    stdin.write("\u0003");
+    await settle();
+    expect(asked).toEqual(["quit"]);
+    asked.length = 0;
+    stdin.write("k");
+    await settle();
+    stdin.write("y");
+    await settle();
+    expect(asked).toEqual([{ kind: "kill", agent: "a", claim: A }]);
+    // The row reads as ending, and k is not offered for it a second time.
+    expect(lastFrame() ?? "").toContain(ENDING_BY_YOU);
+    expect(lastFrame() ?? "").not.toContain("kill this session");
+  });
+
+  it("167-S8: the question names the agent, the short claim and how long the session has run", async () => {
+    const row = feed([{ kind: "configured", agent: "dev-bot-mdden" }, start("dev-bot-mdden", A)]).agents[0];
+    expect(killQuestion(row, AT.getTime() + 252_000)).toBe(
+      "Kill dev-bot-mdden's session (claim 3f2a…, running 4m12s)? y to kill, any other key to keep it.",
+    );
+
+    const view = feed([{ kind: "configured", agent: "dev-bot-mdden" }, start("dev-bot-mdden", A)], new Date(Date.now() - 252_000));
+    const { lastFrame, stdin } = render(liveScreenFor(view));
+    await settle();
+    stdin.write(DOWN);
+    await settle();
+    stdin.write("k");
+    await settle();
+    expect(lastFrame() ?? "").toMatch(/Kill dev-bot-mdden's session \(claim 3f2a…, running 4m1[23]s\)\?/);
+  });
+
+  it("167-S9: a question whose session ends first closes itself, says so, and a y afterwards sends nothing", async () => {
+    const asked: ViewRequest[] = [];
+    const view = feed([{ kind: "configured", agent: "a" }, start("a", A)]);
+    const { lastFrame, stdin, rerender } = render(liveScreenFor(view, (request) => asked.push(request)));
+    await settle();
+    stdin.write(DOWN);
+    await settle();
+    stdin.write("k");
+    await settle();
+    expect(lastFrame() ?? "").toContain("Kill a's session");
+    const over = applyEvent(view, { kind: "done", agent: "a", claim: A, ms: 1000, costUsd: 0.1, turns: 1, message: "Done." }, AT);
+    rerender(liveScreenFor(over, (request) => asked.push(request)));
+    await settle();
+    expect(lastFrame() ?? "").not.toContain("Kill a's session");
+    expect(lastFrame() ?? "").toContain(KILL_OUTRUN);
+    stdin.write("y");
+    await settle();
+    expect(asked).toEqual([]);
+  });
+
+  it("167-S10: a kill for a claim with no stopper is refused out loud, and nothing fires", async () => {
+    const { live, startSession } = stoppable();
+    const running = drive({ isTTY: true, claim: async () => ({ work: [unit("dev-bot-mdden", A)], refused: [] }), startSession });
+    await until(() => live.size === 1);
+    captured.handler!({ kind: "kill", agent: "dev-bot-mdden", claim: B });
+    expect(notes()).toContain("That session had already finished.");
+    expect(live.get(A)!.reasons).toEqual([]);
+    live.get(A)!.finish();
+    await running;
+  });
+
+  it("167-S11: a kill naming an agent that is not running that claim is refused, and nothing fires", async () => {
+    const { live, startSession } = stoppable();
+    const running = drive({ ...two, isTTY: true, claim: async () => ({ work: [unit("dev-bot-mdden", A), unit("spec-warden", B)], refused: [] }), startSession });
+    await until(() => live.size === 2);
+    captured.handler!({ kind: "kill", agent: "spec-warden", claim: A });
+    expect(notes()).toContain("That session had already finished.");
+    expect(live.get(A)!.reasons).toEqual([]);
+    expect(live.get(B)!.reasons).toEqual([]);
+    live.get(A)!.finish();
+    live.get(B)!.finish();
+    await running;
+  });
+
+  it("167-S12: a kill while the runner is stopping is refused, and the session ends as stopped rather than killed", async () => {
+    const { live, startSession } = stoppable();
+    const running = drive({ isTTY: true, claim: async () => ({ work: [unit("dev-bot-mdden", A)], refused: [] }), startSession });
+    await until(() => live.size === 1);
+    process.emit("SIGTERM", "SIGTERM");
+    captured.handler!({ kind: "kill", agent: "dev-bot-mdden", claim: A });
+    expect(notes()).toContain("The runner is stopping and is already ending every session.");
+    expect(live.get(A)!.reasons).toEqual(["stop"]);
+    const driven = await running;
+    expect(driven.rows).toEqual([expect.objectContaining({ claim: A, outcome: "stopped" })]);
+  });
+
+  it("167-S13: the first stop wins — a kill during a time-out's grace leaves it a time-out, and signals nothing more", async () => {
+    const { runSession } = await import("../src/run/execute.ts");
+    const { EventEmitter } = await import("node:events");
+    const sent: Array<[number, string]> = [];
+    const kill = vi.spyOn(process, "kill").mockImplementation(((pid: number, signal: string) => {
+      sent.push([pid, signal]);
+      return true;
+    }) as typeof process.kill);
+    try {
+      const child = Object.assign(new EventEmitter(), { pid: 424242, stdout: new EventEmitter(), stderr: new EventEmitter() });
+      let stopper: ((reason: StopReason) => void) | null = null;
+      const running = runSession(
+        {
+          spawnable: { command: "claude", args: [], env: {} },
+          cwd,
+          wallClockMs: 5,
+          graceMs: 60_000,
+          onStop: (given) => {
+            stopper = given;
+            return () => {};
+          },
+        },
+        { spawn: (() => child) as unknown as typeof import("node:child_process").spawn, isWindows: false },
+      );
+      await until(() => sent.length === 1);
+      stopper!("kill");
+      child.emit("close", null);
+      const ending = await running;
+      expect(ending).toMatchObject({ timedOut: true, stoppedBy: null, signal: "term" });
+      expect(sent).toEqual([[-424242, "SIGTERM"]]);
+      expect(readOutcome({ ...ending, credentialVariable: null }).kind).toBe("timed-out");
+    } finally {
+      kill.mockRestore();
+    }
+  });
+
+  it("167-S13, the other order: a wall clock running out during a kill's grace leaves it killed, and a stop then leaves it killed too", async () => {
+    const { runSession } = await import("../src/run/execute.ts");
+    const { EventEmitter } = await import("node:events");
+    const sent: Array<[number, string]> = [];
+    const kill = vi.spyOn(process, "kill").mockImplementation(((pid: number, signal: string) => {
+      sent.push([pid, signal]);
+      return true;
+    }) as typeof process.kill);
+    try {
+      const child = Object.assign(new EventEmitter(), { pid: 424244, stdout: new EventEmitter(), stderr: new EventEmitter() });
+      let stopper: ((reason: StopReason) => void) | null = null;
+      const running = runSession(
+        {
+          spawnable: { command: "claude", args: [], env: {} },
+          cwd,
+          wallClockMs: 20,
+          graceMs: 60_000,
+          onStop: (given) => {
+            stopper = given;
+            return () => {};
+          },
+        },
+        { spawn: (() => child) as unknown as typeof import("node:child_process").spawn, isWindows: false },
+      );
+      stopper!("kill");
+      // Past the wall clock, inside the kill's grace.
+      await new Promise((r) => setTimeout(r, 80));
+      stopper!("stop");
+      child.emit("close", null);
+      const ending = await running;
+      expect(ending).toMatchObject({ timedOut: false, stoppedBy: "person", signal: "term" });
+      expect(sent).toEqual([[-424244, "SIGTERM"]]);
+      expect(readOutcome({ ...ending, credentialVariable: null }).kind).toBe("killed");
+    } finally {
+      kill.mockRestore();
+    }
+  });
+
+  it("a second kill of a session already being killed is refused out loud, and its stopper is not fired again", async () => {
+    const { live, startSession } = stoppable();
+    const running = drive({ isTTY: true, claim: async () => ({ work: [unit("dev-bot-mdden", A)], refused: [] }), startSession });
+    await until(() => live.size === 1);
+    captured.handler!({ kind: "kill", agent: "dev-bot-mdden", claim: A });
+    captured.handler!({ kind: "kill", agent: "dev-bot-mdden", claim: A });
+    expect(notes()).toContain("That session is already ending.");
+    expect(live.get(A)!.reasons).toEqual(["kill"]);
+    const driven = await running;
+    expect(driven.rows).toEqual([expect.objectContaining({ claim: A, outcome: "killed" })]);
+  });
+
+  it("a kill that lands after the harness exited, while its pipes drain, still signals the group and relabels nothing", async () => {
+    const { runSession } = await import("../src/run/execute.ts");
+    const { EventEmitter } = await import("node:events");
+    const kill = vi.spyOn(process, "kill").mockImplementation((() => true) as typeof process.kill);
+    try {
+      const child = Object.assign(new EventEmitter(), { pid: 424243, stdout: new EventEmitter(), stderr: new EventEmitter() });
+      let stopper: ((reason: StopReason) => void) | null = null;
+      const running = runSession(
+        {
+          spawnable: { command: "claude", args: [], env: {} },
+          cwd,
+          wallClockMs: 60_000,
+          onStop: (given) => {
+            stopper = given;
+            return () => {};
+          },
+        },
+        { spawn: (() => child) as unknown as typeof import("node:child_process").spawn, isWindows: false },
+      );
+      child.stdout.emit("data", Buffer.from(good()));
+      child.emit("exit", 0, null);
+      // A straggler still holds the pipes, so the group is still there to end.
+      stopper!("kill");
+      stopper!("stop");
+      child.emit("close", 0);
+      const ending = await running;
+      expect(ending).toMatchObject({ stoppedBy: null, signal: null });
+      expect(kill.mock.calls).toEqual([[-424243, "SIGTERM"]]);
+      expect(readOutcome({ ...ending, credentialVariable: null }).kind).toBe("done");
+    } finally {
+      kill.mockRestore();
+    }
+  });
+
+  it("a late kill the straggler ignores is followed by SIGKILL after the grace, and still records no signal", async () => {
+    vi.useFakeTimers();
+    const { runSession } = await import("../src/run/execute.ts");
+    const { EventEmitter } = await import("node:events");
+    const kill = vi.spyOn(process, "kill").mockImplementation((() => true) as typeof process.kill);
+    try {
+      const child = Object.assign(new EventEmitter(), { pid: 424247, stdout: new EventEmitter(), stderr: new EventEmitter() });
+      let stopper: ((reason: StopReason) => void) | null = null;
+      const running = runSession(
+        {
+          spawnable: { command: "claude", args: [], env: {} },
+          cwd,
+          wallClockMs: 600_000,
+          graceMs: 30_000,
+          onStop: (given) => {
+            stopper = given;
+            return () => {};
+          },
+        },
+        { spawn: (() => child) as unknown as typeof import("node:child_process").spawn, isWindows: false },
+      );
+      child.stdout.emit("data", Buffer.from(good()));
+      child.emit("exit", 0, null);
+      stopper!("stop");
+      vi.advanceTimersByTime(30_000);
+      child.emit("close", 0);
+      const ending = await running;
+      expect(kill.mock.calls).toEqual([
+        [-424247, "SIGTERM"],
+        [-424247, "SIGKILL"],
+      ]);
+      expect(ending).toMatchObject({ stoppedBy: null, timedOut: false, signal: null });
+      expect(readOutcome({ ...ending, credentialVariable: null }).kind).toBe("done");
+    } finally {
+      kill.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("a late kill followed by the wall clock during its grace sends nothing after the session closed", async () => {
+    // The late stop's SIGKILL timer is the one that must not survive `close`:
+    // the group id is free for reuse by then. A second ending arriving during
+    // the grace would replace that timer, and `close` would clear only the new one.
+    vi.useFakeTimers();
+    const { runSession } = await import("../src/run/execute.ts");
+    const { EventEmitter } = await import("node:events");
+    const kill = vi.spyOn(process, "kill").mockImplementation((() => true) as typeof process.kill);
+    try {
+      const child = Object.assign(new EventEmitter(), { pid: 424244, stdout: new EventEmitter(), stderr: new EventEmitter() });
+      let stopper: ((reason: StopReason) => void) | null = null;
+      const running = runSession(
+        {
+          spawnable: { command: "claude", args: [], env: {} },
+          cwd,
+          wallClockMs: 60_000,
+          graceMs: 30_000,
+          onStop: (given) => {
+            stopper = given;
+            return () => {};
+          },
+        },
+        { spawn: (() => child) as unknown as typeof import("node:child_process").spawn, isWindows: false },
+      );
+      child.stdout.emit("data", Buffer.from(good()));
+      child.emit("exit", 0, null);
+      vi.advanceTimersByTime(50_000);
+      stopper!("kill");
+      vi.advanceTimersByTime(15_000);
+      child.emit("close", 0);
+      vi.advanceTimersByTime(60_000);
+      const ending = await running;
+      expect(kill.mock.calls).toEqual([[-424244, "SIGTERM"]]);
+      expect(ending).toMatchObject({ stoppedBy: null, timedOut: false, signal: null });
+      expect(readOutcome({ ...ending, credentialVariable: null }).kind).toBe("done");
+    } finally {
+      kill.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("on Windows a stop that lands after the harness exited sends no taskkill", async () => {
+    // `taskkill /T` walks the tree from the harness's pid, which is gone once it
+    // has exited: it reaches no straggler, and the pid is free to name an
+    // unrelated process whose whole tree `/F` would end.
+    const spawned: string[][] = [];
+    vi.resetModules();
+    vi.doMock("node:child_process", async (original) => {
+      const actual = await original<typeof import("node:child_process")>();
+      const { EventEmitter } = await import("node:events");
+      return {
+        ...actual,
+        spawn: ((command: string, args: string[]) => {
+          spawned.push([command, ...args]);
+          return new EventEmitter();
+        }) as unknown as typeof actual.spawn,
+      };
+    });
+    try {
+      const { runSession } = await import("../src/run/execute.ts");
+      const { EventEmitter } = await import("node:events");
+      const session = (pid: number) => {
+        const child = Object.assign(new EventEmitter(), { pid, stdout: new EventEmitter(), stderr: new EventEmitter() });
+        let stopper: ((reason: StopReason) => void) | null = null;
+        const running = runSession(
+          {
+            spawnable: { command: "claude", args: [], env: {} },
+            cwd,
+            wallClockMs: 60_000,
+            onStop: (given) => {
+              stopper = given;
+              return () => {};
+            },
+          },
+          { spawn: (() => child) as unknown as typeof import("node:child_process").spawn, isWindows: true },
+        );
+        return { child, running, stop: (reason: StopReason) => stopper!(reason) };
+      };
+
+      // A kill while the harness runs reaches it, which is what shows the stub is the one used.
+      const early = session(424245);
+      early.stop("kill");
+      early.child.emit("exit", null, null);
+      early.child.emit("close", null);
+      await early.running;
+      expect(spawned).toEqual([["taskkill", "/pid", "424245", "/T", "/F"]]);
+
+      const late = session(424246);
+      late.child.stdout.emit("data", Buffer.from(good()));
+      late.child.emit("exit", 0, null);
+      late.stop("kill");
+      late.child.emit("close", 0);
+      const ending = await late.running;
+      expect(spawned).toHaveLength(1);
+      expect(ending).toMatchObject({ stoppedBy: null, signal: null });
+    } finally {
+      vi.doUnmock("node:child_process");
+      vi.resetModules();
+    }
+  });
+
+  it("167-S14: a kill starts the agent's next queued unit at once, under its own claim, with no hold and no poll between", async () => {
+    const { live, startSession } = stoppable();
+    const running = drive({ isTTY: true, claim: async () => ({ work: [unit("dev-bot-mdden", A), unit("dev-bot-mdden", B)], refused: [] }), startSession });
+    await until(() => live.size === 1);
+    captured.handler!({ kind: "kill", agent: "dev-bot-mdden", claim: A });
+    await until(() => live.has(B));
+    const kinds = captured.events.map((e) => (e.kind === "start" || e.kind === "failed" ? `${e.kind} ${e.claim}` : e.kind));
+    const between = kinds.slice(kinds.indexOf(`failed ${A}`), kinds.indexOf(`start ${B}`));
+    expect(between).not.toContain("poll");
+    expect(between).not.toContain("phase");
+    expect(kinds.indexOf(`failed ${A}`)).toBeLessThan(kinds.indexOf(`start ${B}`));
+    live.get(B)!.finish();
+    const driven = await running;
+    expect(driven.rows.map((row) => [(row as { claim: string }).claim, (row as { outcome: string }).outcome])).toEqual([
+      [A, "killed"],
+      [B, "done"],
+    ]);
+  });
+
+  it("167-S15: with something queued, the question says the next unit will start right away", async () => {
+    const view = feed([{ kind: "configured", agent: "a" }, start("a", A), { kind: "queued", agent: "a", depth: 1 }]);
+    const { lastFrame, stdin } = render(liveScreenFor(view));
+    await settle();
+    stdin.write(DOWN);
+    await settle();
+    stdin.write("k");
+    await settle();
+    expect(lastFrame() ?? "").toContain("Its next queued unit will start right away.");
+    expect(killQuestion(view.agents[0], AT.getTime())).toContain(")? Its next queued unit will start right away. y to kill");
+  });
+
+  it("167-S16: with nothing queued, the question carries no queue sentence", async () => {
+    const view = feed([{ kind: "configured", agent: "a" }, start("a", A)]);
+    const { lastFrame, stdin } = render(liveScreenFor(view));
+    await settle();
+    stdin.write(DOWN);
+    await settle();
+    stdin.write("k");
+    await settle();
+    expect(lastFrame() ?? "").toContain("y to kill");
+    expect(lastFrame() ?? "").not.toContain("queued unit");
+    expect(killQuestion(view.agents[0], AT.getTime())).not.toContain("queued");
+  });
+
+  it("167-S17: the kill is said before the next unit's start, in the plain lines and on the live view", async () => {
+    const { live, startSession } = stoppable();
+    const running = drive({ isTTY: true, claim: async () => ({ work: [unit("dev-bot-mdden", A), unit("dev-bot-mdden", B)], refused: [] }), startSession });
+    await until(() => live.size === 1);
+    captured.handler!({ kind: "kill", agent: "dev-bot-mdden", claim: A });
+    await until(() => live.has(B));
+    live.get(B)!.finish();
+    await running;
+
+    const said = "killed dev-bot-mdden's session (claim 3f2a…); starting its next queued unit";
+    const noteAt = captured.events.findIndex((e) => e.kind === "note" && e.message === said);
+    const startAt = captured.events.findIndex((e) => e.kind === "start" && e.claim === B);
+    expect(noteAt).toBeGreaterThan(-1);
+    expect(noteAt).toBeLessThan(startAt);
+
+    const lines = captured.events.flatMap((event) => plainLine({ at: AT, event }) ?? []);
+    const plainNote = lines.findIndex((line) => line.includes(`note      ${said}`));
+    expect(plainNote).toBeGreaterThan(-1);
+    expect(plainNote).toBeLessThan(lines.findIndex((line) => line.includes("start     dev-bot-mdden  claim 77e0…")));
+
+    const onScreen = feed(captured.events.slice(0, startAt + 1));
+    expect(onScreen.note).toBe(said);
+    expect(onScreen.agents[0]).toMatchObject({ state: "running", claim: B });
+  });
+
+  it("167-S18: with nothing queued, the note names only the kill and nothing starts", async () => {
+    const { live, startSession } = stoppable();
+    const running = drive({ isTTY: true, claim: async () => ({ work: [unit("dev-bot-mdden", A)], refused: [] }), startSession });
+    await until(() => live.size === 1);
+    captured.handler!({ kind: "kill", agent: "dev-bot-mdden", claim: A });
+    await running;
+    expect(notes()).toContain("killed dev-bot-mdden's session (claim 3f2a…)");
+    expect(notes().join(" ")).not.toContain("starting its next queued unit");
+    expect(captured.events.filter((e) => e.kind === "start")).toHaveLength(1);
+  });
+
+  it("167-S19: an ending a person caused reads as killed, and says the session may have changed files", () => {
+    const within = readOutcome(ending({ stoppedBy: "person", signal: "term" }));
+    expect(within.kind).toBe("killed");
+    expect(within.message).toBe(`You killed this session before it finished. ${MAY_HAVE_CHANGED_FILES}`);
+    const after = readOutcome(ending({ stoppedBy: "person", signal: "kill" }));
+    expect(after.message).toBe(`You killed this session; it did not stop when asked and was ended after 30 s. ${MAY_HAVE_CHANGED_FILES}`);
+    const windows = readOutcome(ending({ stoppedBy: "person", signal: "kill", windows: true }));
+    expect(windows.message).toBe(`You killed this session; on Windows it is ended at once. ${MAY_HAVE_CHANGED_FILES}`);
+    expect(OUTCOME_KINDS).toContain("killed");
+  });
+
+  it("167-S20: a session the runner stopped prints as failed … stopped, not done, and its recent run says stopped", async () => {
+    const stoppedByRunner: RunDeps["startSession"] = async (request) =>
+      new Promise((resolve) => {
+        request.onStop?.(() =>
+          resolve({ stdout: "", stderr: "", exitCode: null, timedOut: false, stoppedBy: "runner", windows: false, signal: "term", spawnProblem: null }),
+        );
+        queueMicrotask(() => process.emit("SIGTERM", "SIGTERM"));
+      });
+    const plain = await drive({ startSession: stoppedByRunner });
+    const text = plain.out.join("\n");
+    expect(text).toMatch(/failed {4}dev-bot-mdden {2}claim c1f0 {2}stopped: The runner was stopping/);
+    expect(text).not.toContain("done      dev-bot-mdden");
+
+    await drive({ isTTY: true, startSession: stoppedByRunner });
+    expect(captured.events.find((e) => e.kind === "failed")).toMatchObject({ claim: "c1f0", outcome: "stopped" });
+    expect(captured.events.some((e) => e.kind === "done")).toBe(false);
+    expect(feed(captured.events).recent[0]).toMatchObject({ claim: "c1f0", outcome: "stopped" });
+  });
+
+  it("167-S21: on Windows no stop, time-out or kill says the session did not stop when asked", () => {
+    const said = [
+      readOutcome(ending({ stoppedBy: "runner", signal: "kill", windows: true })),
+      readOutcome(ending({ timedOut: true, signal: "kill", windows: true })),
+      readOutcome(ending({ stoppedBy: "person", signal: "kill", windows: true })),
+    ];
+    expect(said.map((outcome) => outcome.kind)).toEqual(["stopped", "timed-out", "killed"]);
+    for (const outcome of said) {
+      expect(outcome.message).not.toContain("did not stop when asked");
+      expect(outcome.message).toContain("on Windows");
+    }
+    // Elsewhere a SIGKILL after the grace is exactly what the sentence means.
+    expect(readOutcome(ending({ timedOut: true, signal: "kill" })).message).toContain("did not stop when asked");
+  });
+
+  it("167-S22: a killed session under --once exits with the code a done one gives", async () => {
+    const { live, startSession } = stoppable();
+    const running = drive({ isTTY: true, startSession });
+    await until(() => live.size === 1);
+    captured.handler!({ kind: "kill", agent: "dev-bot-mdden", claim: "c1f0" });
+    const killedRun = await running;
+    expect(killedRun.rows).toEqual([expect.objectContaining({ outcome: "killed" })]);
+    expect(killedRun.code).toBe((await drive()).code);
+    expect(killedRun.code).toBe(0);
+  });
+
+  it("167-S23: every run-log row carries the signal its outcome had", async () => {
+    for (const signal of ["term", "kill", null] as const) {
+      const outcome = readOutcome(ending({ stoppedBy: signal === null ? null : "person", signal, stdout: signal === null ? good() : "" }));
+      expect(logRow(unit(), outcome, AT, AT).signal).toBe(signal);
+      expect(JSON.parse(rowText(logRow(unit(), outcome, AT, AT))).signal).toBe(signal);
+    }
+    const { live, startSession } = stoppable();
+    const running = drive({ isTTY: true, startSession });
+    await until(() => live.size === 1);
+    captured.handler!({ kind: "kill", agent: "dev-bot-mdden", claim: "c1f0" });
+    expect((await running).rows).toEqual([expect.objectContaining({ outcome: "killed", signal: "term" })]);
+  });
+
+  it("167-S24: a killed run offers r, and r goes through the one resume path", async () => {
+    const run = pickedSession(
+      feed([{ kind: "configured", agent: "a" }, { kind: "failed", agent: "a", claim: A, outcome: "killed", ms: 1000, message: "You killed it." }]),
+      A,
+    );
+    expect(actionForKey("r", press(), run)).toEqual({ to: "resume" });
+    expect(keyHints(run)).toContain("r — resume this run");
+
+    const { waitFor } = await import("../src/commands/run.ts");
+    const { live, startSession } = stoppable();
+    let claimed = false;
+    const running = drive(
+      {
+        isTTY: true,
+        count: async () => ({ waiting: claimed ? 0 : 1, capped: false }),
+        claim: async () => {
+          claimed = true;
+          return { work: [unit()], refused: [] };
+        },
+        startSession,
+        sleep: waitFor,
+      },
+      { once: false },
+    );
+    await until(() => live.size === 1);
+    captured.handler!({ kind: "kill", agent: "dev-bot-mdden", claim: "c1f0" });
+    await until(() => ended("c1f0") !== undefined);
+    // The run's row is written before its ending is announced, so the session is
+    // resumable from here on.
+    captured.handler!({ kind: "resume", agent: "dev-bot-mdden", claim: "c1f0" });
+    await settle();
+    process.emit("SIGTERM", "SIGTERM");
+    const driven = await running;
+    expect(driven.rows).toEqual([expect.objectContaining({ outcome: "killed" })]);
+    expect(driven.resumesAsked).toEqual([expect.objectContaining({ agent: "dev-bot-mdden", claim: "c1f0", workspace: "01-ideas" })]);
+  });
+});
+
+describe("run: the cost of a session cut short", () => {
+  type Row = { costUsd: number | null; turns: number | null; costSource: string | null; turnsSource: string | null; usage?: unknown };
+  const byModel = { "claude-opus-5-5": { input: 1, output: 2, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0 } };
+  const cutShort = { stdout: "", stderr: "", exitCode: null, timedOut: false, stoppedBy: null, windows: false, signal: "kill" as const, spawnProblem: null };
+
+  function recorder(answer: () => Promise<import("../src/run/log.ts").RecoveredUsage | null>) {
+    const asked: Array<{ harness: string; claim: string; from: Date; to: Date }> = [];
+    const recoverUsage: import("../src/commands/run.ts").RunDeps["recoverUsage"] = async (harness, claim, from, to) => {
+      asked.push({ harness, claim, from, to });
+      return answer();
+    };
+    return { asked, recoverUsage };
+  }
+
+  it("reads a spawned session's transcript when its harness reported no cost, and records what it found", async () => {
+    const { asked, recoverUsage } = recorder(async () => ({ costUsd: 3.5, turns: 12, byModel }));
+    const { rows } = await drive({
+      startSession: async (request) => {
+        request.onSpawned?.(5150);
+        return cutShort;
+      },
+      recoverUsage,
+    });
+    expect(asked).toHaveLength(1);
+    expect(asked[0]).toMatchObject({ harness: "claude", claim: "c1f0" });
+    expect(asked[0].from.getTime()).toBeLessThanOrEqual(asked[0].to.getTime());
+    expect(rows[0] as Row).toMatchObject({ costUsd: 3.5, turns: 12, costSource: "transcript", turnsSource: "transcript", usage: byModel });
+  });
+
+  it("does not read the transcript when the harness reported a cost", async () => {
+    const { asked, recoverUsage } = recorder(async () => ({ costUsd: 99, turns: 99, byModel }));
+    const { rows } = await drive({
+      startSession: async (request) => {
+        request.onSpawned?.(5150);
+        return { ...cutShort, stdout: good(), exitCode: 0, signal: null };
+      },
+      recoverUsage,
+    });
+    expect(asked).toEqual([]);
+    expect(rows[0] as Row).toMatchObject({ costSource: "harness", turnsSource: "harness" });
+  });
+
+  it("does not look for a transcript of a session that never spawned", async () => {
+    const { asked, recoverUsage } = recorder(async () => ({ costUsd: 1, turns: 1, byModel }));
+    const { rows } = await drive({ startSession: async () => cutShort, recoverUsage });
+    expect(asked).toEqual([]);
+    expect(rows[0] as Row).toMatchObject({ costUsd: null, costSource: null });
+  });
+
+  it("still writes the row, with no cost, when the transcript cannot be read", async () => {
+    const { recoverUsage } = recorder(async () => {
+      throw new Error("EACCES");
+    });
+    const { rows } = await drive({
+      startSession: async (request) => {
+        request.onSpawned?.(5150);
+        return cutShort;
+      },
+      recoverUsage,
+    });
+    expect(rows).toHaveLength(1);
+    expect(rows[0] as Row).toMatchObject({ costUsd: null, costSource: null, turnsSource: null });
+  });
+});
+
+describe("run: runs that outlive the runner", () => {
+  type InFlightRecord = import("../src/run/inflight.ts").InFlightRecord;
+  type RunDeps = import("../src/commands/run.ts").RunDeps;
+  type Ending = Awaited<ReturnType<RunDeps["startSession"]>>;
+
+  const until = async (done: () => boolean) => {
+    for (let i = 0; i < 400 && !done(); i += 1) await new Promise((r) => setTimeout(r, 5));
+    expect(done()).toBe(true);
+  };
+  const settle = async () => {
+    for (let i = 0; i < 4; i += 1) await new Promise((r) => setTimeout(r, 25));
+  };
+  const press = (): KeyModifiers => ({ ctrl: false, upArrow: false, downArrow: false, escape: false });
+
+  const ending = (over: Partial<Ending> = {}): Ending => ({
+    stdout: "",
+    stderr: "",
+    exitCode: null,
+    timedOut: false,
+    stoppedBy: null,
+    windows: false,
+    signal: null,
+    spawnProblem: null,
+    ...over,
+  });
+  const sessionEnd = (over: Partial<Ending> = {}): SessionEnd => ({ ...ending(over), credentialVariable: null });
+  /** One ending per outcome a record is kept for, as the harness would leave it. */
+  const cutShort: Record<"stopped" | "failed" | "timed-out" | "unreadable" | "killed", Partial<Ending>> = {
+    stopped: { stoppedBy: "runner", signal: "term" },
+    failed: { stderr: "boom", exitCode: 1 },
+    "timed-out": { timedOut: true, signal: "term" },
+    unreadable: { exitCode: 0 },
+    killed: { stoppedBy: "person", signal: "term" },
+  };
+
+  const store = (initial: InFlightRecord[] = []) => {
+    const records = new Map(initial.map((record) => [record.claim, record]));
+    const log: string[] = [];
+    const inFlight: RunDeps["inFlight"] = {
+      write: async (record) => {
+        records.set(record.claim, record);
+        log.push(`write ${record.claim}`);
+      },
+      remove: async (claim) => {
+        records.delete(claim);
+        log.push(`remove ${claim}`);
+      },
+      list: async () => [...records.values()],
+      lock: async () => null,
+      nameHarness: async () => {},
+      unlock: async () => {},
+    };
+    return { records, log, inFlight };
+  };
+  const spawning = (over: Partial<Ending>): RunDeps["startSession"] => async (request) => {
+    request.onSpawned?.(5150);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    return ending(over);
+  };
+
+  const kept = (over: Partial<InFlightRecord> = {}): InFlightRecord => ({
+    claim: "3f2a0000-0000-4000-8000-000000000000",
+    agentEntryId: "agent-1",
+    agent: "dev-bot-mdden",
+    workspace: "02-assessments",
+    brain: "markdown brain",
+    cwd,
+    startedAt: "2026-09-04T09:00:00.000Z",
+    ownerPid: null,
+    harnessPid: null,
+    resumes: 0,
+    ended: "stopped",
+    endedAt: "2026-09-04T09:10:00.000Z",
+    ...over,
+  });
+
+  /** Run-log text as the real writer writes it, one row per claim and outcome, oldest first. */
+  const logText = (rows: Array<{ claim: string; outcome: keyof typeof cutShort | "done"; agent?: string }>) =>
+    rows
+      .map(({ claim, outcome, agent }, i) => {
+        const startedAt = new Date(Date.UTC(2026, 8, 4, 9, i * 10));
+        const endedAt = new Date(startedAt.getTime() + 90_000);
+        const read = readOutcome(sessionEnd(outcome === "done" ? { stdout: good(), exitCode: 0 } : cutShort[outcome]));
+        return rowText(logRow(unit(agent, claim), read, startedAt, endedAt));
+      })
+      .join("");
+
+  it("176-S1: a resumable ending keeps the record, disowned, with the ending on it", async () => {
+    for (const outcome of ["stopped", "failed", "timed-out", "unreadable"] as const) {
+      const { records, log, inFlight } = store();
+      await drive({ inFlight, startSession: spawning(cutShort[outcome]) });
+      expect(log).toEqual(["write c1f0", "write c1f0"]);
+      expect(records.get("c1f0")).toEqual(
+        expect.objectContaining({ claim: "c1f0", agentEntryId: "agent-1", ownerPid: null, harnessPid: null, ended: outcome, endedAt: expect.any(String) }),
+      );
+    }
+  });
+
+  it("176-S2: a session that ends done, or fails to spawn after it started, has its record removed", async () => {
+    const done = store();
+    await drive({ inFlight: done.inFlight, startSession: spawning({ stdout: good(), exitCode: 0 }) });
+    expect(done.log).toEqual(["write c1f0", "remove c1f0"]);
+    expect(done.records.size).toBe(0);
+
+    const spawnFailed = store();
+    await drive({
+      inFlight: spawnFailed.inFlight,
+      startSession: async (request) => {
+        request.onSpawned?.(5150);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        throw new Error("the spawner fell over");
+      },
+    });
+    expect(spawnFailed.log).toEqual(["write c1f0", "remove c1f0"]);
+  });
+
+  it("176-S3: a killed session keeps its record too", async () => {
+    const { records, inFlight } = store();
+    await drive({ inFlight, startSession: spawning(cutShort.killed) });
+    expect(records.get("c1f0")).toEqual(expect.objectContaining({ ownerPid: null, harnessPid: null, ended: "killed" }));
+  });
+
+  it("176-S4: the record is kept when the run log cannot be written, and the log's note is said", async () => {
+    const { records, inFlight } = store();
+    const driven = await drive({
+      inFlight,
+      recordRun: async () => {
+        throw new Error("ENOSPC: no space left on device");
+      },
+      startSession: spawning(cutShort.stopped),
+    });
+    expect(records.get("c1f0")).toEqual(expect.objectContaining({ ownerPid: null, ended: "stopped" }));
+    expect(driven.out.join("\n")).toContain("The run log could not be written: ENOSPC");
+  });
+
+  it("176-S7: the next run's note says a session was stopped with the runner, and points at mdbrain resume", async () => {
+    const { inFlight } = store([kept()]);
+    const driven = await drive({ inFlight, count: async () => ({ waiting: 0, capped: false }) });
+    const said = driven.out.filter((line) => line.includes("mdbrain resume"));
+    expect(said).toHaveLength(1);
+    expect(said[0]).toContain("dev-bot-mdden's session 3f2a… was stopped with the runner.");
+    expect(driven.spawned).toEqual([]);
+  });
+
+  it("176-S9: the view opens with the last five runs of the log, newest first, done ones included", async () => {
+    const claims = Array.from({ length: 8 }, (_, i) => `c${i}00`);
+    const text = logText(claims.map((claim, i) => ({ claim, outcome: i % 2 === 0 ? "done" : "failed" })));
+    await drive({ isTTY: true, readRunLog: async () => text, count: async () => ({ waiting: 0, capped: false }) });
+    expect(captured.initial.map((run) => run.claim)).toEqual(["c700", "c600", "c500", "c400", "c300"]);
+    expect(captured.initial.map((run) => run.outcome)).toEqual(["failed", "done", "failed", "done", "failed"]);
+    expect(captured.initial[1]).toEqual(
+      expect.objectContaining({ agent: "dev-bot-mdden", ms: 90_000, costUsd: expect.any(Number), message: expect.any(String), at: new Date(Date.UTC(2026, 8, 4, 10, 1, 30)) }),
+    );
+  });
+
+  it("176-S10: a row for an agent this run does not ask for is restored too", async () => {
+    const text = logText([{ claim: "c100", outcome: "done", agent: "ux-critic" }]);
+    await drive({ isTTY: true, readRunLog: async () => text, count: async () => ({ waiting: 0, capped: false }) });
+    expect(captured.initial).toEqual([expect.objectContaining({ agent: "ux-critic", claim: "c100" })]);
+  });
+
+  it("176-S11: a bad line is skipped and the parseable rows nearest the end are shown; no log, or one that cannot be read, is an empty list and nothing said", async () => {
+    const lines = logText(Array.from({ length: 6 }, (_, i) => ({ claim: `c${i}00`, outcome: "done" as const }))).split("\n");
+    lines.splice(4, 0, "{ not json", JSON.stringify({ claim: "c999", agent: "a", outcome: "exploded" }));
+    expect(parseRunLog(lines.join("\n")).map((row) => row.claim)).toEqual(["c000", "c100", "c200", "c300", "c400", "c500"]);
+    expect(restoredRecent(parseRunLog(lines.join("\n")), []).map((run) => run.claim)).toEqual(["c500", "c400", "c300", "c200", "c100"]);
+
+    const root = mkdtempSync(join(tmpdir(), "mdbrain-run-log-"));
+    try {
+      expect(await readRunLog({ platform: process.platform, home: root, env: { MDBRAIN_STATE_DIR: root } })).toBe("");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+
+    const unreadable = await drive({
+      isTTY: true,
+      readRunLog: async () => {
+        throw new Error("EACCES: permission denied");
+      },
+      count: async () => ({ waiting: 0, capped: false }),
+    });
+    expect(captured.initial).toEqual([]);
+    expect(captured.events.some((event) => event.kind === "note" && event.message.includes("EACCES"))).toBe(false);
+    expect(unreadable.code).toBe(0);
+  });
+
+  it("176-S12: the plain presenter prints nothing for a restored row", async () => {
+    const text = logText([{ claim: "c100", outcome: "failed" }]);
+    const without = await drive({ count: async () => ({ waiting: 0, capped: false }) });
+    const readRunLog = vi.fn(async () => text);
+    const restoring = await drive({ readRunLog, count: async () => ({ waiting: 0, capped: false }) });
+    const strip = (lines: string[]) => lines.map((line) => line.replace(/^\d\d:\d\d:\d\d /, ""));
+    expect(strip(restoring.out)).toEqual(strip(without.out));
+    // With nobody to show them to, the log is not read at all.
+    expect(readRunLog).not.toHaveBeenCalled();
+  });
+
+  it("r on a restored row whose record another window has since finished or dismissed resumes nothing, and says so", async () => {
+    const record = kept();
+    const text = logText([{ claim: record.claim, outcome: "stopped" }]);
+    const { waitFor } = await import("../src/commands/run.ts");
+    const { records, inFlight } = store([record]);
+    const running = drive(
+      { isTTY: true, inFlight, readRunLog: async () => text, count: async () => ({ waiting: 0, capped: false }), sleep: waitFor },
+      { once: false },
+    );
+    await until(() => captured.handler !== null);
+    expect(captured.initial[0].resumable).toBe(true);
+    records.delete(record.claim);
+
+    captured.handler!({ kind: "resume", agent: "dev-bot-mdden", claim: record.claim });
+    await settle();
+    process.emit("SIGTERM", "SIGTERM");
+    const driven = await running;
+    expect(driven.resumesAsked).toEqual([]);
+    expect(captured.events).toContainEqual(expect.objectContaining({ kind: "note", message: expect.stringContaining("no longer recorded on this machine") }));
+  });
+
+  it("r on a run this process kept, whose record another window has since finished or dismissed, resumes nothing, and says so", async () => {
+    const { waitFor } = await import("../src/commands/run.ts");
+    const { records, inFlight } = store();
+    let claimed = false;
+    const running = drive(
+      {
+        isTTY: true,
+        inFlight,
+        count: async () => ({ waiting: claimed ? 0 : 1, capped: false }),
+        claim: async () => {
+          claimed = true;
+          return { work: [unit()], refused: [] };
+        },
+        startSession: spawning(cutShort.failed),
+        sleep: waitFor,
+      },
+      { once: false },
+    );
+    await until(() => records.get("c1f0")?.ended === "failed");
+    await settle();
+    // Kept records are listed by `mdbrain resume` everywhere, so this is another window finishing it.
+    records.delete("c1f0");
+
+    captured.handler!({ kind: "resume", agent: "dev-bot-mdden", claim: "c1f0" });
+    await settle();
+    process.emit("SIGTERM", "SIGTERM");
+    const driven = await running;
+    expect(driven.resumesAsked).toEqual([]);
+    expect(captured.events).toContainEqual(expect.objectContaining({ kind: "note", message: expect.stringContaining("no longer recorded on this machine") }));
+  });
+
+  it("r on a run this process kept, whose record is still there, resumes it", async () => {
+    const { waitFor } = await import("../src/commands/run.ts");
+    const { records, inFlight } = store();
+    let claimed = false;
+    const running = drive(
+      {
+        isTTY: true,
+        inFlight,
+        count: async () => ({ waiting: claimed ? 0 : 1, capped: false }),
+        claim: async () => {
+          claimed = true;
+          return { work: [unit()], refused: [] };
+        },
+        startSession: spawning(cutShort.failed),
+        sleep: waitFor,
+      },
+      { once: false },
+    );
+    await until(() => records.get("c1f0")?.ended === "failed");
+    await settle();
+
+    captured.handler!({ kind: "resume", agent: "dev-bot-mdden", claim: "c1f0" });
+    await settle();
+    process.emit("SIGTERM", "SIGTERM");
+    const driven = await running;
+    expect(driven.resumesAsked).toEqual([expect.objectContaining({ agent: "dev-bot-mdden", claim: "c1f0" })]);
+  });
+
+  it("176-S13: r on a restored stopped row is offered, and reaches the one resume path with the record's workspace, brain and cwd", async () => {
+    const record = kept();
+    const text = logText([{ claim: record.claim, outcome: "stopped" }]);
+    const { waitFor } = await import("../src/commands/run.ts");
+    const { inFlight } = store([record]);
+    const running = drive(
+      { isTTY: true, inFlight, readRunLog: async () => text, count: async () => ({ waiting: 0, capped: false }), sleep: waitFor },
+      { once: false },
+    );
+    await until(() => captured.handler !== null);
+    const [run] = captured.initial;
+    expect(run).toEqual(expect.objectContaining({ claim: record.claim, outcome: "stopped", resumable: true }));
+    expect(actionForKey("r", press(), { kind: "recent", run })).toEqual({ to: "resume" });
+
+    captured.handler!({ kind: "resume", agent: "dev-bot-mdden", claim: record.claim });
+    await settle();
+    process.emit("SIGTERM", "SIGTERM");
+    const driven = await running;
+    expect(driven.resumesAsked).toEqual([
+      expect.objectContaining({ agent: "dev-bot-mdden", claim: record.claim, workspace: "02-assessments", brain: "markdown brain", cwd }),
+    ]);
+  });
+
+  it("176-S14: a restored failed row with no record for its claim offers no r", () => {
+    const [run] = restoredRecent(parseRunLog(logText([{ claim: "c100", outcome: "failed" }])), []);
+    expect(run.resumable).toBe(false);
+    expect(actionForKey("r", press(), { kind: "recent", run })).toBeNull();
+    expect(keyHints({ kind: "recent", run }).join(" ")).not.toContain("resume");
+  });
+
+  it("176-S15: a restored done row never offers r, whatever records exist", () => {
+    const record = kept();
+    const [run] = restoredRecent(parseRunLog(logText([{ claim: record.claim, outcome: "done" }])), [record]);
+    expect(run.resumable).toBe(false);
+    expect(actionForKey("r", press(), { kind: "recent", run })).toBeNull();
+  });
+
+  it("a restored row offers r only for a disowned record, and only for one still under its own agent's entry", async () => {
+    const record = kept();
+    const text = logText([{ claim: record.claim, outcome: "stopped" }]);
+    // Still owned by a live process: running somewhere, not something to resume.
+    expect(restoredRecent(parseRunLog(text), [kept({ ownerPid: 999 })])[0].resumable).toBe(false);
+
+    // The name now belongs to a different entry, which must not be handed this transcript.
+    await drive({
+      isTTY: true,
+      inFlight: store([kept({ agentEntryId: "agent-gone" })]).inFlight,
+      readRunLog: async () => text,
+      count: async () => ({ waiting: 0, capped: false }),
+    });
+    expect(captured.initial[0].resumable).toBe(false);
+  });
+
+  it("176-S16: a stopped session's message says it may have changed files, on every platform and signal", () => {
+    for (const over of [{ signal: "term" }, { signal: "kill" }, { windows: true, signal: "kill" }] as const) {
+      const read = readOutcome(sessionEnd({ stoppedBy: "runner", ...over }));
+      expect(read.kind).toBe("stopped");
+      expect(read.message).toContain(MAY_HAVE_CHANGED_FILES);
+      expect(read.message).toContain("It may have changed files before it stopped.");
+    }
+  });
+});
+
+describe("177: no limits unless asked for", () => {
+  it("177-S5: no turns flag, ever", () => {
+    for (const limits of [{}, { maxBudgetUsd: 20 }, { maxBudgetUsd: 20, wallClock: "2h" }, { wallClock: "30m" }]) {
+      expect(claudeHarness.build(invocation({ limits })).args).not.toContain("--max-turns");
+    }
+  });
+
+  it("177-S6: the budget flag only when one is set", () => {
+    expect(claudeHarness.build(invocation({ limits: {} })).args).not.toContain("--max-budget-usd");
+    expect(claudeHarness.build(invocation({ limits: { wallClock: "2h" } })).args).not.toContain("--max-budget-usd");
+    const args = claudeHarness.build(invocation({ limits: { maxBudgetUsd: 20 } })).args;
+    expect(args[args.indexOf("--max-budget-usd") + 1]).toBe("20");
+  });
+
+  it("177-S7: an agent with no wall clock is started with none, and one with 2h is started with 2 hours", async () => {
+    const asked: Array<number | null> = [];
+    const startSession = async (request: { wallClockMs: number | null }) => {
+      asked.push(request.wallClockMs);
+      return { stdout: good(), stderr: "", exitCode: 0, timedOut: false, stoppedBy: null, windows: false, signal: null, spawnProblem: null };
+    };
+    await drive({ startSession });
+    await drive({
+      loadConfiguration: async () => ({ kind: "config", config: config({ "dev-bot-mdden": entry({ limits: { wallClock: "2h" } }) }) }),
+      startSession,
+    });
+    expect(asked).toEqual([null, 2 * 3_600_000]);
+  });
+
+  it("177-S7: runSession arms no timer for a null wall clock, so the session ends on its own", async () => {
+    const { runSession } = await import("../src/run/execute.ts");
+    const { spawn } = await import("node:child_process");
+    const ended = await runSession(
+      {
+        spawnable: { command: process.execPath, args: ["-e", "setTimeout(() => {}, 300)"], env: { PATH: process.env.PATH ?? "" } },
+        cwd: process.cwd(),
+        wallClockMs: null,
+      },
+      { spawn, isWindows: process.platform === "win32" },
+    );
+    expect(ended.timedOut).toBe(false);
+    expect(ended.exitCode).toBe(0);
+  }, 20_000);
+
+  it("177-S8: a file still holding the old limits is reported once in the summary, and a file without them says nothing", async () => {
+    const { OLD_LIMITS_LINE } = await import("../src/run/loop.ts");
+    const old = await drive({ loadConfiguration: async () => ({ kind: "config", config: config(), oldLimits: true }) });
+    const said = old.out.filter((line) => line.includes("still has limits written by an earlier mdbrain"));
+    expect(said).toHaveLength(1);
+    expect(said[0]).toContain(OLD_LIMITS_LINE);
+    expect(said[0]).toContain("mdbrain configure");
+
+    const fresh = await drive();
+    expect(fresh.out.join("\n")).not.toContain("earlier mdbrain");
+  });
+
+  /** A session that runs for `hours` of fake time once spawned, and everything `run` printed. */
+  async function sessionOf(hours: number, limits: Record<string, string>) {
+    vi.useFakeTimers();
+    try {
+      const running = drive({
+        loadConfiguration: async () => ({ kind: "config", config: config({ "dev-bot-mdden": entry({ limits }) }) }),
+        startSession: async (request) => {
+          request.onSpawned?.(4242);
+          await new Promise((resolve) => setTimeout(resolve, hours * 3_600_000));
+          return { stdout: good(), stderr: "", exitCode: 0, timedOut: false, stoppedBy: null, windows: false, signal: null, spawnProblem: null };
+        },
+      });
+      // In hour steps, so a note that repeated on any timer of its own would be
+      // given every chance to.
+      for (let h = 0; h <= hours + 1; h += 1) await vi.advanceTimersByTimeAsync(3_600_000);
+      return (await running).out;
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
+  it("177-S9: a long session with no time limit is noted once, at 2 hours, naming the agent and the short claim", async () => {
+    const { NO_LIMIT_NOTE_MS, noLimitNote } = await import("../src/run/loop.ts");
+    expect(NO_LIMIT_NOTE_MS).toBe(2 * 3_600_000);
+    expect(noLimitNote("dev-bot-mdden", "3f2a0000-0000")).toBe("dev-bot-mdden's session (claim 3f2a…) has run 2h with no time limit set.");
+    // Past 4 hours, so a note repeated on a 2-hour interval would be said twice.
+    const out = await sessionOf(4.5, {});
+    const notes = out.filter((line) => line.includes("with no time limit set"));
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toContain("dev-bot-mdden's session (claim c1f0…) has run 2h");
+  }, 30_000);
+
+  it("177-S9: a session with no time limit that ends before 2 hours is never noted, even with run still up long after", async () => {
+    vi.useFakeTimers();
+    try {
+      const running = drive({
+        loadConfiguration: async () => ({ kind: "config", config: config({ "dev-bot-mdden": entry({ limits: {} }) }) }),
+        startSession: async (request) => {
+          request.onSpawned?.(4242);
+          await new Promise((resolve) => setTimeout(resolve, 3_600_000));
+          return { stdout: good(), stderr: "", exitCode: 0, timedOut: false, stoppedBy: null, windows: false, signal: null, spawnProblem: null };
+        },
+      });
+      for (let h = 0; h < 2; h += 1) await vi.advanceTimersByTimeAsync(3_600_000);
+      const { out } = await running;
+      // The note's timer is armed at spawn, so a session that has ended has to
+      // take it with it, or the note names a session that finished hours ago.
+      for (let h = 0; h < 3; h += 1) await vi.advanceTimersByTimeAsync(3_600_000);
+      expect(out.join("\n")).not.toContain("with no time limit set");
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 30_000);
+
+  it("177-S10: a session with a wall clock is not noted, however long it runs", async () => {
+    const out = await sessionOf(3.5, { wallClock: "4h" });
+    expect(out.join("\n")).not.toContain("with no time limit set");
+  }, 30_000);
 });

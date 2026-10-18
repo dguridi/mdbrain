@@ -65,6 +65,7 @@ import { diagnosisPath, redactSecrets } from "../run/diagnosis.ts";
 import { runLogPath } from "../run/log.ts";
 import { noConfigMessage, UNREADABLE_CONFIG_MESSAGE } from "./run.ts";
 import { readySession, type SessionOutcome } from "./session.ts";
+import { configureAt } from "./configure.ts";
 
 /**
  * How long `agents check` waits for the MCP server before calling a key
@@ -95,6 +96,11 @@ export interface AgentsDeps {
   browse: (plan: BrowserPlan) => Promise<void>;
   /** Shows what is about to happen and answers whether the person said yes. */
   confirm: (lines: string[]) => Promise<boolean>;
+  /**
+   * Opens configure's menu at one agent's rows, answering configure's exit code.
+   * What `e` hands over to: this command edits no setting itself.
+   */
+  configure: (openAt: string, context: CommandContext) => Promise<number>;
 }
 
 /** The roster read the refusal table rests on, made as the person. */
@@ -121,6 +127,7 @@ const defaultDeps = (): AgentsDeps => ({
   removeMcpFile: (name) => removeMcpConfig(name),
   browse: browseOnScreen,
   confirm: confirmOnScreen,
+  configure: configureAt,
 });
 
 /** The usage line, for a subcommand that is not one of the three or a name that is missing. */
@@ -250,9 +257,9 @@ function removalPlan(config: Config, name: string, prefix: string | null): strin
     `  ${mcpConfigPath(name)} is deleted`,
     prefix === null
       ? "  there is no key for it on this machine"
-      : `  the key ${shownKey(prefix)} is forgotten on this machine and revoked in markdown-den`,
+      : `  the key ${shownKey(prefix)} is forgotten on this machine and revoked in markdownbrain.ai`,
     "  a mdbrain run already running keeps the agent until it restarts",
-    `${name} itself stays in markdown-den; it is deleted only on its own page there.`,
+    `${name} itself stays in markdownbrain.ai; it is deleted only on its own page there.`,
   ];
 }
 
@@ -260,10 +267,10 @@ function removalPlan(config: Config, name: string, prefix: string | null): strin
 function renewalPlan(name: string, prefix: string | null): string[] {
   return [
     `Renewing ${name}'s connection key:`,
-    "  a new key is requested from markdown-den and stored on this machine",
+    "  a new key is requested from markdownbrain.ai and stored on this machine",
     prefix === null
       ? "  there is no key here for it to replace"
-      : `  then the key it replaces, ${shownKey(prefix)}, is revoked in markdown-den`,
+      : `  then the key it replaces, ${shownKey(prefix)}, is revoked in markdownbrain.ai`,
   ];
 }
 
@@ -317,7 +324,7 @@ async function removeAgent(
   if (prefix !== null) {
     lines.push(
       gone
-        ? `  nothing to revoke: ${name} is gone from markdown-den, and its keys with it`
+        ? `  nothing to revoke: ${name} is gone from markdownbrain.ai, and its keys with it`
         : `  ${retirementSentence(await retireKey(deps, token, entry.id, prefix))}`,
     );
   }
@@ -498,8 +505,15 @@ export async function runAgents(given: AgentsDeps, context: CommandContext): Pro
     const held = current.agents[name] ? prefixes[current.agents[name].id] : null;
     return held === "unreadable" || held === undefined ? null : held;
   };
+  // Set by `e`, and read once the browser has gone: the hand-over happens after
+  // the browser's screen is torn down, so two Ink trees never share the terminal.
+  let editing: string | null = null;
   await deps.browse({
     locations: locationLines(at),
+    canEdit: (name) => current.agents[name] !== undefined,
+    edit: (name) => {
+      editing = current.agents[name]?.id ?? null;
+    },
     rows: await rowsOf(config),
     check: async (name) => (await check(name, current)).verdict,
     renewPlan: (name) => renewalPlan(name, prefixOf(name)),
@@ -515,6 +529,7 @@ export async function runAgents(given: AgentsDeps, context: CommandContext): Pro
       return { lines: result.lines, rows: await rowsOf(now) };
     },
   });
+  if (editing !== null) return deps.configure(editing, context);
   return 0;
 }
 

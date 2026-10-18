@@ -74,7 +74,7 @@ export function parseArgv(argv: string[], valueFlags: Set<string> = new Set()): 
 export function renderHelp(commands: CommandSpec[], version: string): string {
   const width = Math.max(...commands.map((c) => `${c.name} ${c.usage ?? ""}`.trim().length));
   const lines = [
-    `mdbrain ${version} — sign in to markdown-den from the command line`,
+    `mdbrain ${version} — sign in to markdownbrain.ai from the command line`,
     "",
     "Usage: mdbrain <command> [options]",
     "",

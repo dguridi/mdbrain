@@ -25,7 +25,8 @@ import { DRAFT_VERSION, mcpFileNameFor, parseDraft, type ConfigureDraft } from "
 
 /** What was on disk, with the two failures told apart from absence. */
 export type LoadedConfig =
-  | { kind: "config"; config: Config }
+  /** `oldLimits`: the file still holds limits an earlier build wrote, which no longer apply. */
+  | { kind: "config"; config: Config; oldLimits?: boolean }
   | { kind: "none" }
   | { kind: "unreadable" }
   | { kind: "problem"; message: string };
@@ -46,7 +47,9 @@ export async function loadConfig(env?: PathEnv): Promise<LoadedConfig> {
     return { kind: "unreadable" };
   }
   const reading = parseConfig(text);
-  return reading.kind === "config" ? { kind: "config", config: reading.config } : { kind: "problem", message: reading.message };
+  return reading.kind === "config"
+    ? { kind: "config", config: reading.config, oldLimits: reading.oldLimits }
+    : { kind: "problem", message: reading.message };
 }
 
 /**

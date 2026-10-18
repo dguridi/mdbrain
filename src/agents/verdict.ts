@@ -196,15 +196,15 @@ function causeSentence(name: string, cause: RefusalCause, heldPrefix: string | n
     case "recreated":
       return "agent recreated under the same name: run mdbrain configure to carry this configuration over";
     case "deleted":
-      return `agent deleted in markdown-den: mdbrain agents remove ${name}`;
+      return `agent deleted in markdownbrain.ai: mdbrain agents remove ${name}`;
     case "not-owner":
       return "you no longer own this agent's organization";
     case "disabled":
-      return "agent disabled in markdown-den: enable it on the agent's page";
+      return "agent disabled in markdownbrain.ai: enable it on the agent's page";
     case "revoked":
       return `key revoked on ${cause.at.slice(0, 10)}: mdbrain agents renew ${name}`;
     case "unknown-key":
-      return `${heldPrefix === null ? "this key" : shownKey(heldPrefix)} is not one markdown-den knows for this agent (minted against another server?): mdbrain agents renew ${name}`;
+      return `${heldPrefix === null ? "this key" : shownKey(heldPrefix)} is not one markdownbrain.ai knows for this agent (minted against another server?): mdbrain agents renew ${name}`;
     case "unexplained":
       return "refused for a reason the runner cannot see";
   }

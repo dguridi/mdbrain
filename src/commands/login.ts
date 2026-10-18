@@ -1,6 +1,6 @@
 // `mdbrain login` — the browser round-trip, once.
 //
-// The browser is sent to **markdown-den's own sign-in page**, not to an identity
+// The browser is sent to **markdownbrain.ai's own sign-in page**, not to an identity
 // provider. That is what makes this work for every account: the app's form signs
 // somebody in with Google or with an email and a password, and an account with
 // no provider has nowhere else it could go. It also means the project's redirect
@@ -82,7 +82,7 @@ export const login: CommandSpec = {
     out("");
     out(`  ${url}`);
     out("");
-    out(`Waiting for markdown-den to hand the session to 127.0.0.1:${loopback.port} ...`);
+    out(`Waiting for markdownbrain.ai to hand the session to 127.0.0.1:${loopback.port} ...`);
     if (launch) openBrowser(url);
 
     let session;

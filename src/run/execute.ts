@@ -37,8 +37,17 @@ export interface SessionEnding {
   stderr: string;
   exitCode: number | null;
   timedOut: boolean;
-  /** The runner was asked to stop and ended this session early. */
-  stopped: boolean;
+  /**
+   * Who ended this session early, or null when nobody did: `runner` when the
+   * runner was stopping, `person` when somebody killed this one session.
+   */
+  stoppedBy: "runner" | "person" | null;
+  /**
+   * Whether it ran on Windows, where an early ending is `taskkill /F` at once and
+   * no polite signal is ever sent. Carried so the sentence about the ending never
+   * blames a harness for ignoring a signal it was not given.
+   */
+  windows: boolean;
   /** Which signal ended the session; null when neither the wall clock nor a stop fired. */
   signal: "term" | "kill" | null;
   /** Set when the process never started at all. */
@@ -46,8 +55,22 @@ export interface SessionEnding {
 }
 
 /**
- * Registers something to call when the runner is asked to stop, and answers how
- * to unregister it.
+ * Why a session is being ended early: the runner is stopping (`stop`), or a
+ * person picked this one session and killed it (`kill`). The two end the
+ * process identically; only what the ending is called differs.
+ */
+export type StopReason = "stop" | "kill";
+
+/** Ends one session early, for the reason given. A second call is a no-op. */
+export type Stopper = (reason: StopReason) => void;
+
+/**
+ * Registers something to call when the runner is asked to stop, or when a
+ * person kills this session, and answers how to unregister it.
+ *
+ * One call per session, so the caller can keep each stopper under the name of
+ * the session it ends — which is what lets one session be ended while every
+ * other keeps running.
  *
  * A session **must** be reachable this way, and it is not merely tidiness on
  * POSIX: the child is spawned `detached`, in its own process group, precisely so
@@ -56,15 +79,19 @@ export interface SessionEnding {
  * is given costs the same thing for a different reason. Without this the runner would exit
  * while its harness sessions carried on with no terminal and nobody watching.
  */
-export type StopRegistry = (stopper: () => void) => () => void;
+export type StopRegistry = (stopper: Stopper) => () => void;
 
 /** What one session needs from the outside world. */
 export interface SessionRequest {
   spawnable: Spawnable;
   cwd: string;
-  wallClockMs: number;
+  /**
+   * The runner's outer bound, or **null for none**: no timer is armed, and the
+   * session ends when the harness ends it, a person kills it, or the runner stops.
+   */
+  wallClockMs: number | null;
   graceMs?: number;
-  /** How this session learns the runner is stopping. */
+  /** How this session learns the runner is stopping, or that a person killed it. */
   onStop?: StopRegistry;
   /**
    * Called once the harness has actually started, with its pid.
@@ -172,7 +199,8 @@ export function runSession(request: SessionRequest, given: Partial<ExecuteDeps> 
         stderr: "",
         exitCode: null,
         timedOut: false,
-        stopped: false,
+        stoppedBy: null,
+        windows: deps.isWindows,
         signal: null,
         spawnProblem: (cause as Error).message,
       });
@@ -188,7 +216,7 @@ export function runSession(request: SessionRequest, given: Partial<ExecuteDeps> 
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
     let timedOut = false;
-    let stopped = false;
+    let stoppedBy: SessionEnding["stoppedBy"] = null;
     let signal: "term" | "kill" | null = null;
     let settled = false;
     let hardKill: ReturnType<typeof setTimeout> | null = null;
@@ -200,39 +228,73 @@ export function runSession(request: SessionRequest, given: Partial<ExecuteDeps> 
     /**
      * Ask the session to end, then insist.
      *
-     * The same two signals whether the wall clock fired or the runner is
-     * stopping: SIGTERM leaves the turn unfinished and resumable, and SIGKILL
+     * The same two signals whether the wall clock fired, the runner is
+     * stopping, or a person killed this session: SIGTERM leaves the turn unfinished and resumable, and SIGKILL
      * after the grace is for a harness that ignores it, which is exactly the
      * case both paths exist for. On Windows there is no polite signal, so the
      * grace is skipped and the outcome records that it was.
      */
-    const end = () => {
-      signal = deps.isWindows ? "kill" : "term";
+    const end = (record = true) => {
+      if (record) signal = deps.isWindows ? "kill" : "term";
       stopChild(child, deps.isWindows, deps.isWindows);
       if (deps.isWindows) return;
       hardKill = setTimeout(() => {
-        signal = "kill";
+        if (record) signal = "kill";
         stopChild(child, true, false);
       }, graceMs);
       hardKill.unref?.();
     };
 
-    const wallClock = setTimeout(() => {
-      timedOut = true;
-      end();
-    }, wallClockMs);
-    wallClock.unref?.();
+    // **The first early ending wins, whichever it is.** A session already being
+    // ended is not relabelled by a second reason arriving during its grace, and
+    // is not signalled a second time: a kill landing after the wall clock fired
+    // is still a time-out, and a wall clock running out during a kill's grace is
+    // still a kill. A stop that landed after the harness exited counts too: its
+    // group is already being ended, and a second `end` would replace the SIGKILL
+    // timer that `close` must clear, leaving the first one to fire at a group id
+    // that may by then belong to something else.
+    let lateStopSent = false;
+    const wallClock =
+      wallClockMs === null
+        ? null
+        : setTimeout(() => {
+            if (stoppedBy !== null || lateStopSent) return;
+            timedOut = true;
+            end();
+          }, wallClockMs);
+    wallClock?.unref?.();
 
-    const unregister = request.onStop?.(() => {
-      if (settled || stopped || timedOut) return;
-      stopped = true;
+    // **A harness that has exited finished on its own, but its group may not
+    // have.** Something it started can still hold its pipes, and with them the
+    // process group, open, and left alone that runs to the wall clock. So a stop
+    // arriving between exit and close still signals the group, once, and the
+    // outcome says what happened: the session ended on its own, so neither the
+    // reason nor the signal is recorded.
+    //
+    // **Not on Windows.** There is no group there: `taskkill /T` walks the tree
+    // down from the harness's pid, and once the harness has exited that pid
+    // names nothing, so the walk reaches no straggler. The pid is also free to
+    // be handed to an unrelated process by then, whose whole tree `/F` would end.
+    let exited = false;
+    child.on("exit", () => {
+      exited = true;
+    });
+    const unregister = request.onStop?.((reason) => {
+      if (settled || stoppedBy !== null || timedOut) return;
+      if (exited) {
+        if (lateStopSent || deps.isWindows) return;
+        lateStopSent = true;
+        end(false);
+        return;
+      }
+      stoppedBy = reason === "kill" ? "person" : "runner";
       end();
     });
 
     const settle = (exitCode: number | null, spawnProblem: string | null) => {
       if (settled) return;
       settled = true;
-      clearTimeout(wallClock);
+      if (wallClock !== null) clearTimeout(wallClock);
       // **Cleared, and this is not tidiness.** A child that answered SIGTERM
       // within the grace has exited and been reaped by the time this runs; an
       // orphaned timer firing afterwards sends SIGKILL to a process *group id*
@@ -246,7 +308,8 @@ export function runSession(request: SessionRequest, given: Partial<ExecuteDeps> 
         stderr: Buffer.concat(stderrChunks).toString("utf8"),
         exitCode,
         timedOut,
-        stopped,
+        stoppedBy,
+        windows: deps.isWindows,
         signal,
         spawnProblem,
       });

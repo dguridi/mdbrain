@@ -11,9 +11,9 @@
 // owner can revoke, and it is never enough to use. `shownKey` is the only way a
 // key reaches this text.
 
-import type { AgentEntry, Config } from "../config/schema.ts";
+import { hasLimits, type AgentEntry, type Config } from "../config/schema.ts";
 import { shownKey } from "../config/secrets.ts";
-import { harnessSentence, workSentence } from "../configure/questions.ts";
+import { harnessSentence, limitsLabel, workSentence } from "../configure/questions.ts";
 
 /** Where this machine keeps things, and what moved a root there. */
 export interface Locations {
@@ -49,7 +49,6 @@ export function locationLines(at: Locations): string[] {
  * @param heldPrefix the prefix of the key this machine holds for it, or null for none
  */
 export function agentLines(name: string, entry: AgentEntry, mcpPath: string, heldPrefix: string | null | "unreadable"): string[] {
-  const { maxTurns, maxBudgetUsd, wallClock } = entry.bounds;
   return [
     name,
     `  id ${entry.id}`,
@@ -57,7 +56,7 @@ export function agentLines(name: string, entry: AgentEntry, mcpPath: string, hel
     `  ${workSentence(entry)}`,
     `  ${harnessSentence(entry)}`,
     `  connection file ${mcpPath}`,
-    `  bounds: ${maxTurns} turns, $${maxBudgetUsd}, ${wallClock} a session`,
+    `  limits: ${limitsLabel(entry.limits)}${hasLimits(entry.limits) ? " a session" : ""}`,
     `  ${heldPrefix === null ? "no key on this machine" : heldPrefix === "unreadable" ? "the key store could not be read" : `key ${shownKey(heldPrefix)}`}`,
   ];
 }

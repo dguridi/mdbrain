@@ -1,4 +1,4 @@
-// The one markdown-den this CLI talks to.
+// The one markdownbrain.ai this CLI talks to.
 //
 // Production, and only production. There is no environment variable and no flag,
 // and that is a decision about scope rather than a limit anything imposes: one

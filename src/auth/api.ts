@@ -515,7 +515,7 @@ export interface KeyRow {
  * Owner-gated by the same `assert_agent_org_owner` as the mint, so a refusal
  * here is an answer about the person's rights and not about the key. It is what
  * lets a refused key be explained: the prefix this machine holds is either in the
- * list, revoked or not, or it is a key markdown-den does not know for the agent.
+ * list, revoked or not, or it is a key markdownbrain.ai does not know for the agent.
  */
 export async function listAgentKeys(accessToken: string, agentId: string): Promise<KeyRow[]> {
   const res = await fetch(`${PROJECT_URL}/rest/v1/rpc/list_agent_keys`, {

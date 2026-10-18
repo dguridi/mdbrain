@@ -13,6 +13,7 @@
 
 import type { Config } from "../config/schema.ts";
 import { runningPid, type InFlightRecord } from "../run/inflight.ts";
+import type { OutcomeKind } from "../run/outcome.ts";
 // The run view's own renderings, so a claim and an age read the same in both lists.
 import { agoText, shortClaim } from "../run/present.ts";
 
@@ -63,7 +64,41 @@ export function resumeRows(records: readonly InFlightRecord[], config: Config, i
     });
 }
 
-/** What a row's state says, in the column after the claim. */
+/**
+ * How a kept record's ending reads: in a picker row before its age, and in the
+ * start-up note after the session's name. Null for an outcome whose record is
+ * never kept. One table, so the two sentences cannot come to name an ending
+ * differently, and a new outcome is a type error here rather than a silent
+ * *never ended*.
+ */
+const ENDINGS: Record<OutcomeKind, { row: string; note: string } | null> = {
+  stopped: { row: "stopped", note: "was stopped with the runner" },
+  failed: { row: "failed", note: "failed" },
+  "timed-out": { row: "timed out", note: "timed out" },
+  killed: { row: "killed", note: "was killed" },
+  unreadable: { row: "unreadable", note: "ended with a result that could not be read" },
+  done: null,
+  "spawn-failed": null,
+};
+
+/**
+ * A record's ending as the two lists say it, or null when it should read as
+ * *never ended*: no ending was written, or a person resumed it since and the
+ * resume is the newer fact.
+ */
+function endingOf(record: InFlightRecord): { row: string; note: string } | null {
+  if (record.resumes > 0 || record.ended === null || record.endedAt === null) return null;
+  return ENDINGS[record.ended];
+}
+
+/**
+ * What a row's state says, in the column after the claim.
+ *
+ * **A record that says how its session ended says that**, aged from the ending.
+ * One with no ending was left by a runner that died, and *never ended* is the
+ * truth about it. A record a person has resumed says so first, because the
+ * resume is the newer fact and it is the one that did not end.
+ */
 export function stateText(row: ResumeRow, now: number): string {
   switch (row.state.kind) {
     case "running":
@@ -71,8 +106,12 @@ export function stateText(row: ResumeRow, now: number): string {
     case "unconfigured":
       return `${row.record.agent} is no longer configured here`;
     case "resumable": {
-      const ago = agoText(now - Date.parse(row.record.startedAt));
-      return row.record.resumes === 0 ? `started ${ago}, never ended` : `resumed ${ago}, never ended`;
+      const { record } = row;
+      if (record.resumes > 0) return `resumed ${agoText(now - Date.parse(record.startedAt))}, never ended`;
+      const ending = endingOf(record);
+      if (ending === null || record.endedAt === null) return `started ${agoText(now - Date.parse(record.startedAt))}, never ended`;
+      const ago = agoText(now - Date.parse(record.endedAt));
+      return record.ended === "stopped" ? `${ending.row} ${ago}, when the runner stopped` : `${ending.row} ${ago}`;
     }
   }
 }
@@ -120,8 +159,9 @@ export function unfinishedMessage(claim: string): string {
 }
 
 /**
- * What a runner says about the sessions a crash left behind, or null when there
- * are none.
+ * What a runner says about the sessions it can pick up, or null when there are
+ * none: the ones a crash left behind, and the ones kept after an ending that cut
+ * them short.
  *
  * One note and not one per session, because the live view keeps a single note
  * and a second would silently replace the first. It names the command and stops
@@ -133,8 +173,11 @@ export function leftBehindNote(records: readonly InFlightRecord[], isAlive: (pid
   if (ended.length === 0) return null;
   if (ended.length === 1) {
     const [only] = ended;
-    return `${only.agent}'s session ${shortClaim(only.claim)} started and never ended. \`mdbrain resume\` can pick it up.`;
+    const how = endingOf(only)?.note ?? (only.resumes > 0 ? "was resumed and never ended" : "started and never ended");
+    return `${only.agent}'s session ${shortClaim(only.claim)} ${how}. \`mdbrain resume\` can pick it up.`;
   }
   const names = [...new Set(ended.map((record) => record.agent))].join(", ");
-  return `${ended.length} sessions started and never ended (${names}). \`mdbrain resume\` can pick them up.`;
+  const kept = ended.filter((record) => endingOf(record) !== null).length;
+  const how = kept === 0 ? "started and never ended" : kept === ended.length ? "were cut short" : "were cut short or never ended";
+  return `${ended.length} sessions ${how} (${names}). \`mdbrain resume\` can pick them up.`;
 }

@@ -34,6 +34,15 @@
 // only ever be an agent already chosen. Nothing here refuses an empty second
 // list: a machine whose agents are all driven by hand is a configuration, and
 // `run` is where that is worth a sentence rather than here.
+//
+// **The sequence is walked once, on the first run, and a menu serves every run
+// after.** A person changing one setting on a configured machine wants that
+// setting, not twenty Enters past the others. So with a config, the screen opens
+// on a menu of the agents and the machine-wide rows, and each row is edited with
+// the walk's own question and judge; the walk is what a machine with nothing
+// configured gets. **Neither asks about limits on the way**: an agent starts with
+// none, and the one row that sets them is on the menu, where a person goes once
+// they have seen a session run.
 
 import { basename, dirname, isAbsolute, join, resolve as resolvePath, sep } from "node:path";
 import type { Agent, Membership, Organization } from "../auth/api.ts";
@@ -41,15 +50,15 @@ import { shownKey, type SecretBackend } from "../config/secrets.ts";
 import type { Retirement } from "../agents/retire.ts";
 import {
   CONFIG_VERSION,
-  DEFAULT_BOUNDS,
   SESSION_CAP_HARD_MAX,
   durationMs,
+  hasLimits,
   isVariableName,
   looksLikeSecret,
   newAgentMap,
   type AgentEntry,
-  type Bounds,
   type Config,
+  type Limits,
 } from "../config/schema.ts";
 
 /** The variable the one harness reads its own credential from. */
@@ -310,7 +319,7 @@ export function agentChoices(roster: RosterAgent[], existing: Config | null, sti
  * already under its new id.
  *
  * Every default the per-agent questions offer — the directory, the harness
- * variable, the bounds, whether it polls — is looked up by id, and the id is the
+ * variable, the limits, whether it polls — is looked up by id, and the id is the
  * one thing a carry-over changes. Swapping it once here is what lets every one
  * of those lookups find the old answers without each learning about carry-overs.
  * The entry is otherwise untouched, name included.
@@ -454,7 +463,8 @@ export interface AgentDefaults {
    * machine's key store, so there is nothing here for a person to decide.
    */
   connectionKeyVariable: string;
-  bounds: Bounds;
+  /** What bounds a session of it, which is nothing until somebody sets a limit from the menu. */
+  limits: Limits;
   /**
    * Whether `run` asks for this agent's work — the second selection's answer,
    * carried here because it decides which of the remaining questions exist.
@@ -486,7 +496,7 @@ export function agentDefaults(
     cwd: draft?.cwd ?? existing?.cwd ?? currentDirectory,
     harnessVariable: draft?.harnessVariable !== undefined ? draft.harnessVariable : harnessFromExisting,
     connectionKeyVariable: existing?.env.connectionKey ?? connectionKeyVariableFor(agentName),
-    bounds: draft?.bounds ?? existing?.bounds ?? DEFAULT_BOUNDS,
+    limits: draft?.limits ?? existing?.limits ?? {},
     // A starting value only. The answer is the second selection's, and the
     // caller overwrites this with it before the first question is asked.
     pollsWork: existing?.pollsWork ?? true,
@@ -505,7 +515,7 @@ export interface DraftAgent {
   id: string;
   cwd?: string;
   harnessVariable?: string | null;
-  bounds?: Bounds;
+  limits?: Limits;
 }
 
 /**
@@ -566,8 +576,9 @@ export function parseDraft(text: string): ConfigureDraft | null {
       const agent: DraftAgent = { id };
       if (typeof e.cwd === "string") agent.cwd = e.cwd;
       if (typeof e.harnessVariable === "string" || e.harnessVariable === null) agent.harnessVariable = e.harnessVariable;
-      const bounds = readDraftBounds(e.bounds);
-      if (bounds) agent.bounds = bounds;
+      // A draft's old `bounds` is read past, as the config's is.
+      const limits = readDraftLimits(e.limits);
+      if (limits) agent.limits = limits;
       agents[id] = agent;
     }
   }
@@ -581,11 +592,13 @@ export function parseDraft(text: string): ConfigureDraft | null {
   return read;
 }
 
-function readDraftBounds(v: unknown): Bounds | null {
-  if (typeof v !== "object" || v === null) return null;
-  const b = v as Record<string, unknown>;
-  if (typeof b.maxTurns !== "number" || typeof b.maxBudgetUsd !== "number" || typeof b.wallClock !== "string") return null;
-  return { maxTurns: b.maxTurns, maxBudgetUsd: b.maxBudgetUsd, wallClock: b.wallClock };
+function readDraftLimits(v: unknown): Limits | null {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return null;
+  const raw = v as Record<string, unknown>;
+  const limits: Limits = {};
+  if (typeof raw.maxBudgetUsd === "number" && raw.maxBudgetUsd > 0) limits.maxBudgetUsd = raw.maxBudgetUsd;
+  if (typeof raw.wallClock === "string" && durationMs(raw.wallClock) !== null) limits.wallClock = raw.wallClock;
+  return limits;
 }
 
 /**
@@ -675,22 +688,87 @@ export function judgeVariable(input: string, env: Record<string, string | undefi
   return { ok: true, value: name };
 }
 
-export function judgeTurns(input: string): Judgement<number> {
-  const n = Number(input.trim());
-  return Number.isInteger(n) && n >= 1 ? { ok: true, value: n } : { ok: false, problem: "A whole number of turns, at least 1." };
+/**
+ * Whether an answer to a limit means *no limit*: blank, or the word `none`.
+ *
+ * Both, because a limit is now off unless set, so the question has to be able
+ * to say off — blank is what Enter on an empty field gives, and `none` is what a
+ * person types when they mean it.
+ */
+function meansNone(text: string): boolean {
+  return text === "" || text.toLowerCase() === "none";
 }
 
-export function judgeBudget(input: string): Judgement<number> {
-  const n = Number(input.trim());
-  return Number.isFinite(n) && n > 0 ? { ok: true, value: n } : { ok: false, problem: "A positive number of dollars, such as 5." };
-}
-
-export function judgeDuration(input: string, minimumMs = 1): Judgement<string> {
+/** A session's budget in dollars, or null for none. */
+export function judgeBudget(input: string): Judgement<number | null> {
   const text = input.trim();
-  const ms = durationMs(text);
-  if (ms === null) return { ok: false, problem: "A duration with a unit, such as 30m or 90s — and no longer than 24 days." };
-  if (ms < minimumMs) return { ok: false, problem: `At least ${Math.round(minimumMs / 1000)}s.` };
+  if (meansNone(text)) return { ok: true, value: null };
+  const n = Number(text);
+  return Number.isFinite(n) && n > 0 ? { ok: true, value: n } : { ok: false, problem: "A positive number of dollars, such as 20, or blank for none." };
+}
+
+/** A session's wall clock as a duration with a unit, or null for none. */
+export function judgeDuration(input: string): Judgement<string | null> {
+  const text = input.trim();
+  if (meansNone(text)) return { ok: true, value: null };
+  if (durationMs(text) === null) return { ok: false, problem: "A duration with a unit, such as 2h or 90m, no longer than 24 days; or blank for none." };
   return { ok: true, value: text };
+}
+
+/**
+ * An agent's limits in the words the menu and `mdbrain agents` both use:
+ * `none`, `$20`, `2h`, or `$20 · 2h`.
+ */
+export function limitsLabel(limits: Limits): string {
+  if (!hasLimits(limits)) return "none";
+  const parts: string[] = [];
+  if (limits.maxBudgetUsd !== undefined) parts.push(`$${limits.maxBudgetUsd}`);
+  if (limits.wallClock !== undefined) parts.push(limits.wallClock);
+  return parts.join(" · ");
+}
+
+/** Which setting a menu row edits. */
+export type AgentRowKind = "cwd" | "harness" | "variable" | "polls" | "limits";
+
+/** One row of an agent's settings on the menu, with the value it holds now. */
+export interface AgentRow {
+  kind: AgentRowKind;
+  label: string;
+  value: string;
+}
+
+/**
+ * The rows an agent opens to on the menu, each holding its current value.
+ *
+ * **The rows follow the answers the way the walk's questions do**: *Key
+ * variable* only for an agent paid for by a key, and *Limits* only for one that
+ * polls, because a limit bounds an unattended session and an identity-only agent
+ * never has one. *Limits* is one row however many limits there are, so setting
+ * them is at most one question.
+ */
+export function agentRows(agent: AgentDefaults): AgentRow[] {
+  const rows: AgentRow[] = [
+    { kind: "cwd", label: "Directory", value: agent.cwd },
+    {
+      kind: "harness",
+      label: "Pays with",
+      value: agent.harnessVariable === null ? "this machine's own Claude Code account" : "an API key, held in an environment variable",
+    },
+  ];
+  if (agent.harnessVariable !== null) rows.push({ kind: "variable", label: "Key variable", value: agent.harnessVariable });
+  rows.push({ kind: "polls", label: "Polls for work", value: agent.pollsWork ? "yes" : "no, identity only" });
+  if (agent.pollsWork) rows.push({ kind: "limits", label: "Limits", value: limitsLabel(agent.limits) });
+  return rows;
+}
+
+/**
+ * One agent's line on the menu: whether it polls, where it runs, and — for a
+ * poller — its limits. An identity-only agent has no limits to show, since
+ * nothing it does is unattended.
+ */
+export function agentSummary(agent: AgentDefaults): string {
+  if (!agent.pollsWork) return `identity only · ${agent.cwd}`;
+  return `polls · ${agent.cwd} · ${hasLimits(agent.limits) ? limitsLabel(agent.limits) : "no limits"}`;
 }
 
 /** The runner's ceiling: blank keeps the server's, a number is held to the server's cap. */
@@ -753,10 +831,46 @@ export function assembleConfig(answers: Answers): Config {
       pollsWork: a.pollsWork,
       cwd: a.cwd,
       env: { harness: a.harnessVariable, connectionKey: a.connectionKeyVariable },
-      bounds: a.bounds,
+      limits: a.limits,
     };
   }
   return { version: CONFIG_VERSION, sessionsPerHour: answers.sessionsPerHour, agents };
+}
+
+/**
+ * How many things saving would change, as the menu counts them: each setting
+ * of an agent that differs, each agent added or removed, and the ceiling.
+ *
+ * **Matched by id and not by name**, so a rename accepted before the menu opened
+ * counts as the one change it is rather than as one agent removed and another
+ * added. The limits count as one setting, because they are one row.
+ */
+export function countChanges(before: Config | null, after: Config): number {
+  const was = new Map(Object.entries(before?.agents ?? {}).map(([name, entry]) => [entry.id, { name, entry }]));
+  let changes = 0;
+  const seen = new Set<string>();
+  for (const [name, entry] of Object.entries(after.agents)) {
+    seen.add(entry.id);
+    const old = was.get(entry.id);
+    if (!old) {
+      changes += 1;
+      continue;
+    }
+    if (old.name !== name) changes += 1;
+    if (old.entry.cwd !== entry.cwd) changes += 1;
+    if (old.entry.env.harness !== entry.env.harness) changes += 1;
+    if (old.entry.pollsWork !== entry.pollsWork) changes += 1;
+    if (limitsLabel(old.entry.limits) !== limitsLabel(entry.limits)) changes += 1;
+  }
+  for (const id of was.keys()) if (!seen.has(id)) changes += 1;
+  if ((before?.sessionsPerHour ?? null) !== after.sessionsPerHour) changes += 1;
+  return changes;
+}
+
+/** The count, as the menu's *Save and leave* row and the leave question say it. */
+export function changesLabel(count: number): string {
+  if (count === 0) return "no changes";
+  return count === 1 ? "1 change" : `${count} changes`;
 }
 
 /** What the write reports: where the config went, the MCP file each agent got, and the stale files removed. */
@@ -843,7 +957,7 @@ export function summaryLines(
     // list, and a person who declined the carry-over and then marked it has
     // configured it afresh, which the block above already described.
     if (config.agents[r.name]?.id !== r.id) {
-      lines.push(`  ${r.name} was dropped: it was deleted and created again in markdown-den, and you chose not to carry this configuration over.`);
+      lines.push(`  ${r.name} was dropped: it was deleted and created again in markdownbrain.ai, and you chose not to carry this configuration over.`);
     }
   }
   for (const path of report.removed) lines.push(`  removed ${path}, which belonged to an agent no longer configured here`);
@@ -874,18 +988,18 @@ export function summaryLines(
  * when the store has none, so a key pasted into the variable by hand would never
  * be reached.
  */
-function connectionKeyLine(outcome: KeyOutcome | undefined, variable: string, name: string): string {
+export function connectionKeyLine(outcome: KeyOutcome | undefined, variable: string, name: string): string {
   switch (outcome?.kind) {
     case "minted":
-      return "connection key requested from markdown-den and stored on this machine";
+      return "connection key requested from markdownbrain.ai and stored on this machine";
     case "renewed": {
-      const replaced = "a fresh connection key requested from markdown-den and stored on this machine, replacing the one that was here";
+      const replaced = "a fresh connection key requested from markdownbrain.ai and stored on this machine, replacing the one that was here";
       const { retirement } = outcome;
       if (retirement.kind === "revoked") return `${replaced}, which was revoked (${shownKey(retirement.prefix)})`;
       if (retirement.kind === "live") {
-        return `${replaced}; that key (${shownKey(retirement.prefix)}) is still live in markdown-den: revoke it on the agent's page`;
+        return `${replaced}; that key (${shownKey(retirement.prefix)}) is still live in markdownbrain.ai: revoke it on the agent's page`;
       }
-      return retirement.prefix === null ? replaced : `${replaced} (${shownKey(retirement.prefix)}), which markdown-den no longer had live`;
+      return retirement.prefix === null ? replaced : `${replaced} (${shownKey(retirement.prefix)}), which markdownbrain.ai no longer had live`;
     }
     case "held":
       return "connection key already stored on this machine, and kept (mdbrain configure --new-keys mints another)";
