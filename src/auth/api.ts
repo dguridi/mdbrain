@@ -257,8 +257,8 @@ export function listOrganizations(accessToken: string): Promise<Organization[]> 
   return selectRows<Organization>("organizations?select=id,name&order=name", accessToken);
 }
 
-export function listAgents(accessToken: string): Promise<Agent[]> {
-  return selectRows<Agent>("agents?select=id,org_id,display_name,status,bot_user_id&order=display_name", accessToken);
+export function listAgents(accessToken: string, signal?: AbortSignal): Promise<Agent[]> {
+  return selectRows<Agent>("agents?select=id,org_id,display_name,status,bot_user_id&order=display_name", accessToken, signal);
 }
 
 /** One organization membership of the signed-in account, with the role it holds there. */

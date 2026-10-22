@@ -46,6 +46,16 @@ import {
 } from "./channel.ts";
 import { emptyLedger, presenceKeyFor, presencePayload, reconcile, type PresenceLedger } from "./presence.ts";
 
+/**
+ * How long a join may go unanswered before it is treated as refused.
+ *
+ * Phoenix's own clients give a join ten seconds. Without a bound, a reply lost
+ * on the way back leaves the join in flight for as long as the connection lasts,
+ * and a join in flight is exactly what refuses every later ask — so one lost
+ * frame would keep the agent out of the roster until the socket happened to drop.
+ */
+export const JOIN_TIMEOUT_MS = 10_000;
+
 /** What a socket hands back, reduced to the two things this uses. */
 export interface SocketHandle {
   send(text: string): void;
@@ -176,7 +186,45 @@ interface AgentSocket {
    * an open socket on a channel it was refused from reading as working.
    */
   joinRefused: boolean;
+  /**
+   * Whether the refusal above is only a join that went unanswered.
+   *
+   * The two read the same everywhere but one place: leaving. A refused join holds
+   * no room, so there is nothing to leave. An unanswered one may have landed with
+   * only its reply lost, and an agent that moves on without leaving it stays in the
+   * old brain's roster until that room's token expires.
+   */
+  joinTimedOut: boolean;
+  /**
+   * Whether the server took away a room this socket was holding.
+   *
+   * The commonest cause is the access token reaching its expiry: Realtime closes
+   * the room at that second and leaves the connection up, so the transport is
+   * fine and the roster entry is gone. Counted against `open` for the same
+   * reason a refusal is, and against nothing else, so the state reads *retrying*
+   * rather than *connected* until the room is held again.
+   */
+  roomLost: boolean;
+  /**
+   * Whether a join of the current topic has ever been accepted on this socket.
+   *
+   * Per topic, and cleared when the agent moves to another brain, because a
+   * brain whose channel refuses this runner is presence that does not work there
+   * however well the last brain went.
+   *
+   * What tells a refusal that follows a lost room — a rejoin sent with the token
+   * that just expired — from a channel that was never going to let this runner
+   * in: the first is presence between attempts, the second is presence that
+   * does not work, and a person acts on the two differently.
+   */
+  everJoined: boolean;
   attempt: number;
+  /** Consecutive failed joins of the current topic, which paces its rejoin. */
+  rejoinAttempt: number;
+  /** A pending rejoin of the current topic, so there is never more than one. */
+  rejoinTimer: ReturnType<typeof setTimeout> | null;
+  /** The bound on the join in flight, cleared when it is answered. */
+  joinTimer: ReturnType<typeof setTimeout> | null;
   /** The brain topic this socket is joined to, or trying to join. */
   topic: string | null;
   joinRef: string | null;
@@ -217,10 +265,12 @@ export function presenceLink(options: PresenceLinkOptions): PresenceLink {
     if (closed) return;
     const state = aggregateConnection(
       [...sockets.values()].map((s) => ({
-        // A refused join is an open socket that will never put anything in a
-        // roster, so it counts as neither up now nor ever having been.
-        open: s.open && !s.joinRefused,
-        everOpen: s.everOpen && !s.joinRefused,
+        // A refused join is an open socket that puts nothing in a roster, so it
+        // is not up now — and, until a join has once been accepted, not ever
+        // having been either, since a channel that never let this runner in is
+        // presence that does not work rather than presence between attempts.
+        open: s.open && !s.joinRefused && !s.roomLost,
+        everOpen: s.everOpen && (!s.joinRefused || s.everJoined),
         settled: s.settled,
       })),
     );
@@ -229,11 +279,23 @@ export function presenceLink(options: PresenceLinkOptions): PresenceLink {
     options.onState(state);
   };
 
+  const stopRejoin = (socket: AgentSocket) => {
+    if (socket.rejoinTimer !== null) clearTimeout(socket.rejoinTimer);
+    socket.rejoinTimer = null;
+  };
+
+  const stopJoinTimer = (socket: AgentSocket) => {
+    if (socket.joinTimer !== null) clearTimeout(socket.joinTimer);
+    socket.joinTimer = null;
+  };
+
   const stopTimers = (socket: AgentSocket) => {
     if (socket.retryTimer !== null) clearTimeout(socket.retryTimer);
     if (socket.heartbeatTimer !== null) clearInterval(socket.heartbeatTimer);
     socket.retryTimer = null;
     socket.heartbeatTimer = null;
+    stopRejoin(socket);
+    stopJoinTimer(socket);
   };
 
   const send = (socket: AgentSocket, frame: Parameters<typeof encodeFrame>[0]) => {
@@ -241,11 +303,23 @@ export function presenceLink(options: PresenceLinkOptions): PresenceLink {
     socket.handle.send(encodeFrame(frame));
   };
 
-  /** Join the topic this socket is meant to be on, if it has one and is open. */
+  /**
+   * Join the topic this socket is meant to be on, if it has one and is open.
+   *
+   * **Never while a join of it is still unanswered.** Realtime does not refuse a
+   * second live join of one topic on one socket: it answers the newcomer `ok`
+   * and closes the incumbent, in a close frame that names only the topic. Read by
+   * the handler below as *the room I held is gone*, that close would rejoin,
+   * which evicts the join just made, which closes — a held room churning for the
+   * life of the process. A rejoin timer and a fresher token can both ask while a
+   * join is in flight, and this is the one place that can refuse them both.
+   */
   const joinTopic = (agent: string, socket: AgentSocket) => {
     if (socket.topic === null || !socket.open) return;
+    if (socket.joinRef !== null && !socket.joined && !socket.joinRefused) return;
     const identity = options.identities.get(agent);
     if (identity === undefined) return;
+    stopRejoin(socket);
     const key = presenceKeyFor(options.nonce, identity.userId);
     socket.payload = presencePayload(key, identity.userId, identity.name);
     socket.joinRef = nextRef();
@@ -253,12 +327,55 @@ export function presenceLink(options: PresenceLinkOptions): PresenceLink {
     // Cleared on every attempt, so a policy that changes is picked up by the next
     // reconnect rather than leaving the runner permanently pessimistic.
     socket.joinRefused = false;
+    socket.joinTimedOut = false;
     send(socket, joinFrame(socket.topic, key, accessToken, socket.joinRef));
+    stopJoinTimer(socket);
+    const ref = socket.joinRef;
+    socket.joinTimer = setTimeout(() => {
+      socket.joinTimer = null;
+      if (closed || socket.joinRef !== ref || socket.joined) return;
+      // Unanswered is read as refused, and asked again on the backoff. If the
+      // join did land and only its reply was lost, the next one is a duplicate the
+      // server answers `ok` while closing this one, and that close arrives while
+      // the new join is in flight, which is when a close is ignored.
+      socket.joinRefused = true;
+      socket.joinTimedOut = true;
+      scheduleRejoin(agent, socket);
+      sayState();
+    }, JOIN_TIMEOUT_MS);
+    socket.joinTimer.unref?.();
+  };
+
+  /**
+   * Ask for the current topic again, later.
+   *
+   * On the shared backoff, so a policy refusal is not asked about in a tight
+   * loop, and with whatever token the link holds when the timer fires — a
+   * fresher one handed over meanwhile is the remedy, and `refresh` does not wait
+   * for this timer to use it.
+   */
+  const scheduleRejoin = (agent: string, socket: AgentSocket) => {
+    if (closed || socket.rejoinTimer !== null) return;
+    socket.rejoinAttempt += 1;
+    socket.rejoinTimer = setTimeout(() => {
+      socket.rejoinTimer = null;
+      if (closed || socket.joined) return;
+      joinTopic(agent, socket);
+    }, backoffDelay(socket.rejoinAttempt, options.random()));
+    socket.rejoinTimer.unref?.();
   };
 
   const onJoined = (socket: AgentSocket) => {
     if (socket.topic === null || socket.joinRef === null) return;
     socket.joined = true;
+    socket.everJoined = true;
+    socket.roomLost = false;
+    socket.rejoinAttempt = 0;
+    // An accepted join undoes a give-up: the reply to a join `JOIN_TIMEOUT_MS`
+    // already wrote off can still arrive before the rejoin goes out, and a room
+    // held under a refusal mark reads as retrying for good and is never left.
+    socket.joinRefused = false;
+    socket.joinTimedOut = false;
     // Membership is tracked with an empty object, exactly as the browser and the
     // MCP server do: Presence answers *who is here*, and the data every reader
     // renders travels on the broadcast below.
@@ -286,15 +403,40 @@ export function presenceLink(options: PresenceLinkOptions): PresenceLink {
         if (frame === null) return;
         const reply = replyIn(frame);
         if (reply !== null && reply.ref === socket.joinRef) {
+          stopJoinTimer(socket);
           if (reply.ok) {
             onJoined(socket);
           } else {
-            // A refused join is left alone rather than retried in a loop: the
-            // reason is a policy or a topic name, and neither changes by asking
-            // again. It is marked instead, so the state stops claiming presence
-            // works on a socket that is up and useless.
+            // Marked, so the state stops claiming presence works on a socket
+            // that is up and useless, **and asked again on the backoff**. The
+            // reason is not reliably a policy or a topic name: the commonest one
+            // is a token that expired a moment before the join, and that answers
+            // differently once a fresher one is in hand.
             socket.joinRefused = true;
+            socket.joinTimedOut = false;
+            scheduleRejoin(agent, socket);
           }
+          sayState();
+          return;
+        }
+        // **A room the server closes under us is the case nothing else sees.** A
+        // token reaching its expiry does not drop the connection: Realtime closes
+        // the room at that second and the socket goes on answering heartbeats,
+        // so neither the reply path above nor `onClosed` below is reached, and
+        // the agent is out of the roster with every surface saying *connected*.
+        //
+        // **Only while the room is held.** A close that arrives while a join is
+        // in flight is about an earlier join — the server answers frames in the
+        // order they were sent, so the close of a room just left lands before the
+        // reply to the join that followed it — and reading it as this room lost
+        // would ask a second time for a room already being joined.
+        if (frame.event === "phx_error" || frame.event === "phx_close") {
+          if (socket.topic === null || frame.topic !== realtimeTopic(socket.topic)) return;
+          if (!socket.joined) return;
+          socket.joined = false;
+          socket.joinRef = null;
+          socket.roomLost = true;
+          scheduleRejoin(agent, socket);
           sayState();
           return;
         }
@@ -320,6 +462,10 @@ export function presenceLink(options: PresenceLinkOptions): PresenceLink {
         socket.settled = true;
         socket.joined = false;
         socket.joinRef = null;
+        // The re-dial joins whatever the topic is when it opens, so a room lost
+        // before the drop is the dial's to recover now, not a rejoin's.
+        socket.roomLost = false;
+        socket.rejoinAttempt = 0;
         stopTimers(socket);
         sayState();
         if (closed) return;
@@ -348,7 +494,13 @@ export function presenceLink(options: PresenceLinkOptions): PresenceLink {
       everOpen: false,
       settled: false,
       joinRefused: false,
+      joinTimedOut: false,
+      roomLost: false,
+      everJoined: false,
       attempt: 0,
+      rejoinAttempt: 0,
+      rejoinTimer: null,
+      joinTimer: null,
       topic: null,
       joinRef: null,
       joined: false,
@@ -371,13 +523,24 @@ export function presenceLink(options: PresenceLinkOptions): PresenceLink {
       const socket = sockets.get(action.agent);
       if (socket === undefined) continue;
       if (action.kind === "leave") {
-        if (socket.joined && socket.joinRef !== null && socket.topic !== null) {
+        // A join still in flight is left too, not only one that was answered: the
+        // server takes the two frames in order, so it joins and then leaves, and
+        // a join abandoned without a leave would hold a room nobody tracks. So is
+        // one given up as unanswered, which may have landed; one the server
+        // refused holds nothing to leave.
+        if (socket.joinRef !== null && (!socket.joinRefused || socket.joinTimedOut) && socket.topic !== null) {
           send(socket, leaveFrame(socket.topic, nextRef(), socket.joinRef));
         }
+        stopRejoin(socket);
+        stopJoinTimer(socket);
         socket.topic = null;
+        socket.everJoined = false;
         socket.joinRef = null;
         socket.joined = false;
         socket.joinRefused = false;
+        socket.joinTimedOut = false;
+        socket.roomLost = false;
+        socket.rejoinAttempt = 0;
         sayState();
         continue;
       }
@@ -405,9 +568,18 @@ export function presenceLink(options: PresenceLinkOptions): PresenceLink {
     },
     refresh(token) {
       accessToken = token;
-      for (const socket of sockets.values()) {
-        if (!socket.joined || socket.topic === null || socket.joinRef === null) continue;
-        send(socket, accessTokenFrame(socket.topic, token, nextRef(), socket.joinRef));
+      for (const [agent, socket] of sockets) {
+        if (socket.topic === null) continue;
+        if (socket.joined && socket.joinRef !== null) {
+          send(socket, accessTokenFrame(socket.topic, token, nextRef(), socket.joinRef));
+          continue;
+        }
+        // **A room wanted and not held is asked for at once.** A fresher token
+        // is exactly what makes a refused or lost room answer differently, so
+        // waiting out a backoff paced for a policy refusal would leave the agent
+        // out of the roster with the remedy already in hand. `joinTopic` drops
+        // the ask when a join is already in flight.
+        joinTopic(agent, socket);
       }
     },
     close() {

@@ -24,7 +24,7 @@ import {
   reconcile,
   type PresenceLedger,
 } from "../src/run/presence.ts";
-import { openWebSocket, presenceLink, type SocketFactory, type SocketHandlers } from "../src/run/realtime.ts";
+import { JOIN_TIMEOUT_MS, openWebSocket, presenceLink, type SocketFactory, type SocketHandlers } from "../src/run/realtime.ts";
 import { colorForBot } from "@markdown-den/collab-core";
 
 const BRAIN = "brain-1";
@@ -504,6 +504,275 @@ describe("the link, joining and publishing", () => {
       return (join?.payload as { config: { presence: { key: string } } }).config.presence.key;
     });
     expect(new Set(keys).size).toBe(2);
+    handle.close();
+  });
+});
+
+describe("the link, recovering a room it lost", () => {
+  const joinsOf = (socket: FakeSocket) => framesOf(socket).filter((frame) => frame.event === "phx_join");
+
+  function answerLastJoin(socket: FakeSocket, status: "ok" | "error" = "ok") {
+    const join = joinsOf(socket).at(-1);
+    expect(join).toBeDefined();
+    socket.handlers.onMessage(
+      JSON.stringify({ topic: join!.topic, ref: join!.ref, event: "phx_reply", payload: { status, response: {} } }),
+    );
+  }
+
+  /** What Realtime sends at the second a room's token expires: the topic, and nothing else. */
+  function closeRoom(socket: FakeSocket, event: "phx_close" | "phx_error" = "phx_close") {
+    socket.handlers.onMessage(JSON.stringify({ topic: `realtime:${TOPIC}`, event, ref: null, payload: {} }));
+  }
+
+  it("117-S36: a room the server closes under a held join is rejoined, with the token the link holds now", () => {
+    vi.useFakeTimers();
+    const { opened, factory } = fakeSockets();
+    const { states, handle } = link({}, factory);
+    opened[0].handlers.onOpen();
+    handle.want(new Map([["dev-bot", BRAIN]]));
+    answerLastJoin(opened[0]);
+    expect(states).toEqual(["connected"]);
+
+    closeRoom(opened[0]);
+    // The socket is still up, so nothing re-dials; what is said is that the
+    // roster entry is being retried rather than that presence is connected.
+    expect(states).toEqual(["connected", "retrying"]);
+    handle.refresh("token-2");
+    vi.advanceTimersByTime(JOIN_TIMEOUT_MS - 1);
+
+    const joins = joinsOf(opened[0]);
+    expect(joins).toHaveLength(2);
+    expect((joins[1].payload as { access_token: string }).access_token).toBe("token-2");
+    answerLastJoin(opened[0]);
+    // Tracked and announced again, so the entry is back in the roster.
+    expect(framesOf(opened[0]).filter((frame) => frame.event === "presence")).toHaveLength(2);
+    expect(broadcastsOf(opened[0])).toHaveLength(2);
+    expect(states.at(-1)).toBe("connected");
+    expect(opened).toHaveLength(1);
+    handle.close();
+  });
+
+  it("117-S36: a channel error is read the same way as a close", () => {
+    vi.useFakeTimers();
+    const { opened, factory } = fakeSockets();
+    const { handle } = link({}, factory);
+    opened[0].handlers.onOpen();
+    handle.want(new Map([["dev-bot", BRAIN]]));
+    answerLastJoin(opened[0]);
+    closeRoom(opened[0], "phx_error");
+    vi.advanceTimersByTime(JOIN_TIMEOUT_MS - 1);
+    expect(joinsOf(opened[0])).toHaveLength(2);
+    handle.close();
+  });
+
+  it("117-S36: a close about another brain's room is not this room lost", () => {
+    vi.useFakeTimers();
+    const { opened, factory } = fakeSockets();
+    const { handle } = link({}, factory);
+    opened[0].handlers.onOpen();
+    handle.want(new Map([["dev-bot", BRAIN]]));
+    answerLastJoin(opened[0]);
+    opened[0].handlers.onMessage(
+      JSON.stringify({ topic: `realtime:${channels.workspacePresence(OTHER)}`, event: "phx_close", ref: null, payload: {} }),
+    );
+    vi.advanceTimersByTime(JOIN_TIMEOUT_MS - 1);
+    expect(joinsOf(opened[0])).toHaveLength(1);
+    handle.close();
+  });
+
+  it("117-S37: a refused join is asked again on the backoff, and is accepted once the token is good", () => {
+    vi.useFakeTimers();
+    const { opened, factory } = fakeSockets();
+    const { states, handle } = link({}, factory);
+    opened[0].handlers.onOpen();
+    handle.want(new Map([["dev-bot", BRAIN]]));
+    answerLastJoin(opened[0], "error");
+    expect(states.at(-1)).toBe("unavailable");
+
+    vi.advanceTimersByTime(backoffDelay(1, 0));
+    expect(joinsOf(opened[0])).toHaveLength(2);
+    answerLastJoin(opened[0], "error");
+    // The second refusal waits longer than the first, so a refusal that is a
+    // policy is not asked about in a tight loop.
+    vi.advanceTimersByTime(backoffDelay(1, 0));
+    expect(joinsOf(opened[0])).toHaveLength(2);
+    vi.advanceTimersByTime(backoffDelay(2, 0));
+    expect(joinsOf(opened[0])).toHaveLength(3);
+    answerLastJoin(opened[0]);
+    expect(states.at(-1)).toBe("connected");
+    handle.close();
+  });
+
+  it("117-S37: a rejoin refused after the room was held reads as retrying, not as presence that does not work", () => {
+    // The rejoin that follows an expiry is sent with the token that just ran
+    // out, and is refused for it; that is presence between attempts.
+    vi.useFakeTimers();
+    const { opened, factory } = fakeSockets();
+    const { states, handle } = link({}, factory);
+    opened[0].handlers.onOpen();
+    handle.want(new Map([["dev-bot", BRAIN]]));
+    answerLastJoin(opened[0]);
+    closeRoom(opened[0]);
+    vi.advanceTimersByTime(JOIN_TIMEOUT_MS - 1);
+    answerLastJoin(opened[0], "error");
+    expect(states).toEqual(["connected", "retrying"]);
+    handle.close();
+  });
+
+  it("117-S37: a refusal in a brain the agent has just moved to reads as unavailable, however the last brain went", () => {
+    vi.useFakeTimers();
+    const { opened, factory } = fakeSockets();
+    const { states, handle } = link({}, factory);
+    opened[0].handlers.onOpen();
+    handle.want(new Map([["dev-bot", BRAIN]]));
+    answerLastJoin(opened[0]);
+    handle.want(new Map([["dev-bot", OTHER]]));
+    answerLastJoin(opened[0], "error");
+    expect(states.at(-1)).toBe("unavailable");
+    handle.close();
+  });
+
+  it("117-S37: a fresher token asks for a refused room at once, without waiting out the backoff", () => {
+    vi.useFakeTimers();
+    const { opened, factory } = fakeSockets();
+    const { handle } = link({}, factory);
+    opened[0].handlers.onOpen();
+    handle.want(new Map([["dev-bot", BRAIN]]));
+    answerLastJoin(opened[0], "error");
+    handle.refresh("token-2");
+    const joins = joinsOf(opened[0]);
+    expect(joins).toHaveLength(2);
+    expect((joins[1].payload as { access_token: string }).access_token).toBe("token-2");
+    // And the backoff's own attempt does not follow it with a third.
+    vi.advanceTimersByTime(JOIN_TIMEOUT_MS - 1);
+    expect(joinsOf(opened[0])).toHaveLength(2);
+    handle.close();
+  });
+
+  it("117-S38: a close that lands while a join is in flight asks for nothing, so no room is joined twice", () => {
+    // Realtime answers a second join of a held topic `ok` and closes the first,
+    // so a second ask here would evict the join it made and churn from then on.
+    vi.useFakeTimers();
+    const { opened, factory } = fakeSockets();
+    const { handle } = link({}, factory);
+    opened[0].handlers.onOpen();
+    handle.want(new Map([["dev-bot", BRAIN]]));
+    closeRoom(opened[0]);
+    handle.refresh("token-2");
+    vi.advanceTimersByTime(JOIN_TIMEOUT_MS - 1);
+    expect(joinsOf(opened[0])).toHaveLength(1);
+    answerLastJoin(opened[0]);
+    expect(framesOf(opened[0]).filter((frame) => frame.event === "presence")).toHaveLength(1);
+    handle.close();
+  });
+
+  it("117-S38: a join that is never answered is given up after a bound, so the socket is not wedged on it", () => {
+    vi.useFakeTimers();
+    const { opened, factory } = fakeSockets();
+    const { handle } = link({}, factory);
+    opened[0].handlers.onOpen();
+    handle.want(new Map([["dev-bot", BRAIN]]));
+    vi.advanceTimersByTime(JOIN_TIMEOUT_MS - 1);
+    expect(joinsOf(opened[0])).toHaveLength(1);
+    vi.advanceTimersByTime(1 + backoffDelay(1, 0));
+    expect(joinsOf(opened[0])).toHaveLength(2);
+    // The reply to the lost join arriving late is about a ref nobody holds.
+    replyToJoin(opened[0]);
+    expect(framesOf(opened[0]).filter((frame) => frame.event === "presence")).toHaveLength(0);
+    answerLastJoin(opened[0]);
+    expect(framesOf(opened[0]).filter((frame) => frame.event === "presence")).toHaveLength(1);
+    handle.close();
+  });
+
+  it("117-S38: a reply that lands after the give-up and before the rejoin holds the room, and reads as connected", () => {
+    vi.useFakeTimers();
+    const { opened, factory } = fakeSockets();
+    const { states, handle } = link({}, factory);
+    opened[0].handlers.onOpen();
+    handle.want(new Map([["dev-bot", BRAIN]]));
+    vi.advanceTimersByTime(JOIN_TIMEOUT_MS);
+    answerLastJoin(opened[0]);
+    expect(framesOf(opened[0]).filter((frame) => frame.event === "presence")).toHaveLength(1);
+    expect(states.at(-1)).toBe("connected");
+    // The rejoin the give-up scheduled is not sent over the room now held.
+    vi.advanceTimersByTime(60_000);
+    expect(joinsOf(opened[0])).toHaveLength(1);
+    expect(states.at(-1)).toBe("connected");
+    handle.close();
+  });
+
+  it("117-S38: a room held by a reply that landed after the give-up is left when the agent moves on", () => {
+    vi.useFakeTimers();
+    const { opened, factory } = fakeSockets();
+    const { handle } = link({}, factory);
+    opened[0].handlers.onOpen();
+    handle.want(new Map([["dev-bot", BRAIN]]));
+    vi.advanceTimersByTime(JOIN_TIMEOUT_MS);
+    answerLastJoin(opened[0]);
+    handle.want(new Map([["dev-bot", OTHER]]));
+    const leave = framesOf(opened[0]).find((frame) => frame.event === "phx_leave");
+    expect(leave?.topic).toBe(`realtime:${TOPIC}`);
+    handle.close();
+  });
+
+  it("117-S39: a join given up while still in flight is left, rather than holding a room nobody tracks", () => {
+    vi.useFakeTimers();
+    const { opened, factory } = fakeSockets();
+    const { handle } = link({}, factory);
+    opened[0].handlers.onOpen();
+    handle.want(new Map([["dev-bot", BRAIN]]));
+    handle.want(new Map([["dev-bot", OTHER]]));
+    const frames = framesOf(opened[0]);
+    const leave = frames.find((frame) => frame.event === "phx_leave");
+    expect(leave?.topic).toBe(`realtime:${TOPIC}`);
+    expect(leave?.join_ref).toBe(joinsOf(opened[0])[0].ref);
+    handle.close();
+  });
+
+  it("117-S39: a join given up as unanswered is left when the agent moves on before the rejoin, since it may have landed", () => {
+    vi.useFakeTimers();
+    const { opened, factory } = fakeSockets();
+    const { handle } = link({}, factory);
+    opened[0].handlers.onOpen();
+    handle.want(new Map([["dev-bot", BRAIN]]));
+    vi.advanceTimersByTime(JOIN_TIMEOUT_MS);
+    handle.want(new Map([["dev-bot", OTHER]]));
+    const leave = framesOf(opened[0]).find((frame) => frame.event === "phx_leave");
+    expect(leave?.topic).toBe(`realtime:${TOPIC}`);
+    expect(leave?.join_ref).toBe(joinsOf(opened[0])[0].ref);
+    handle.close();
+  });
+
+  it("117-S39: a join the server refused holds no room, so moving on sends no leave for it", () => {
+    vi.useFakeTimers();
+    const { opened, factory } = fakeSockets();
+    const { handle } = link({}, factory);
+    opened[0].handlers.onOpen();
+    handle.want(new Map([["dev-bot", BRAIN]]));
+    vi.advanceTimersByTime(JOIN_TIMEOUT_MS);
+    // The lost join's verdict arrives after all, and it is a refusal.
+    replyToJoin(opened[0], "error");
+    handle.want(new Map([["dev-bot", OTHER]]));
+    expect(framesOf(opened[0]).some((frame) => frame.event === "phx_leave")).toBe(false);
+    handle.close();
+  });
+
+  it("117-S39: a room the server already took is not left again", () => {
+    vi.useFakeTimers();
+    const { opened, factory } = fakeSockets();
+    const { handle } = link({}, factory);
+    opened[0].handlers.onOpen();
+    handle.want(new Map([["dev-bot", BRAIN]]));
+    answerLastJoin(opened[0]);
+    closeRoom(opened[0]);
+    handle.want(new Map([["dev-bot", OTHER]]));
+    expect(framesOf(opened[0]).some((frame) => frame.event === "phx_leave")).toBe(false);
+    // Nor asked for again once the agent has moved on.
+    vi.advanceTimersByTime(JOIN_TIMEOUT_MS - 1);
+    expect(joinsOf(opened[0]).map((frame) => frame.topic)).toEqual([
+      `realtime:${TOPIC}`,
+      `realtime:${channels.workspacePresence(OTHER)}`,
+    ]);
     handle.close();
   });
 });

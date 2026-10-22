@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { request } from "node:http";
 import { join } from "node:path";
@@ -7,7 +8,7 @@ import { login } from "../src/commands/login.ts";
 import { logout } from "../src/commands/logout.ts";
 import { whoami } from "../src/commands/whoami.ts";
 import { readySession } from "../src/commands/session.ts";
-import { loadSession } from "../src/auth/store.ts";
+import { loadSession, SESSION_LOCK_STALE_MS } from "../src/auth/store.ts";
 
 interface Call {
   url: string;
@@ -143,6 +144,64 @@ describe("the refresh every command does first", () => {
         const message = (outcome as { message: string }).message;
         expect(message).toContain("has not ended");
         expect(message).not.toContain("signed out from the app");
+      },
+    );
+  });
+});
+
+describe("a token refreshed ahead of its expiry", () => {
+  const nowS = () => Math.floor(Date.now() / 1000);
+  // Ten minutes left: usable by the ordinary margin, short of a twenty-minute one.
+  const closing = () => ({ accessToken: "ten-minutes-left", refreshToken: "rt", expiresAt: nowS() + 600 });
+
+  it("117-S41: a holder asking twenty minutes ahead gets a fresh token, and it is written back", async () => {
+    await withRuntime(
+      closing(),
+      () => json({ access_token: "a-fresh-one", refresh_token: "rt2", expires_at: nowS() + 3600 }),
+      async (calls) => {
+        expect(await readySession(1200)).toEqual({ kind: "ready", accessToken: "a-fresh-one" });
+        expect(calls).toHaveLength(1);
+        const stored = await loadSession();
+        expect(stored.kind === "session" && stored.session.accessToken).toBe("a-fresh-one");
+      },
+    );
+  });
+
+  it("117-S41: an early refresh that cannot reach the server keeps the token that still works", async () => {
+    await withRuntime(
+      closing(),
+      () => {
+        throw new TypeError("fetch failed");
+      },
+      async () => {
+        expect(await readySession(1200)).toEqual({ kind: "ready", accessToken: "ten-minutes-left" });
+      },
+    );
+  });
+
+  it("117-S41: an early refresh met by a server error or a rate limit keeps the token that still works", async () => {
+    for (const status of [503, 429]) {
+      await withRuntime(closing(), () => json({ error: "try later" }, status), async () => {
+        expect(await readySession(1200)).toEqual({ kind: "ready", accessToken: "ten-minutes-left" });
+      });
+    }
+  });
+
+  it("117-S41: an early refresh the server refuses still ends the session", async () => {
+    await withRuntime(closing(), () => json({ error: "invalid_grant" }, 400), async () => {
+      expect(await readySession(1200)).toMatchObject({ kind: "stop", reason: "refreshed-away" });
+    });
+  });
+
+  it("117-S41: a caller that asks for no margin refreshes nothing early", async () => {
+    await withRuntime(
+      closing(),
+      () => {
+        throw new Error("no refresh was due");
+      },
+      async (calls) => {
+        expect(await readySession()).toEqual({ kind: "ready", accessToken: "ten-minutes-left" });
+        expect(calls).toHaveLength(0);
       },
     );
   });
@@ -394,5 +453,109 @@ describe("the roster whoami asks for", () => {
     expect(printed).toContain("belong to an organization you own");
     expect(printed).not.toContain("dev-bot");
     expect(printed).not.toContain("not shown here");
+  });
+});
+
+describe("two commands renewing one login at once", () => {
+  const nowS = () => Math.floor(Date.now() / 1000);
+  const fresh = () => json({ access_token: "a-fresh-one", refresh_token: "rt2", expires_at: nowS() + 3600 });
+
+  it("202-S19: three commands that find the token expired refresh it once, and all three get the new one", async () => {
+    await withRuntime(EXPIRED, fresh, async (calls) => {
+      const outcomes = await Promise.all([readySession(), readySession(), readySession()]);
+      expect(outcomes).toEqual(Array(3).fill({ kind: "ready", accessToken: "a-fresh-one" }));
+      expect(calls.filter((c) => c.url.includes("grant_type=refresh_token"))).toHaveLength(1);
+      expect(existsSync(join(process.env.MDBRAIN_STATE_DIR!, "session.json.lock"))).toBe(false);
+    });
+  });
+
+  it("202-S20: a lock left by a process that died is taken over once it is stale", async () => {
+    await withRuntime(EXPIRED, fresh, async (calls) => {
+      const lock = join(process.env.MDBRAIN_STATE_DIR!, "session.json.lock");
+      writeFileSync(lock, "");
+      const old = (Date.now() - SESSION_LOCK_STALE_MS - 1000) / 1000;
+      utimesSync(lock, old, old);
+      expect(await readySession()).toEqual({ kind: "ready", accessToken: "a-fresh-one" });
+      expect(calls).toHaveLength(1);
+      expect(existsSync(lock)).toBe(false);
+    });
+  });
+
+  // Two processes that both find the lock stale must not both remove it: the
+  // second would remove the fresh lock the first made in its place.
+  it("202-S20: a stale lock another process is already taking over is left to it", async () => {
+    await withRuntime(EXPIRED, fresh, async (calls) => {
+      const lock = join(process.env.MDBRAIN_STATE_DIR!, "session.json.lock");
+      writeFileSync(lock, "the-dead-one");
+      const old = (Date.now() - SESSION_LOCK_STALE_MS - 1000) / 1000;
+      utimesSync(lock, old, old);
+      const guard = `${lock}.${createHash("sha256").update("the-dead-one").digest("hex").slice(0, 16)}`;
+      writeFileSync(guard, "");
+      const asked = readySession();
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(readFileSync(lock, "utf8")).toBe("the-dead-one");
+      expect(calls).toHaveLength(0);
+      // The other taker finishes: the stale lock and its guard both gone.
+      rmSync(lock);
+      rmSync(guard);
+      expect(await asked).toEqual({ kind: "ready", accessToken: "a-fresh-one" });
+      expect(calls).toHaveLength(1);
+    });
+  });
+
+  it("202-S20: a holder whose lock was taken over does not remove the lock that replaced it", async () => {
+    const state = mkdtempSync(join(tmpdir(), "mdbrain-cmd-"));
+    const previousState = process.env.MDBRAIN_STATE_DIR;
+    const originalFetch = globalThis.fetch;
+    process.env.MDBRAIN_STATE_DIR = state;
+    writeFileSync(join(state, "session.json"), JSON.stringify(EXPIRED));
+    const lock = join(state, "session.json.lock");
+    let answer: (r: Response) => void = () => {};
+    globalThis.fetch = (() => new Promise<Response>((resolve) => (answer = resolve))) as typeof fetch;
+    try {
+      const asked = readySession();
+      while (!existsSync(lock)) await new Promise((resolve) => setTimeout(resolve, 10));
+      // Another process judged this holder stale and took the lock over.
+      writeFileSync(lock, "another-taking");
+      answer(json({ access_token: "a-fresh-one", refresh_token: "rt2", expires_at: Math.floor(Date.now() / 1000) + 3600 }));
+      expect(await asked).toEqual({ kind: "ready", accessToken: "a-fresh-one" });
+      expect(readFileSync(lock, "utf8")).toBe("another-taking");
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (previousState === undefined) delete process.env.MDBRAIN_STATE_DIR;
+      else process.env.MDBRAIN_STATE_DIR = previousState;
+      rmSync(state, { recursive: true, force: true });
+    }
+  });
+
+  it("202-S20: a session file read mid-write is read again under the lock before it is called unreadable", async () => {
+    await withRuntime(undefined, fresh, async (calls) => {
+      const state = process.env.MDBRAIN_STATE_DIR!;
+      const lock = join(state, "session.json.lock");
+      // A refresh elsewhere holds the lock and has written half the file.
+      writeFileSync(join(state, "session.json"), '{"accessToken":"the-hold');
+      writeFileSync(lock, "the-writer");
+      const asked = readySession();
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      writeFileSync(join(state, "session.json"), JSON.stringify({ accessToken: "the-holders", refreshToken: "rt9", expiresAt: nowS() + 3600 }));
+      rmSync(lock);
+      expect(await asked).toEqual({ kind: "ready", accessToken: "the-holders" });
+      expect(calls).toHaveLength(0);
+    });
+  });
+
+  it("202-S20: a lock that is still fresh is waited on, and the pair its holder wrote is used without a second refresh", async () => {
+    await withRuntime(EXPIRED, fresh, async (calls) => {
+      const state = process.env.MDBRAIN_STATE_DIR!;
+      const lock = join(state, "session.json.lock");
+      writeFileSync(lock, "");
+      const asked = readySession();
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      // The holder finishes: a fresh pair on disk, and its lock gone.
+      writeFileSync(join(state, "session.json"), JSON.stringify({ accessToken: "the-holders", refreshToken: "rt9", expiresAt: nowS() + 3600 }));
+      rmSync(lock);
+      expect(await asked).toEqual({ kind: "ready", accessToken: "the-holders" });
+      expect(calls).toHaveLength(0);
+    });
   });
 });

@@ -54,7 +54,7 @@ export const SAID_LIMIT = 300;
  * **What it cannot catch, stated rather than implied:** a GoTrue refresh token is
  * opaque and looks like any other short random string, so no pattern separates
  * one from an ordinary word. This covers the shapes that *are* recognisable —
- * JWTs, the connection keys this product mints, the publishable and secret keys
+ * JWTs, the connection and member keys this product mints, the publishable and secret keys
  * of the API, and the token half of an echoed `Authorization` header — and the
  * length cap is what bounds the rest.
  */
@@ -62,6 +62,7 @@ export function redactSecrets(text: string): string {
   return text
     .replace(/eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]+/g, "[redacted]")
     .replace(/\bsmd_agent_[A-Za-z0-9_-]+/g, "[redacted]")
+    .replace(/\bmdb_key_[A-Za-z0-9_-]+/g, "[redacted]")
     .replace(/\bsb_(?:publishable|secret)_[A-Za-z0-9_-]{8,}/g, "[redacted]")
     .replace(/\b(Bearer|bearer)\s+[A-Za-z0-9._~+/=-]{8,}/g, "$1 [redacted]");
 }

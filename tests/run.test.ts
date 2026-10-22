@@ -1218,6 +1218,39 @@ describe("run: the command, driven end to end", () => {
     expect(args[args.indexOf("-p") + 1]).toBe("Read 01-ideas/37-a-doctor-command.md (id 9f1e) and triage it.");
   });
 
+  it("195-S14: the prompt reaches the harness with the mention manifest substituted into it", async () => {
+    // Driven through the session start rather than `renderPrompt`, because the
+    // manifest has to be handed over at the call site too: without it every
+    // `{mentions}` renders the sentence for a row that recorded none.
+    const mentioned: WorkUnit = {
+      ...unit("dev-bot-mdden", "c1f0", 8412, {
+        prompt: "Answer {mentions}",
+        file: null,
+        mentions: { thread: "t-a", comments: ["c-1", "c-2"], count: 2 },
+      }),
+      kind: "agent-mentioned",
+    };
+    const started = await drive({ claim: async () => ({ work: [mentioned], refused: [] }) });
+    const args = started.spawned[0].args;
+    expect(args[args.indexOf("-p") + 1]).toBe("Answer 2 mentions on thread `t-a`: comments `c-1` and `c-2`.");
+  });
+
+  it("185-S29: the prompt reaches the harness with the moment the firing was due substituted into it", async () => {
+    // Driven through the session start for the reason the mention case is: a
+    // call site that stopped handing `due` over would render nothing in its place.
+    const fired: WorkUnit = {
+      ...unit("dev-bot-mdden", "c1f0", 8412, {
+        prompt: "This round was due at {due}.",
+        file: null,
+        due: "2026-10-20T09:00:00+02:00",
+      }),
+      kind: "schedule",
+    };
+    const started = await drive({ claim: async () => ({ work: [fired], refused: [] }) });
+    const args = started.spawned[0].args;
+    expect(args[args.indexOf("-p") + 1]).toBe("This round was due at 2026-10-20T09:00:00+02:00.");
+  });
+
   it("105-S79: a prompt with an unrecognised placeholder starts no session and spends no money", async () => {
     let sessions = 0;
     const typo = await drive({
@@ -1552,6 +1585,132 @@ describe("run: the command, driven end to end", () => {
       },
     });
     expect(blind.presence.opened()?.identities.size).toBe(0);
+  });
+
+  it("117-S42: a roster that could not be read at startup is read again on the tick, and presence opens for it", async () => {
+    let reads = 0;
+    const signals: (AbortSignal | undefined)[] = [];
+    const late = await drive({
+      roster: async (_token, signal) => {
+        reads += 1;
+        signals.push(signal);
+        if (reads === 1) throw new Error("the roster timed out");
+        return [{ id: "agent-1", org_id: "o", display_name: "dev-bot-mdden", status: "active", bot_user_id: "u-agent-1" }];
+      },
+    });
+    expect(reads).toBe(2);
+    // The read the tick asks for is bounded, so one that hangs cannot hold the
+    // one-at-a-time guard for the life of the process.
+    expect(signals[1]).toBeInstanceOf(AbortSignal);
+    expect(late.presence.opened()?.identities.get("dev-bot-mdden")).toEqual({ userId: "u-agent-1", name: "dev-bot-mdden" });
+    // The empty link it replaced is closed rather than left beside it.
+    expect(late.presence.closes()).toBeGreaterThanOrEqual(2);
+  });
+
+  it("117-S42: a roster that was read is not read again, even when it names none of the agents", async () => {
+    let reads = 0;
+    await drive({
+      roster: async () => {
+        reads += 1;
+        return [];
+      },
+    });
+    expect(reads).toBe(1);
+  });
+
+  it("117-S42: once the roster has been read again, later ticks neither read it nor re-dial presence", async () => {
+    let reads = 0;
+    let ticks = 0;
+    let dials = 0;
+    await drive(
+      {
+        count: async () => {
+          ticks += 1;
+          return { waiting: 0, capped: false };
+        },
+        session: async () =>
+          ticks >= 3
+            ? { kind: "stop", reason: "sign-in", message: "Sign in with `mdbrain login`." }
+            : { kind: "ready", accessToken: "token" },
+        roster: async () => {
+          reads += 1;
+          if (reads === 1) throw new Error("the roster timed out");
+          return [{ id: "agent-1", org_id: "o", display_name: "dev-bot-mdden", status: "active", bot_user_id: "u-agent-1" }];
+        },
+        openPresence: () => {
+          dials += 1;
+          return { want: () => {}, refresh: () => {}, close: () => {} };
+        },
+      },
+      { once: false },
+    );
+    expect(ticks).toBeGreaterThanOrEqual(3);
+    expect(reads).toBe(2);
+    expect(dials).toBe(2);
+  }, 10_000);
+
+  it("117-S40: every session read asks for a token with more than one upkeep step left", async () => {
+    const { TOKEN_AHEAD_SECONDS, TOKEN_UPKEEP_MS } = await import("../src/commands/run.ts");
+    expect(TOKEN_AHEAD_SECONDS * 1_000).toBeGreaterThan(TOKEN_UPKEEP_MS);
+    const asked: (number | undefined)[] = [];
+    await drive({
+      session: async (ahead) => {
+        asked.push(ahead);
+        return { kind: "ready", accessToken: "token" };
+      },
+    });
+    expect(asked.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(asked)).toEqual(new Set([TOKEN_AHEAD_SECONDS]));
+  });
+
+  it("117-S40: the upkeep step between polls asks ahead too, since it is the read that hands the sockets their token", async () => {
+    // A single tick never reaches an upkeep step, and the upkeep is the read the
+    // margin exists for: the poll is three steps long.
+    const { TOKEN_AHEAD_SECONDS } = await import("../src/commands/run.ts");
+    const asked: (number | undefined)[] = [];
+    let ticks = 0;
+    await drive(
+      {
+        count: async () => {
+          ticks += 1;
+          return { waiting: 0, capped: false };
+        },
+        session: async (ahead) => {
+          asked.push(ahead);
+          if (ticks >= 2) return { kind: "stop", reason: "sign-in", message: "Sign in with `mdbrain login`." };
+          return { kind: "ready", accessToken: "token" };
+        },
+        sleep: async () => {},
+      },
+      { once: false },
+    );
+    // Startup, the first tick, and the upkeep steps of one interval at least.
+    expect(asked.length).toBeGreaterThan(ticks + 1);
+    expect(new Set(asked)).toEqual(new Set([TOKEN_AHEAD_SECONDS]));
+  }, 10_000);
+
+  it("117-S40: over a day of upkeep steps, no socket is ever handed a token that has expired", async () => {
+    // The real decision, stepped the way the wait is cut. With the ordinary
+    // sixty-second margin alone every refresh lands just after the expiry, which
+    // is the hourly close of the room this exists to prevent.
+    const { TOKEN_AHEAD_SECONDS, TOKEN_UPKEEP_MS } = await import("../src/commands/run.ts");
+    const { refreshAhead, sessionAction } = await import("../src/auth/session.ts");
+    const step = TOKEN_UPKEEP_MS / 1_000;
+    for (const drift of [0.05, 0.5, 2, 30]) {
+      let now = 1_000_000;
+      let session = { accessToken: "t", refreshToken: "rt", expiresAt: now + 3600 };
+      let refreshes = 0;
+      for (let at = 0; at < (24 * 3600) / step; at += 1) {
+        now += step + drift;
+        const late = sessionAction(session, now).kind === "refresh";
+        expect(late, `drift ${drift}s, step ${at}`).toBe(false);
+        if (refreshAhead(session, now, TOKEN_AHEAD_SECONDS)) {
+          session = { ...session, expiresAt: now + 3600 };
+          refreshes += 1;
+        }
+      }
+      expect(refreshes).toBeGreaterThanOrEqual(24);
+    }
   });
 
   it("hands the socket the same fresh token each poll, since it outlives one by days", async () => {

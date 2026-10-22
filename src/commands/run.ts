@@ -110,6 +110,21 @@ const RUN_COMMAND = "mdbrain run";
 const LISTEN_LOOKUP_TIMEOUT_MS = 5_000;
 
 /**
+ * How long a roster read asked again on the tick may take before it is dropped.
+ *
+ * Bounded and aborted for the reason the brain lookup is: a read that never
+ * settles would hold the one-at-a-time guard for the life of the process, so the
+ * retry that exists because startup could not read the roster would itself stop
+ * ever asking.
+ */
+const ROSTER_AGAIN_TIMEOUT_MS = 10_000;
+
+/** Who each agent in a roster is, by name: what a presence payload carries. */
+function identitiesOf(agents: readonly { display_name: string; bot_user_id: string }[]): Map<string, AgentIdentity> {
+  return new Map(agents.map((agent) => [agent.display_name, { userId: agent.bot_user_id, name: agent.display_name }]));
+}
+
+/**
  * The longest either socket may be left holding one access token.
  *
  * **The sockets are refreshed on the tick, and that is only safe while the poll
@@ -125,7 +140,21 @@ const LISTEN_LOOKUP_TIMEOUT_MS = 5_000;
  * anything. It is not a clock of its own: it is the loop's own wait, cut into
  * lengths that cannot outlive a credential — three of them to an interval.
  */
-const TOKEN_UPKEEP_MS = 15 * 60_000;
+export const TOKEN_UPKEEP_MS = 15 * 60_000;
+
+/**
+ * How much life a token must have left for the runner to keep holding it.
+ *
+ * **One upkeep step and a margin, because the sockets are only handed a token at
+ * a step boundary.** Realtime closes a room at the exact second its token
+ * expires, and the ordinary sixty-second margin is shorter than a step: a token
+ * minted at one boundary is still usable at the next three and has already
+ * expired by the fourth, so every refresh would land just after the close it was
+ * meant to prevent, and every session running across the hour would lose its
+ * roster entry. Refreshing once less than this remains puts the next boundary,
+ * and the next tick, inside the token's life whatever the clock did between them.
+ */
+export const TOKEN_AHEAD_SECONDS = (TOKEN_UPKEEP_MS + 5 * 60_000) / 1_000;
 
 /**
  * How many finished runs the runner remembers well enough to resume from the
@@ -397,7 +426,7 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
   // Read once here so a signed-out runner refuses before it draws anything;
   // the tick reads it again each poll for the token, which is where a session
   // that ends mid-run is caught.
-  const session = await deps.session();
+  const session = await deps.session(TOKEN_AHEAD_SECONDS);
   if (session.kind === "stop") {
     // Deliberately no inline login, unlike `configure`: this is the command a
     // service manager starts, and a browser opening on a machine nobody is
@@ -414,14 +443,12 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
   // Who each agent *is*, which is what a presence payload carries. Empty when
   // the roster could not be read — and an empty one is why a runner that started
   // anyway publishes nothing rather than publishing a guess.
-  const identities = new Map<string, AgentIdentity>();
+  let identities = new Map<string, AgentIdentity>();
   try {
     const agents = await deps.roster(session.accessToken);
     roster = rosterView(agents);
     rosterById = new Map(agents.map((a) => [a.display_name, a.id]));
-    for (const agent of agents) {
-      identities.set(agent.display_name, { userId: agent.bot_user_id, name: agent.display_name });
-    }
+    identities = identitiesOf(agents);
   } catch (cause) {
     const refused = cause instanceof AuthError ? signInAgainMessage(cause.status, RUN_COMMAND) : null;
     if (refused) {
@@ -570,31 +597,56 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
   //
   // **Nothing about this can end the run.** A socket that will not connect costs
   // the roster dot and nothing else, because work still arrives entirely by poll.
-  let presence: PresenceLink;
-  try {
-    presence = deps.openPresence({
-      url: socketUrl(PROJECT_URL, ANON_KEY),
-      accessToken: session.accessToken,
-      identities: new Map([...identities].filter(([agent]) => startup.asking.includes(agent))),
-      nonce: deps.presenceNonce(),
-      onState: (state) => {
-        if (presenting) say({ kind: "connection", state });
-      },
-      now: () => deps.now().getTime(),
-      random: Math.random,
-    });
-  } catch (cause) {
-    // A connection that could not even be built is the same fact as one that
-    // will not dial, and is answered the same way: one line, and the run goes
-    // on. This is the only place the rule has to be enforced rather than
-    // followed, because everything past construction reports rather than throws.
-    presence = silentLink;
-    say({
-      kind: "note",
-      message:
-        `Presence could not be started: ${(cause as Error).message}. Agents will not appear in a roster; work still arrives by poll.`,
-    });
-  }
+  //
+  // The nonce is drawn once, here, because a link opened again later for a roster
+  // that could not be read at startup is still this process's session: two keys
+  // for one runner would be two roster entries for one agent.
+  const nonce = deps.presenceNonce();
+  const dialPresence = (token: string, who: ReadonlyMap<string, AgentIdentity>): PresenceLink => {
+    try {
+      return deps.openPresence({
+        url: socketUrl(PROJECT_URL, ANON_KEY),
+        accessToken: token,
+        identities: new Map([...who].filter(([agent]) => startup.asking.includes(agent))),
+        nonce,
+        onState: (state) => {
+          if (presenting) say({ kind: "connection", state });
+        },
+        now: () => deps.now().getTime(),
+        random: Math.random,
+      });
+    } catch (cause) {
+      // A connection that could not even be built is the same fact as one that
+      // will not dial, and is answered the same way: one line, and the run goes
+      // on. This is the only place the rule has to be enforced rather than
+      // followed, because everything past construction reports rather than throws.
+      say({
+        kind: "note",
+        message:
+          `Presence could not be started: ${(cause as Error).message}. Agents will not appear in a roster; work still arrives by poll.`,
+      });
+      return silentLink;
+    }
+  };
+  let presence: PresenceLink = dialPresence(session.accessToken, identities);
+  /**
+   * Whether the run has closed presence for good. Checked by the roster read the
+   * tick may still have in flight, which must not dial a link after the run has
+   * recorded its ending — whichever way it ended.
+   */
+  let presenceOver = false;
+  const closePresence = () => {
+    presenceOver = true;
+    presence.close();
+  };
+  /** The freshest token the run has handed the sockets, for a link dialled later. */
+  let heldToken = session.accessToken;
+  /**
+   * Whether the startup roster read failed, which is the one case in which an
+   * empty set of identities is a gap rather than an answer. A roster that was
+   * read and names none of these agents is asked about by nobody.
+   */
+  let rosterUnread = roster === null;
 
   /**
    * Write one diagnosis row, never letting it become the reason anything failed.
@@ -664,7 +716,7 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
         said: verdict.said,
       }),
     );
-    presence.close();
+    closePresence();
     await presenter.stop();
     err(verdict.message);
     return 1;
@@ -1098,7 +1150,7 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
     // it is the same read-refresh-write every command does, done before each
     // poll rather than on a clock of its own, and a session that is genuinely
     // over ends the run here rather than being retried.
-    const ready = await deps.session();
+    const ready = await deps.session(TOKEN_AHEAD_SECONDS);
     if (ready.kind === "stop") {
       sessionEnded = ready.message;
       return;
@@ -1114,7 +1166,9 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
     // its roster entry is the thing depending on a live token. Refreshing only
     // on a tick that asks would mean a single-agent runner never refreshed while
     // it mattered, and a session outliving its hour would lose the entry for
-    // good, since the presence link does not retry a refused join.
+    // good: the presence link rejoins a room it lost, but a token that has
+    // already expired is refused again on every attempt.
+    heldToken = token;
     presence.refresh(token);
     // The listening socket holds a token too, and it is the one whose expiry is
     // silent: a work topic lost to a stale token is a room the runner is no
@@ -1128,6 +1182,7 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
     // has a live token, and the startup attempt is the one most likely to have
     // failed.
     await startListening(token);
+    rosterAgain(token);
 
     if (plan.ask.length === 0) return;
 
@@ -1704,6 +1759,56 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
     }
   };
 
+  /**
+   * Read the roster again, for presence alone, when the startup read failed.
+   *
+   * **Asked on the tick rather than once, for the reason `startListening` is.**
+   * The startup read is the one most likely to fail — a machine still bringing its
+   * network up — and a runner that took that failure as final published nothing
+   * for the days it then ran. Only the presence identities are filled from it: the
+   * startup checks already ran on the roster they had, and re-deciding which
+   * agents are held mid-run is a restart's job.
+   *
+   * **Not awaited, and bounded.** The tick is what finds work, so a roster that
+   * is slow costs presence and never a poll, and one that hangs is dropped after
+   * `ROSTER_AGAIN_TIMEOUT_MS` so the next tick can ask again. One read at a time.
+   */
+  let rosterAsking = false;
+  const rosterAgain = (token: string): void => {
+    if (!rosterUnread || rosterAsking || stopping() || presenceOver) return;
+    rosterAsking = true;
+    const abort = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const timedOut = new Promise<null>((resolve) => {
+      timer = setTimeout(() => {
+        abort.abort();
+        resolve(null);
+      }, ROSTER_AGAIN_TIMEOUT_MS);
+      timer.unref?.();
+    });
+    void Promise.race([deps.roster(token, abort.signal), timedOut])
+      .then((agents) => {
+        if (agents === null || stopping() || presenceOver || !rosterUnread) return;
+        rosterUnread = false;
+        const found = identitiesOf(agents);
+        if (![...found.keys()].some((agent) => startup.asking.includes(agent))) return;
+        presence.close();
+        // The token the run holds now rather than the one the read started
+        // with, which may be older by the length of a slow read.
+        presence = dialPresence(heldToken, found);
+        // An agent already running when the roster arrived is published now
+        // rather than at its next unit.
+        settlePresence();
+      })
+      .catch(() => {
+        // Deliberately nothing: the next tick asks again.
+      })
+      .finally(() => {
+        if (timer !== null) clearTimeout(timer);
+        rosterAsking = false;
+      });
+  };
+
   await startListening(session.accessToken);
   // **The silent state is the runner's to say, because there is no link to say
   // it.** Every other listening state comes from the socket reporting on itself;
@@ -1817,8 +1922,9 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
    */
   const upkeepTokens = async (): Promise<void> => {
     try {
-      const ready = await deps.session();
+      const ready = await deps.session(TOKEN_AHEAD_SECONDS);
       if (ready.kind === "stop") return;
+      heldToken = ready.accessToken;
       presence.refresh(ready.accessToken);
       signals.refresh(ready.accessToken);
     } catch {
@@ -1885,7 +1991,7 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
     // the ambiguity it exists to remove. The throw is re-raised unchanged; all
     // that happens here is that it stops being invisible.
     await record(stopRow(deps.now(), "threw", 1, sessionsStarted));
-    presence.close();
+    closePresence();
     signals.close();
     throw cause;
   } finally {
@@ -1917,7 +2023,7 @@ export async function runRun(deps: RunDeps, context: CommandContext): Promise<nu
   // timer behind it is unref'd, so this is about not leaving a socket open on a
   // program that has printed its last line rather than about anything that could
   // hold the exit.
-  presence.close();
+  closePresence();
   signals.close();
   // A read that is still pending has nothing left to wake: the loop is over.
   if (signalTimer !== null) clearTimeout(signalTimer);
@@ -2039,7 +2145,11 @@ async function oneSession(
   // reason the check is here and not inside the harness's own arguments: past
   // this line a session exists, and a session that ran on a broken prompt reads
   // exactly like one that worked.
-  const rendered = renderPrompt(unit.instruction.prompt, { file: unit.instruction.file, due: unit.instruction.due });
+  const rendered = renderPrompt(unit.instruction.prompt, {
+    file: unit.instruction.file,
+    due: unit.instruction.due,
+    mentions: unit.instruction.mentions,
+  });
   if (!rendered.ok) return spawnFailed(rendered.reason);
 
   // Only an agent this run asks for can be claimed for, and every one of those

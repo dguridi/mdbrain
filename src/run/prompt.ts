@@ -1,12 +1,19 @@
 // Rendering the prompt a trigger's author wrote into the prompt a session is
 // given.
 //
-// A trigger fires because a particular file arrived or changed, or because a
-// schedule came due, and the person who wrote the prompt should be able to name
-// what it fired about. `{path}` and `{id}` stand for that file and `{due}` for
-// the moment the schedule was due, and each is replaced at the moment the session
-// starts. Nothing else in the prompt is touched, and the prompt still travels
-// verbatim in every other respect.
+// A trigger fires because a particular file arrived or changed, because a
+// schedule came due, or because an agent was mentioned, and the person who wrote
+// the prompt should be able to name what it fired about. `{path}` and `{id}`
+// stand for that file, `{due}` for the moment the schedule was due, and
+// `{mentions}` for the thread and comments, or the document, a mention wake-up
+// stands for. Each is replaced at the moment the session starts. Nothing else in
+// the prompt is touched, and the prompt still travels verbatim in every other
+// respect.
+//
+// **`{mentions}` is the one placeholder that never refuses.** Every unit can
+// render it: a mention unit whose event recorded no manifest gets a sentence
+// saying so and pointing the agent at its own tools. A refusal there would spend
+// a whole session on a fact the agent can look up for itself.
 //
 // **An unrecognised placeholder is refused rather than passed through, and that
 // is the one opinion here.** A prompt reaching a harness with `{paht}` still in
@@ -51,20 +58,59 @@ export interface TriggerFile {
 }
 
 /**
+ * The mentions a mention wake-up stands for: a thread and the comment ids on it,
+ * oldest first, or a document. `count` can exceed the comments listed, because
+ * the list is capped and the count is not.
+ */
+export type TriggerMentions =
+  | { thread: string; comments: readonly string[]; count: number }
+  | { document: TriggerFile; count: number };
+
+/**
  * What a firing was about, as far as a prompt can name it: the file its event
- * names, and the moment a schedule was due. Either may be missing, since no kind
- * has both.
+ * names, the moment a schedule was due, and the mentions a mention wake-up
+ * stands for. Any may be missing, since no kind has more than one.
  */
 export interface TriggerContext {
   file: TriggerFile | null;
   due?: string | null | undefined;
+  mentions?: TriggerMentions | null | undefined;
 }
 
 /** One placeholder: what it stands for, and the sentence's word for the fact it
- *  needs when the event does not carry that fact. */
+ *  needs when the event does not carry that fact — absent for one that always
+ *  resolves. */
 interface Placeholder {
   readonly resolve: (context: TriggerContext) => string | null;
-  readonly needs: "file" | "due";
+  readonly needs?: "file" | "due";
+}
+
+/** What `{mentions}` says when the unit carries no manifest. */
+export const MENTIONS_NOT_RECORDED =
+  "The mentions this wake-up stands for were not recorded; read them with `list_mentions`.";
+
+/**
+ * The sentences `{mentions}` is replaced with.
+ *
+ * Plain prose rather than a structure, because the reader is the agent and a
+ * sentence is something it needs no teaching to act on. Ids are quoted in
+ * backticks so they read as values to pass to a tool rather than as words.
+ */
+export function mentionsSentence(mentions: TriggerMentions | null | undefined): string {
+  if (!mentions) return MENTIONS_NOT_RECORDED;
+  const many = (n: number) => (n === 1 ? "1 mention" : `${n} mentions`);
+  if ("document" in mentions) {
+    const where = `\`${mentions.document.path}\` (\`${mentions.document.id}\`)`;
+    return mentions.count === 1 ? `A mention in ${where}.` : `${many(mentions.count)} in ${where}.`;
+  }
+  const head = `${many(mentions.count)} on thread \`${mentions.thread}\``;
+  const ids = mentions.comments.map((c) => `\`${c}\``);
+  if (ids.length === 0) return `${head}.`;
+  const noun = ids.length === 1 ? "comment" : "comments";
+  const unlisted = mentions.count - ids.length;
+  return unlisted > 0
+    ? `${head}: ${noun} ${ids.join(", ")} and ${unlisted} more on the same thread.`
+    : `${head}: ${noun} ${listed(ids)}.`;
 }
 
 /** The placeholders a prompt may use, and what each stands for. */
@@ -72,6 +118,7 @@ export const PLACEHOLDERS: Readonly<Record<string, Placeholder>> = Object.freeze
   path: { resolve: (c) => c.file?.path ?? null, needs: "file" },
   id: { resolve: (c) => c.file?.id ?? null, needs: "file" },
   due: { resolve: (c) => c.due ?? null, needs: "due" },
+  mentions: { resolve: (c) => mentionsSentence(c.mentions) },
 });
 
 /**
@@ -103,9 +150,9 @@ export type Rendered = { ok: true; prompt: string } | { ok: false; reason: strin
  * genuinely named `{id}.md` substitutes once and is then left alone.
  *
  * @param prompt the trigger author's prompt, as it arrived in the instruction
- * @param context the file the event names and the moment it was due, either of
- *   them missing when the event carries none; a bare file, or null, is read as
- *   a context with only that file
+ * @param context the file the event names, the moment it was due and the
+ *   mentions it stands for, any of them missing when the event carries none; a
+ *   bare file, or null, is read as a context with only that file
  * @returns the rendered prompt, or a refusal naming what could not be resolved
  */
 export function renderPrompt(prompt: string, context: TriggerContext | TriggerFile | null): Rendered {
@@ -121,12 +168,12 @@ export function renderPrompt(prompt: string, context: TriggerContext | TriggerFi
       return whole;
     }
     const value = placeholder.resolve(given);
-    if (value === null) {
+    if (value === null && placeholder.needs !== undefined) {
       const missing = placeholder.needs === "file" ? needsFile : needsDue;
       if (!missing.includes(name)) missing.push(name);
       return whole;
     }
-    return value;
+    return value ?? whole;
   });
 
   // The unrecognised name is reported first when both are wrong: a typo is the

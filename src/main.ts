@@ -7,6 +7,7 @@
 import { pathToFileURL } from "node:url";
 import { agents } from "./commands/agents.ts";
 import { as } from "./commands/as.ts";
+import { call, read, upload } from "./commands/call.ts";
 import { dispatch, type CommandSpec } from "./cli.ts";
 import { configure } from "./commands/configure.ts";
 import { login } from "./commands/login.ts";
@@ -25,7 +26,7 @@ import { VERSION } from "./version.ts";
 export { VERSION };
 
 /** Every command this binary has. */
-export const COMMANDS: CommandSpec[] = [login, whoami, logout, configure, runCommand, as, resume, agents, upgrade];
+export const COMMANDS: CommandSpec[] = [login, whoami, logout, configure, runCommand, as, resume, agents, upgrade, call, read, upload];
 
 /**
  * Run one invocation.
@@ -44,6 +45,9 @@ export function run(argv: string[]): Promise<number> {
   return dispatch(argv, COMMANDS, VERSION, {
     out: (line) => console.log(line),
     err: (line) => console.error(line),
+    write: (text) => {
+      process.stdout.write(text);
+    },
   });
 }
 

@@ -1,6 +1,7 @@
 // The one markdownbrain.ai this CLI talks to.
 //
-// Production, and only production. There is no environment variable and no flag,
+// Production, and only production. There is no environment variable and no flag
+// — the HTTP API's address, at the bottom, is the one exception and says why —
 // and that is a decision about scope rather than a limit anything imposes: one
 // address means one thing to get wrong, and a session that could be minted by
 // whatever a variable happened to name is a session whose origin nobody can read
@@ -17,6 +18,8 @@
 // rather than a leak: the web app ships exactly these two to every browser that
 // loads it. The anon key authorizes nothing on its own — every request it
 // accompanies is still judged by RLS under whatever session carries it.
+
+import type { Judged } from "../api/call.ts";
 
 /** The project's base URL, which every auth and REST request is built on. */
 export const PROJECT_URL = "https://rczxydsqwkzobebirkcu.supabase.co";
@@ -99,6 +102,78 @@ export function keyRole(key: string): string | null {
  * its `/mcp`.
  */
 export const MCP_URL = "https://mcp.markdownbrain.ai/mcp";
+
+/**
+ * The HTTP API `call`, `read` and `upload` speak to, served beside the MCP
+ * endpoint under its own name so the public address does not say "mcp".
+ */
+export const API_URL = "https://api.markdownbrain.ai/v1";
+
+/**
+ * The API address this invocation uses: `MDBRAIN_API_URL` when it is set, this
+ * binary's own constant otherwise.
+ *
+ * **This is the one address here an environment variable may move**, and the
+ * reasons the others may not do not reach it. Nothing is minted or stored
+ * against it — no session, no MCP file — and the credential it is used with is
+ * itself read from the environment on every invocation, so whoever can set the
+ * one can already set the other. What the override buys is pointing the
+ * commands at a local stack.
+ *
+ * **Plain `http` is refused except to this machine.** That reasoning covers a
+ * hostile environment, not a mistaken one: a typo or a stale CI variable naming
+ * `http://` would send the key in cleartext on every invocation, and the server's
+ * redirect to `https` comes only after the key has crossed the wire. A local
+ * stack is the one place `http` is wanted, and there the key never leaves the
+ * machine.
+ *
+ * @returns the address without a trailing slash, or why the one given cannot be
+ *   used — decided before anything is sent
+ */
+export function apiBase(env: Record<string, string | undefined>): Judged<string> {
+  const given = env.MDBRAIN_API_URL?.trim();
+  const value = (given ? given : API_URL).replace(/\/+$/, "");
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return { ok: false, message: `MDBRAIN_API_URL is not an address: ${value}` };
+  }
+  if (url.protocol === "https:") return { ok: true, value };
+  if (url.protocol === "http:" && isLoopback(url.hostname)) return { ok: true, value };
+  return {
+    ok: false,
+    message: `MDBRAIN_API_URL must be https (plain http only to localhost, 127.0.0.1 or [::1]), or the key would be sent unencrypted: ${value}`,
+  };
+}
+
+/**
+ * Whether the person's login may be sent to an API address: only to this
+ * binary's own `API_URL`, or to this machine.
+ *
+ * **A key and a login are not the same risk at a strange address.** A member key
+ * is fenced to one organization, rate-limited and revocable on its own. A
+ * session's access token works against the database as the person, in every
+ * organization they belong to, until it expires — so an `MDBRAIN_API_URL` left
+ * pointing somewhere else must never be handed one. A key is still sent there,
+ * as it always was, because setting the address and the key are one decision.
+ *
+ * @param base an address `apiBase` accepted
+ */
+export function loginMayGoTo(base: string): boolean {
+  if (base === API_URL) return true;
+  try {
+    return isLoopback(new URL(base).hostname);
+  } catch {
+    return false;
+  }
+}
+
+/** Whether a host, as `URL` spells it, is this machine: `localhost`, any of
+ *  127.0.0.0/8, or `[::1]` (which `URL` writes every spelling of as). */
+function isLoopback(hostname: string): boolean {
+  return hostname === "localhost" || hostname === "[::1]" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname);
+}
 
 /**
  * The name that server is given inside the per-agent MCP file.

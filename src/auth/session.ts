@@ -62,6 +62,30 @@ export function sessionAction(
 }
 
 /**
+ * Whether a session that is still usable should be refreshed now anyway.
+ *
+ * For a holder that hands the token on to something that keeps it, rather than
+ * spending it at once. A Realtime room closes at the exact second its token
+ * expires, so a holder that checks on a fixed step and refreshes only inside
+ * {@link REFRESH_MARGIN_SECONDS} lands every refresh just after the expiry it
+ * was meant to beat: a token is still usable at each of three quarter-hour
+ * checks and already expired by the fourth. Asking for a margin at least one
+ * step long is what puts the refresh before the expiry rather than after it.
+ *
+ * Never true for a session that has no refresh token, which has nothing to
+ * refresh with, or for one that is not usable, which {@link sessionAction}
+ * already answers.
+ *
+ * @param aheadSeconds how much life a token must have left to be kept
+ */
+export function refreshAhead(session: StoredSession, nowSeconds: number, aheadSeconds: number): boolean {
+  return (
+    sessionAction(session, nowSeconds).kind === "use" &&
+    sessionAction(session, nowSeconds, aheadSeconds).kind === "refresh"
+  );
+}
+
+/**
  * Read a session out of whatever the file held.
  *
  * Deliberately strict about the three fields it needs and silent about anything

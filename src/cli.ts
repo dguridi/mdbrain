@@ -19,6 +19,13 @@ export interface CommandSpec {
   /** Rendered after the name in help, e.g. `<agent>`. */
   usage?: string;
   flags?: FlagSpec[];
+  /**
+   * Whether the command reads its own words from `argv`, where any word after
+   * the first may be a value — `mdbrain call search_files --query -v` searches
+   * for `-v`. For such a command only the first word after its name can ask
+   * for `--help` or `--version`.
+   */
+  ownsArgv?: boolean;
   run(context: CommandContext): Promise<number>;
 }
 
@@ -27,6 +34,19 @@ export interface CommandContext {
   flags: Record<string, string | boolean>;
   out: (line: string) => void;
   err: (line: string) => void;
+  /**
+   * The words after the command name, exactly as typed. For a command whose
+   * flags are not known until it runs — `call` reads them off the server's
+   * catalogue — so the parser above, which only lets a declared flag take a
+   * value, has not already split `--path TODO.md` into a flag and a stray word.
+   */
+  argv?: string[];
+  /**
+   * Writes text to stdout as it is, with no newline added, for output a script
+   * redirects into a file, where a line-based `out` would change the bytes.
+   * Absent, a command falls back to `out`.
+   */
+  write?: (text: string) => void;
 }
 
 export interface ParsedArgv {
@@ -102,13 +122,19 @@ export async function dispatch(
   argv: string[],
   commands: CommandSpec[],
   version: string,
-  io: { out: (line: string) => void; err: (line: string) => void },
+  io: { out: (line: string) => void; err: (line: string) => void; write?: (text: string) => void },
 ): Promise<number> {
   const first = parseArgv(argv);
+  const at = argv.findIndex((word) => !word.startsWith("-"));
+  const named = first.command === null ? undefined : commands.find((c) => c.name === first.command);
+  // This program's own flags, as distinct from a command's values: every word
+  // for most commands, but for one that owns its words only those up to the
+  // first after its name, so a value spelled `-v` or `--help` reaches it.
+  const own = named?.ownsArgv ? parseArgv(argv.slice(0, at + 2)) : first;
 
   // Asked before the bare-invocation branch below, which would otherwise swallow
   // `--version` — it carries no command, and so looks like an empty invocation.
-  if (first.flags.version === true || first.flags.v === true) {
+  if (own.flags.version === true || own.flags.v === true) {
     io.out(version);
     return 0;
   }
@@ -120,7 +146,7 @@ export async function dispatch(
     return 0;
   }
 
-  const command = commands.find((c) => c.name === first.command);
+  const command = named;
   if (!command) {
     io.err(`Unknown command "${first.command}".`);
     io.out(renderHelp(commands, version));
@@ -130,10 +156,19 @@ export async function dispatch(
   const valueFlags = new Set((command.flags ?? []).filter((f) => f.takesValue).map((f) => f.name));
   const parsed = parseArgv(argv, valueFlags);
 
-  if (parsed.flags.help === true || parsed.flags.h === true) {
+  const asked = command.ownsArgv ? own : parsed;
+  if (asked.flags.help === true || asked.flags.h === true) {
     io.out(renderHelp([command], version));
     return 0;
   }
 
-  return command.run({ positional: parsed.positional, flags: parsed.flags, out: io.out, err: io.err });
+  const rest = argv.slice(at + 1);
+  return command.run({
+    positional: parsed.positional,
+    flags: parsed.flags,
+    out: io.out,
+    err: io.err,
+    argv: rest,
+    ...(io.write ? { write: io.write } : {}),
+  });
 }

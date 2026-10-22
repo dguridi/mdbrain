@@ -42,7 +42,23 @@ export interface Instruction {
    * occurrence of a clock, which is every kind but one.
    */
   due?: string;
+  /**
+   * The mentions a mention wake-up stands for, which `{mentions}` in the prompt
+   * renders. Absent on every other kind, and on a mention unit whose event
+   * recorded none — the prompt then says so rather than the unit being refused.
+   */
+  mentions?: InstructionMentions;
 }
+
+/**
+ * The manifest of a mention wake-up: one thread and the ids of the comments on
+ * it that named the agent, or one document. `count` is every mention the
+ * wake-up stands for, and can exceed the comments listed, because the server
+ * caps the list and not the count.
+ */
+export type InstructionMentions =
+  | { thread: string; comments: string[]; count: number }
+  | { document: InstructionFile; count: number };
 
 /** One unit of work as the server answers it: the instruction, in an envelope
  *  that makes the wake legible in a log. */
@@ -96,12 +112,46 @@ function readUnit(v: unknown): WorkUnit | null {
   // The same rule for the due moment: absent is fine, and present but not text
   // is a server answering something this version does not understand.
   if (i.due !== undefined && !isText(i.due)) return null;
+  // And for the mentions: a server that never sends them is readable, and one
+  // that sends a manifest this version cannot shape is refused whole.
+  const mentions = i.mentions === undefined ? undefined : readMentions(i.mentions);
+  if (mentions === null) return null;
   return {
     kind: v.kind,
     seq: v.seq,
     at: v.at,
-    instruction: { claim: i.claim, workspace: i.workspace, agent: i.agent, prompt: i.prompt, file, ...(isText(i.due) ? { due: i.due } : {}) },
+    instruction: {
+      claim: i.claim,
+      workspace: i.workspace,
+      agent: i.agent,
+      prompt: i.prompt,
+      file,
+      ...(isText(i.due) ? { due: i.due } : {}),
+      ...(mentions ? { mentions } : {}),
+    },
   };
+}
+
+const isCount = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 1;
+
+/**
+ * A mention wake-up's manifest, or null when it is not a well-shaped one.
+ *
+ * Either a thread with its comment ids, or a document, never both, and a count
+ * of at least one that is never fewer than the comments listed: a manifest that
+ * says less than it lists is not one the sentence built from it could be true
+ * about.
+ */
+function readMentions(v: unknown): InstructionMentions | null {
+  if (!isRecord(v) || !isCount(v.count)) return null;
+  if (v.thread !== undefined) {
+    if (v.document !== undefined || !isText(v.thread) || !Array.isArray(v.comments)) return null;
+    if (!v.comments.every(isText) || v.comments.length > v.count) return null;
+    return { thread: v.thread, comments: [...v.comments], count: v.count };
+  }
+  const document = readFile(v.document);
+  if (document === null) return null;
+  return { document, count: v.count };
 }
 
 /** The instruction's file, or null when there is not a well-shaped one. */

@@ -113,6 +113,52 @@ describe("reading the claim's answer", () => {
     expect(readWork({ work: [unit({}, { due: 7 })] }).kind).toBe("unreadable");
   });
 
+  it("195-S14: carries a thread wake-up's manifest, and nothing where there is none", () => {
+    const mentions = { thread: "t-a", comments: ["c-1", "c-2", "c-3"], count: 3 };
+    const named = readWork({ work: [unit({ kind: "agent-mentioned" }, { mentions })] });
+    if (named.kind !== "work") throw new Error(named.message);
+    expect(named.work[0].instruction.mentions).toEqual(mentions);
+    const plain = readWork({ work: [unit()] });
+    expect(plain.kind === "work" && "mentions" in plain.work[0].instruction).toBe(false);
+  });
+
+  it("195-S15: carries a document wake-up's manifest", () => {
+    const mentions = { document: { id: "9f1e", path: "04-specs/80.md" }, count: 1 };
+    const named = readWork({ work: [unit({ kind: "agent-mentioned" }, { mentions })] });
+    if (named.kind !== "work") throw new Error(named.message);
+    expect(named.work[0].instruction.mentions).toEqual(mentions);
+  });
+
+  it("195-S16: a mention unit with no manifest is ordinary work, as a server that never sends one is", () => {
+    const reading = readWork({ work: [unit({ kind: "agent-mentioned" })] });
+    expect(reading.kind).toBe("work");
+  });
+
+  it("a manifest it cannot shape is refused, not half-read", () => {
+    for (const mentions of [
+      null,
+      "t-a",
+      { thread: "t-a", comments: ["c-1"] },
+      { thread: "t-a", comments: ["c-1"], count: 0 },
+      // A count below one with nothing listed, so the list-longer-than-count
+      // rule cannot be what refuses it.
+      { thread: "t-a", comments: [], count: 0 },
+      { document: { id: "9f1e", path: "a.md" }, count: 0 },
+      { thread: "t-a", comments: ["c-1"], count: 1.5 },
+      { thread: "", comments: [], count: 1 },
+      { thread: "t-a", comments: "c-1", count: 1 },
+      { thread: "t-a", comments: ["c-1", 7], count: 2 },
+      { thread: "t-a", comments: ["c-1", "c-2"], count: 1 },
+      { thread: "t-a", comments: [], count: 1, document: { id: "9f1e", path: "a.md" } },
+      { document: { id: "9f1e" }, count: 1 },
+      { count: 1 },
+    ]) {
+      expect(readWork({ work: [unit({ kind: "agent-mentioned" }, { mentions })] }).kind, JSON.stringify(mentions)).toBe(
+        "unreadable",
+      );
+    }
+  });
+
   it("105-S73: a file it cannot shape is refused, not half-read", () => {
     // Half of this is worse than none: a path with no id cannot be followed back
     // and an id with no path is what the placeholder exists to save a lookup on.

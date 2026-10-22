@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { PLACEHOLDERS, placeholderNames, renderPrompt } from "../src/run/prompt.ts";
+import { MENTIONS_NOT_RECORDED, PLACEHOLDERS, placeholderNames, renderPrompt } from "../src/run/prompt.ts";
 
 const file = { id: "9f1e-4d2c", path: "01-ideas/37-a-doctor-command.md" };
 
@@ -103,9 +103,9 @@ describe("105-S77: a trigger whose event names no file", () => {
 });
 
 describe("the recognised set is one table", () => {
-  it("names exactly path, id and due", () => {
-    expect(placeholderNames()).toEqual(["due", "id", "path"]);
-    expect(Object.keys(PLACEHOLDERS).sort()).toEqual(["due", "id", "path"]);
+  it("names exactly path, id, due and mentions", () => {
+    expect(placeholderNames()).toEqual(["due", "id", "mentions", "path"]);
+    expect(Object.keys(PLACEHOLDERS).sort()).toEqual(["due", "id", "mentions", "path"]);
   });
 
   it("does not answer for a name inherited from Object.prototype", () => {
@@ -142,9 +142,66 @@ describe("185-S29: a schedule's prompt can say when the firing was due", () => {
     if (!out.ok) expect(out.reason).toContain("names no file");
   });
 
-  it("lists all three names when one is unknown", () => {
+  it("lists every name when one is unknown", () => {
     const out = renderPrompt("{nope}", { file: null, due });
     expect(out.ok).toBe(false);
-    if (!out.ok) expect(out.reason).toContain("{due}, {id} and {path}");
+    if (!out.ok) expect(out.reason).toContain("{due}, {id}, {mentions} and {path}");
+  });
+});
+
+describe("a mention trigger's prompt can say which mentions this wake-up stands for", () => {
+  const thread = { thread: "t-a", comments: ["c-1", "c-2", "c-3"], count: 3 };
+
+  it("195-S14: renders a thread unit as a sentence naming the thread and its three comments", () => {
+    const out = renderPrompt("Answer these. {mentions}", { file: null, mentions: thread });
+    expect(out).toEqual({
+      ok: true,
+      prompt: "Answer these. 3 mentions on thread `t-a`: comments `c-1`, `c-2` and `c-3`.",
+    });
+  });
+
+  it("195-S14: one mention is said in the singular", () => {
+    const out = renderPrompt("{mentions}", { file: null, mentions: { thread: "t-a", comments: ["c-1"], count: 1 } });
+    expect(out).toEqual({ ok: true, prompt: "1 mention on thread `t-a`: comment `c-1`." });
+  });
+
+  it("195-S13: past the cap, says how many more there are than it lists", () => {
+    const comments = Array.from({ length: 50 }, (_, i) => `c-${i}`);
+    const out = renderPrompt("{mentions}", { file: null, mentions: { thread: "t-a", comments, count: 62 } });
+    expect(out.ok).toBe(true);
+    if (out.ok) {
+      expect(out.prompt.startsWith("62 mentions on thread `t-a`: comments `c-0`, `c-1`,")).toBe(true);
+      expect(out.prompt.endsWith("`c-49` and 12 more on the same thread.")).toBe(true);
+    }
+  });
+
+  it("195-S15: renders a document unit as the document's path and id", () => {
+    const document = { id: "9f1e-4d2c", path: "04-specs/80-events.md" };
+    expect(renderPrompt("{mentions}", { file: null, mentions: { document, count: 1 } })).toEqual({
+      ok: true,
+      prompt: "A mention in `04-specs/80-events.md` (`9f1e-4d2c`).",
+    });
+    expect(renderPrompt("{mentions}", { file: null, mentions: { document, count: 2 } })).toEqual({
+      ok: true,
+      prompt: "2 mentions in `04-specs/80-events.md` (`9f1e-4d2c`).",
+    });
+  });
+
+  it("195-S16: a unit that carries no manifest renders the fallback sentence and is not refused", () => {
+    for (const context of [{ file: null }, { file: null, mentions: null }, null]) {
+      const out = renderPrompt("Answer every unanswered mention. {mentions}", context);
+      expect(out, JSON.stringify(context)).toEqual({
+        ok: true,
+        prompt: `Answer every unanswered mention. ${MENTIONS_NOT_RECORDED}`,
+      });
+    }
+    expect(MENTIONS_NOT_RECORDED).toBe(
+      "The mentions this wake-up stands for were not recorded; read them with `list_mentions`.",
+    );
+  });
+
+  it("substitutes in one pass, so an id that looks like a placeholder is not re-read", () => {
+    const out = renderPrompt("{mentions}", { file: null, mentions: { thread: "{path}", comments: [], count: 1 } });
+    expect(out).toEqual({ ok: true, prompt: "1 mention on thread `{path}`." });
   });
 });
